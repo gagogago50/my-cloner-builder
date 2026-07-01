@@ -19,13 +19,18 @@ jobs:
         with:
           go-version: '1.22'
 
-      # 3. Compilation croisée pour Windows (Syntaxe PowerShell pour windows-latest)
+      # 3. Compilation croisée pour Windows (en ciblant le dossier de l'exécutable)
       - name: Compile Binary for Windows
         run: |
           cd target-app
           $env:GOOS="windows"
           $env:GOARCH="amd64"
-          go build -o ../bearer.exe .
+          # On cherche le dossier contenant le binaire principal (souvent cmd/bearer ou via le pattern ./...)
+          if (Test-Path "cmd/bearer") {
+              go build -o ../bearer.exe ./cmd/bearer
+          } else {
+              go build -o ../bearer.exe .
+          }
 
       # 4. Envoi du fichier .exe dans les artefacts de l'action
       - name: Upload Windows Executable
