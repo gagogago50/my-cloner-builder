@@ -1,0 +1,41 @@
+name: Security Scan Remote Project (Anti-Malware & Backdoor)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'URL du dépôt GitHub suspect à scanner'
+        required: true
+        default: 'https://github.com/user/repo'
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest # Linux est plus rapide et idéal pour les outils de scan
+
+    steps:
+      # 1. Cloner le projet suspect entré par l'utilisateur
+      - name: Clone Target Repository
+        run: |
+          git clone --depth 1 ${{ github.event.inputs.repo_url }} target-app
+
+      # 2. Installer Bearer (0 login, détecte l'exfiltration et les stealers)
+      - name: Install and Run Bearer
+        run: |
+          curl -sfL https://raw.githubusercontent.com/bearer/bearer/main/scripts/install.sh | sh
+          ./bin/bearer scan target-app --format text > bearer-report.txt || true
+          # Le "|| true" évite que le workflow plante tout de suite, pour nous laisser voir le rapport
+
+      # 3. Installer et lancer Semgrep OSS (0 login, détecte la logique malveillante et l'obfuscation)
+      - name: Install and Run Semgrep
+        run: |
+          pip install semgrep
+          semgrep scan --config="p/security-audit" --config="p/secrets" target-app > semgrep-report.txt || true
+
+      # 4. Sauvegarder les rapports de sécurité sous forme d'artéfacts téléchargeables
+      - name: Upload Security Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-analysis-reports
+          path: |
+            bearer-report.txt
+            semgrep-report.txt
