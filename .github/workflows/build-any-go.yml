@@ -1,0 +1,35 @@
+name: Compile Remote Go Project
+
+on:
+  workflow_dispatch: # Déclencheur manuel
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    # 1. On n'utilise pas checkout sur notre propre repo, on clone directement Bearer
+    name: Clone Target Repository
+      run: |
+        git clone --depth 1 https://github.com/bearer/bearer.git target-app
+
+    # 2. Configuration de l'environnement Go
+    name: Setup Go Environment
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    # 3. Compilation croisée pour Windows
+    name: Compile Binary for Windows
+      run: |
+        cd target-app
+        $env:GOOS="windows"
+        $env:GOARCH="amd64"
+        go build -o ../bearer.exe .
+
+    # 4. Envoi du fichier .exe dans les artefacts de l'action
+    name: Upload Windows Executable
+      uses: actions/upload-artifact@v4
+      with:
+        name: bearer-windows
+        path: bearer.exe
