@@ -1,0 +1,70 @@
+name: Build Rizin Windows x64 with Security Scan
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install Cppcheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cppcheck
+
+    # Analyse statique du code C avec Cppcheck
+    - name: Run Cppcheck Scan
+      run: |
+        cppcheck --enable=warning,style,performance,portability \
+                 --error-exitcode=1 \
+                 --inline-suppr \
+                 libr/ binr/
+      # Note : On cible 'libr/' (les bibliothèques de rizin) et 'binr/' (les exécutables)
+      # pour éviter de scanner les dépendances tierces et générer de faux positifs.
+
+  build-windows:
+    needs: security-scan # Le build ne se lance que si le scan Cppcheck réussit
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install Meson and Ninja
+      run: |
+        pip install meson ninja
+
+    - name: Setup Visual Studio Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: amd64
+
+    - name: Configure Meson
+      run: |
+        meson setup build --buildtype=release
+
+    - name: Compile Rizin
+      run: |
+        meson compile -C build
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: rizin-windows-amd64
+        path: build/
