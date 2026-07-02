@@ -16,11 +16,13 @@ jobs:
       with:
         submodules: recursive
 
-    # Étape d'analyse statique du code source avec Bearer
+    # Étape d'analyse statique corrigée pour Bearer
     - name: Run Bearer Security Scan
       uses: bearer/bearer-action@v2
       with:
-        fail-on-severity: 'high' # Fait échouer le workflow si une faille critique est trouvée
+        scanner: 'sast'       # Force l'analyse SAST au lieu du dataflow complet
+        severity: 'high'      # Cible les vulnérabilités de niveau "high" ou plus
+        exit-code: 'true'     # Fait échouer le job si une faille est trouvée
 
   build-windows:
     needs: security-scan # Le build ne se lance que si le scan Bearer réussit
