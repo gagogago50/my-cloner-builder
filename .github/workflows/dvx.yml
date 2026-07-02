@@ -1,0 +1,74 @@
+name: Build DXVK & Security Scan
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  workflow_dispatch:
+
+jobs:
+  # --- JOB 1 : SCAN DE SÉCURITÉ (S'exécute en parallèle) ---
+  scan-code:
+    name: Scanner le code (CodeQL & Trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Récupérer le code source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Initialise CodeQL pour l'analyse statique du C++ (détection de backdoors / failles)
+      - name: Initialiser CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'cpp'
+
+      # Scan additionnel avec Trivy pour détecter les secrets fuités et vulnérabilités de dépendances
+      - name: Scan de vulnérabilités avec Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+
+      # Analyse finale du code par CodeQL
+      - name: Exécuter l'analyse CodeQL
+        uses: github/codeql-action/analyze@v3
+
+  # --- JOB 2 : COMPILATION WINDOWS AMD64 (S'exécute en parallèle) ---
+  build-windows:
+    name: Build DXVK (Windows x64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code source avec les sous-modules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Installer les outils de compilation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build g++-mingw-w64-x86-64 gcc-mingw-w64-x86-64 glslang-tools
+
+      - name: Configurer le build (Meson Cross-compilation)
+        run: |
+          meson setup --cross-file build-win64.txt --buildtype release build.w64
+
+      - name: Compiler le projet (Ninja)
+        run: |
+          ninja -C build.w64
+
+      - name: Archiver et Télécharger les DLLs générées
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-windows-amd64
+          path: |
+            build.w64/src/**/*.dll
