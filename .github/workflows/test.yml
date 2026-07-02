@@ -1,0 +1,70 @@
+name: Build Rizin Windows x64 with Security Scan
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Rizin code
+      uses: actions/checkout@v4
+      with:
+        repository: rizinorg/rizin 
+        submodules: recursive
+
+    - name: Install Cppcheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cppcheck
+
+    # Ajout du flag -j 2 pour utiliser les 2 CPU du runner GitHub
+    - name: Run Cppcheck Scan
+      run: |
+        cppcheck -j 2 --enable=warning,style,performance,portability \
+                 --error-exitcode=1 \
+                 --inline-suppr \
+                 librz/ binrz/
+
+  build-windows:
+    # Suppression du "needs: security-scan" pour compiler EN MÊME TEMPS
+    runs-on: windows-latest
+    steps:
+    - name: Checkout Rizin code
+      uses: actions/checkout@v4
+      with:
+        repository: rizinorg/rizin
+        submodules: recursive
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install Meson and Ninja
+      run: |
+        pip install meson ninja
+
+    - name: Setup Visual Studio Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: amd64
+
+    - name: Configure Meson
+      run: |
+        meson setup . build --buildtype=release
+
+    # Ninja gère déjà le multi-threading par défaut, mais MSVC sur Windows reste lent
+    - name: Compile Rizin
+      run: |
+        meson compile -C build
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: rizin-windows-amd64
+        path: build/
