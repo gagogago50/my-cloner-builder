@@ -21,14 +21,14 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y cppcheck
 
-    # Correction ici : scan de la racine '.' en ignorant explicitement les dépendances tierces
+    # Correction ici : Utilisation de -i pour ignorer les sous-dossiers de manière compatible
     - name: Run Cppcheck Scan
       run: |
         cppcheck --enable=warning,style,performance,portability \
                  --error-exitcode=1 \
                  --inline-suppr \
-                 --ignore-regexp="subprojects/.*" \
-                 --ignore-regexp="build.*/.*" \
+                 -i subprojects \
+                 -i build \
                  .
 
   build-windows:
