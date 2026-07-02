@@ -21,18 +21,18 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y cppcheck
 
-    # Analyse statique du code C avec Cppcheck
+    # Correction ici : scan de la racine '.' en ignorant explicitement les dépendances tierces
     - name: Run Cppcheck Scan
       run: |
         cppcheck --enable=warning,style,performance,portability \
                  --error-exitcode=1 \
                  --inline-suppr \
-                 libr/ binr/
-      # Note : On cible 'libr/' (les bibliothèques de rizin) et 'binr/' (les exécutables)
-      # pour éviter de scanner les dépendances tierces et générer de faux positifs.
+                 --ignore-regexp="subprojects/.*" \
+                 --ignore-regexp="build.*/.*" \
+                 .
 
   build-windows:
-    needs: security-scan # Le build ne se lance que si le scan Cppcheck réussit
+    needs: security-scan
     runs-on: windows-latest
 
     steps:
@@ -57,7 +57,7 @@ jobs:
 
     - name: Configure Meson
       run: |
-        meson setup build --buildtype=release
+        meson setup . build --buildtype=release
 
     - name: Compile Rizin
       run: |
