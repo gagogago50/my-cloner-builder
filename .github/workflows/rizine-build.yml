@@ -21,15 +21,13 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y cppcheck
 
-    # Correction ici : Utilisation de -i pour ignorer les sous-dossiers de manière compatible
+    # Correction définitive : Ciblage précis des dossiers sources réels de Rizin
     - name: Run Cppcheck Scan
       run: |
         cppcheck --enable=warning,style,performance,portability \
                  --error-exitcode=1 \
                  --inline-suppr \
-                 -i subprojects \
-                 -i build \
-                 .
+                 librz/ binrz/
 
   build-windows:
     needs: security-scan
