@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # --- JOB 1 : SCAN DE SÉCURITÉ (S'exécute en parallèle) ---
+  # --- JOB 1 : SCAN DE SÉCURITÉ ---
   scan-code:
     name: Scanner le code (CodeQL & Trivy)
     runs-on: ubuntu-latest
@@ -18,18 +18,17 @@ jobs:
       contents: read
 
     steps:
-      - name: Récupérer le code source
+      - name: Récupérer le code source de DXVK
         uses: actions/checkout@v4
         with:
+          repository: 'doitsujin/dxvk' # <-- AJOUT : Force le clonage du dépôt cible
           submodules: recursive
 
-      # Initialise CodeQL pour l'analyse statique du C++ (détection de backdoors / failles)
       - name: Initialiser CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: 'cpp'
 
-      # Scan additionnel avec Trivy pour détecter les secrets fuités et vulnérabilités de dépendances
       - name: Scan de vulnérabilités avec Trivy
         uses: aquasecurity/trivy-action@master
         with:
@@ -38,19 +37,19 @@ jobs:
           format: 'table'
           severity: 'CRITICAL,HIGH'
 
-      # Analyse finale du code par CodeQL
       - name: Exécuter l'analyse CodeQL
         uses: github/codeql-action/analyze@v3
 
-  # --- JOB 2 : COMPILATION WINDOWS AMD64 (S'exécute en parallèle) ---
+  # --- JOB 2 : COMPILATION WINDOWS AMD64 ---
   build-windows:
     name: Build DXVK (Windows x64)
     runs-on: ubuntu-latest
 
     steps:
-      - name: Récupérer le code source avec les sous-modules
+      - name: Récupérer le code source de DXVK
         uses: actions/checkout@v4
         with:
+          repository: 'doitsujin/dxvk' # <-- AJOUT : Force le clonage du dépôt cible
           submodules: recursive
 
       - name: Installer les outils de compilation
