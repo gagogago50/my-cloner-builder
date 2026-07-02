@@ -1,0 +1,61 @@
+name: Build Rizin Windows x64 with Security Scan
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    # Étape d'analyse statique du code source avec Bearer
+    - name: Run Bearer Security Scan
+      uses: bearer/bearer-action@v2
+      with:
+        fail-on-severity: 'high' # Fait échouer le workflow si une faille critique est trouvée
+
+  build-windows:
+    needs: security-scan # Le build ne se lance que si le scan Bearer réussit
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install Meson and Ninja
+      run: |
+        pip install meson ninja
+
+    - name: Setup Visual Studio Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: amd64
+
+    - name: Configure Meson
+      run: |
+        meson setup build --buildtype=release
+
+    - name: Compile Rizin
+      run: |
+        meson compile -C build
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: rizin-windows-amd64
+        path: build/
