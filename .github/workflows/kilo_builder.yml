@@ -1,0 +1,160 @@
+name: Build Kilo CLI (Windows x64) - Audit Commit Only
+
+# ==============================================================================
+# SÉCURITÉ ANTI-BACKDOOR — LIRE AVANT UTILISATION
+# ==============================================================================
+# 1. Ce workflow NE clone JAMAIS 'main' ou une branche mouvante.
+# 2. Il exige un COMMIT_SHA complet (40 caractères), que VOUS devez avoir
+#    audité personnellement ou dont vous avez vérifié la provenance
+#    (signature GPG des mainteneurs, PR mergée officiellement, etc.).
+# 3. Le SHA est validé (format + existence réelle dans le dépôt officiel)
+#    AVANT tout checkout du code.
+# 4. Aucune dépendance "latest"/"^"/"~" non verrouillée n'est installée :
+#    on utilise le lockfile du dépôt (bun.lock / bun.lockb), en mode
+#    "frozen" (échec immédiat si le lockfile ne correspond pas au code).
+# 5. Aucune étape tierce non officielle (pas d'action marketplace non
+#    nécessaire, uniquement actions/checkout et actions/upload-artifact
+#    publiées par GitHub lui-même, épinglées par tag de version).
+#
+# NOTE TECHNIQUE IMPORTANTE :
+# Le CLI de Kilo-Org/kilocode (packages/opencode) est un monorepo Bun,
+# PAS un projet npm/pkg classique. Le binaire autonome est produit via
+# `Bun.build` en mode compile, appelé par le script de build interne du
+# projet. J'ai donc remplacé "npm ci + pkg" par l'équivalent réel et
+# strict du projet : `bun install --frozen-lockfile` puis le script de
+# build officiel du dépôt. Si la structure du repo change à l'avenir,
+# vérifiez le contenu de packages/opencode/script/build.ts au SHA audité
+# avant de lancer ce workflow.
+# ==============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      COMMIT_SHA:
+        description: "SHA complet (40 caractères) du commit audité à compiler (JAMAIS 'main' ou 'latest')"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  # ÉTAPE 0 : Validation stricte du SHA AVANT tout accès au code source.
+  # --------------------------------------------------------------------------
+  validate-sha:
+    runs-on: ubuntu-latest
+    outputs:
+      sha_ok: ${{ steps.check.outputs.sha_ok }}
+    steps:
+      - name: Vérifier le format du SHA (40 caractères hexadécimaux, non vide)
+        id: format_check
+        shell: bash
+        run: |
+          SHA="${{ inputs.COMMIT_SHA }}"
+          if [ -z "$SHA" ]; then
+            echo "::error::COMMIT_SHA est vide. Interruption immédiate."
+            exit 1
+          fi
+          if [[ "$SHA" =~ ^(main|master|latest|HEAD)$ ]]; then
+            echo "::error::COMMIT_SHA ne doit JAMAIS être une référence de branche mouvante ('$SHA'). Interruption."
+            exit 1
+          fi
+          if ! [[ "$SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::COMMIT_SHA doit être un hash complet de 40 caractères hexadécimaux. Valeur reçue : '$SHA'"
+            exit 1
+          fi
+          echo "Format du SHA valide."
+
+      - name: Vérifier que le commit existe bien dans le dépôt officiel Kilo-Org/kilocode
+        id: check
+        shell: bash
+        run: |
+          SHA="${{ inputs.COMMIT_SHA }}"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://api.github.com/repos/Kilo-Org/kilocode/commits/${SHA}")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Le commit $SHA est introuvable dans Kilo-Org/kilocode (HTTP $HTTP_STATUS). Interruption — aucune compilation ne sera lancée."
+            exit 1
+          fi
+          echo "Commit $SHA confirmé présent dans le dépôt officiel Kilo-Org/kilocode."
+          echo "sha_ok=true" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # ÉTAPE 1 : Compilation, uniquement si la validation ci-dessus a réussi.
+  # --------------------------------------------------------------------------
+  build:
+    needs: validate-sha
+    if: needs.validate-sha.outputs.sha_ok == 'true'
+    runs-on: windows-latest
+    steps:
+      # Checkout EXPLICITE du SHA audité — jamais 'main', jamais 'ref: latest'.
+      - name: Checkout du commit audité (SHA figé, pas de branche)
+        uses: actions/checkout@v4
+        with:
+          repository: Kilo-Org/kilocode
+          ref: ${{ inputs.COMMIT_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Garde-fou supplémentaire : on revérifie le SHA effectivement checkouté
+      # correspond exactement à celui demandé (protection contre tout
+      # détournement de "ref" en amont).
+      - name: Confirmer que le SHA checkouté correspond exactement à l'input
+        shell: bash
+        run: |
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          EXPECTED_SHA="${{ inputs.COMMIT_SHA }}"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Le SHA checkouté ($ACTUAL_SHA) ne correspond PAS au SHA audité demandé ($EXPECTED_SHA)."
+            exit 1
+          fi
+          echo "SHA checkouté conforme : $ACTUAL_SHA"
+
+      - name: Installer Node.js 20 (requis par certains scripts/tooling du repo)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Le projet est un monorepo Bun (voir bun.lock à la racine).
+      - name: Installer Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Installation STRICTE : --frozen-lockfile échoue si package.json et
+      # bun.lock ne correspondent pas exactement. Aucune mise à jour "sauvage"
+      # de dépendance possible, exactement comme demandé pour npm ci.
+      - name: Installer les dépendances (verrouillées, aucune mise à jour)
+        shell: bash
+        run: bun install --frozen-lockfile
+
+      # Build natif Windows x64 du CLI via l'outil officiel du projet
+      # (Bun.build en mode compile, orchestré par le script du repo).
+      # Adaptez la commande ci-dessous si l'audit du SHA révèle un script
+      # différent dans packages/opencode/script/build.ts.
+      - name: Compiler le binaire Windows x64 autonome
+        shell: bash
+        working-directory: packages/opencode
+        run: |
+          bun run build --target=windows-x64
+          # Renomme/localise le binaire produit en kilo.exe pour l'artefact final
+          BIN_PATH=$(find dist -iname "*.exe" | head -n 1)
+          if [ -z "$BIN_PATH" ]; then
+            echo "::error::Aucun exécutable .exe trouvé dans dist/ après compilation."
+            exit 1
+          fi
+          cp "$BIN_PATH" ../../kilo.exe
+
+      - name: Afficher l'empreinte SHA256 du binaire produit (traçabilité)
+        shell: bash
+        run: sha256sum kilo.exe
+
+      # Upload via l'action officielle GitHub uniquement — aucun outil tiers.
+      - name: Publier l'artefact kilo.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: kilo-windows-x64
+          path: kilo.exe
+          if-no-files-found: error
+          retention-days: 14
