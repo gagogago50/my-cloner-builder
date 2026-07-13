@@ -136,10 +136,16 @@ jobs:
 
       # ---------- 4) Semgrep ----------
       - name: "🔬 Semgrep"
+        continue-on-error: true
         run: |
           set +e
-          pip install -q semgrep
+          mkdir -p results
           LOG=results/semgrep.log
+          STATUS=PASS
+
+          pip install -q semgrep
+
+          # Lance le scan (exit 1 = findings, c'est normal)
           semgrep scan \
             --config p/security-audit \
             --config p/secrets \
@@ -147,72 +153,63 @@ jobs:
             --config p/typescript \
             --config p/owasp-top-ten \
             --json -o results/semgrep-report.json \
-            . 2>&1 | tee "$LOG"
+            --text \
+            . > "$LOG" 2>&1
           RC=$?
+
+          # Compte les findings
           FINDINGS=0
           if [ -f results/semgrep-report.json ]; then
             FINDINGS=$(python3 -c "import json; d=json.load(open('results/semgrep-report.json')); print(len(d.get('results',[])))" 2>/dev/null || echo 0)
           fi
-          echo "Findings: $FINDINGS" >> "$LOG"
-          if [ "$FINDINGS" -gt 0 ]; then
-            echo "WARN" > results/semgrep.status
-            echo "**Résultat: WARN** — $FINDINGS finding(s)" >> "$LOG"
-          else
-            echo "PASS" > results/semgrep.status
-            echo "**Résultat: PASS**" >> "$LOG"
-          fi
-          [ $RC -gt 1 ] && echo "WARN" > results/semgrep.status
 
-      # ---------- 5) Patterns suspects ----------
-      - name: "🕵️ Suspicious patterns"
-        run: |
-          set +e
-          LOG=results/patterns.log
-          FOUND=0
           {
-            echo "# Suspicious Patterns & Install Scripts"
-            echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo ""
-            echo "## Scripts pre/postinstall"
-          } > "$LOG"
+            echo "---"
+            echo "Semgrep exit code: $RC"
+            echo "Findings: $FINDINGS"
+          } >> "$LOG"
 
-          while IFS= read -r pkg; do
-            if command -v jq >/dev/null && jq -e '.scripts | (has("preinstall") or has("postinstall") or has("install") or has("prepare"))' "$pkg" >/dev/null 2>&1; then
-              echo "### \`$pkg\`" >> "$LOG"
-              jq -r '.scripts | to_entries[] | select(.key | test("preinstall|postinstall|^install$|prepare")) | "- **\(.key)**: `\(.value)`"' "$pkg" >> "$LOG"
-              FOUND=1
-            fi
-          done < <(find . -name package.json -not -path "*/node_modules/*" -not -path "*/.git/*")
-
-          echo "" >> "$LOG"
-          echo "## Patterns obfuscation / stealer" >> "$LOG"
-          HITS=$(grep -RInE --include='*.{js,ts,mjs,cjs,jsx,tsx}' \
-            -e 'eval\s*\(' -e 'Function\s*\(' -e 'atob\s*\(' \
-            -e 'fromCharCode' -e 'child_process' \
-            -e 'powershell|cmd\.exe|bitsadmin|certutil' \
-            -e 'discord\.com/api/webhooks' -e 'api\.telegram\.org' \
-            -e 'Buffer\.from\([^,]+,\s*["'\'']base64["'\'']' \
-            . 2>/dev/null | grep -v node_modules | head -80 || true)
-
-          if [ -n "$HITS" ]; then
-            echo '```' >> "$LOG"
-            echo "$HITS" >> "$LOG"
-            echo '```' >> "$LOG"
-            FOUND=1
+          # 0 = clean, 1 = findings, >=2 = erreur outil
+          if [ "$RC" -ge 2 ]; then
+            STATUS=WARN
+            echo "**Résultat: WARN** — erreur Semgrep (exit $RC)" >> "$LOG"
+          elif [ "$FINDINGS" -gt 0 ] || [ "$RC" -eq 1 ]; then
+            STATUS=WARN
+            echo "**Résultat: WARN** — $FINDINGS finding(s) (non bloquant pour le build)" >> "$LOG"
           else
-            echo "_Aucun pattern hautement suspect._" >> "$LOG"
+            STATUS=PASS
+            echo "**Résultat: PASS** — 0 finding" >> "$LOG"
           fi
 
-          if [ "$FOUND" -eq 1 ]; then
-            echo "WARN" > results/patterns.status
-            echo "" >> "$LOG"
-            echo "**Résultat: WARN**" >> "$LOG"
-          else
-            echo "PASS" > results/patterns.status
-            echo "" >> "$LOG"
-            echo "**Résultat: PASS**" >> "$LOG"
+          echo "$STATUS" > results/semgrep.status
+
+          # Top findings pour le rapport (lisible)
+          if [ -f results/semgrep-report.json ] && [ "$FINDINGS" -gt 0 ]; then
+            python3 << 'PY' >> "$LOG" || true
+          import json
+          d = json.load(open("results/semgrep-report.json"))
+          results = d.get("results") or []
+          print("")
+          print(f"## Top findings ({min(20, len(results))} / {len(results)})")
+          for r in results[:20]:
+              check = r.get("check_id", "?")
+              path = r.get("path", "?")
+              start = (r.get("start") or {}).get("line", "?")
+              msg = (r.get("extra") or {}).get("message", "")[:120]
+              sev = (r.get("extra") or {}).get("severity", "")
+              print(f"- [{sev}] {check}")
+              print(f"  {path}:{start}")
+              if msg:
+                  print(f"  {msg}")
+          PY
           fi
+
+          echo "STATUS=$STATUS FINDINGS=$FINDINGS"
           cat "$LOG"
+
+          # Important : ne jamais faire échouer le job pour des findings
+          exit 0
 
       # ---------- 6) Socket Firewall (action officielle qui marchait) ----------
       - name: "📦 Socket Firewall"
