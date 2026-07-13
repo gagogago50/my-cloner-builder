@@ -48,13 +48,13 @@ jobs:
             echo "✅ Aucun binaire pré-compilé suspect trouvé dans le code source."
           fi
 
-      # Détection des attaques de Supply Chain (Vol de données via les dépendances externes)
+# Détection des attaques de Supply Chain (Vol de données via les dépendances externes)
       - name: Scan Dependencies for Malware & Obfuscation (Socket)
         uses: SocketDev/action@v1
         with:
           socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }}
-          # Détermine dynamiquement le mode : 'diff' pour une PR, sinon 'search' pour le reste (push, manuel)
-          mode: ${{ github.event_name == 'pull_request' && 'diff' || 'search' }}
+          # Corrigé : 'patch' pour les Pull Requests, sinon 'cli' pour vos builds manuels
+          mode: ${{ github.event_name == 'pull_request' && 'patch' || 'cli' }}
 
       # Détection des vulnérabilités logiques et patterns malveillants dans votre code
       - name: Scan Source Code Logic (Semgrep OSS)
