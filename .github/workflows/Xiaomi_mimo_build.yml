@@ -1,115 +1,292 @@
-name: Build MiMo-Code Windows x64 (Parallel)
+name: Build MiMo-Code Windows x64 (Secure Parallel)
 
 on:
-  workflow_dispatch: # Déclenchement UNIQUEMENT manuel depuis l'interface GitHub
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branche / tag / commit à builder"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+  security-events: write   # pour CodeQL
 
 jobs:
-  # -------------------------------------------------------------------------
-  # TÂCHE 1 (Parallèle) : Détection des binaires malveillants
-  # -------------------------------------------------------------------------
+  # =========================================================================
+  # SCANS DE SÉCURITÉ (tous en parallèle)
+  # =========================================================================
   check-binaries:
-    name: Anti-Malware Scan
+    name: "🛡️ Binary & Precompiled Scan"
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Upstream Source Code
+      - name: Checkout Upstream
         uses: actions/checkout@v4
         with:
-          repository: 'XiaomiMiMo/MiMo-Code'
-          ref: 'main'
+          repository: XiaomiMiMo/MiMo-Code
+          ref: ${{ inputs.ref }}
 
-       Pentest: Check for Pre-compiled Binaries
+      - name: Scan for precompiled binaries & suspicious files
         run: |
-          echo "Recherche de fichiers binaires suspects..."
-          SUSPECT_EXTENSIONS="exe dll bin msi sys so dylib bat cmd cpl scr"
-          FOUND_BINARIES=""
-          
-          for ext in $SUSPECT_EXTENSIONS; do
-            FILES=$(find . -type f -iname "*.$ext" -not -path "*/.git/*" -not -path "*/node_modules/*")
-            if [ ! -z "$FILES" ]; then
-              echo "⚠️ ALERTE : Fichier(s) .$ext détecté(s) :"
-              echo "$FILES"
-              FOUND_BINARIES="true"
+          set -euo pipefail
+          echo "🔍 Recherche de binaires pré-compilés et fichiers suspects..."
+
+          FOUND=0
+          SUSPECT_EXT="exe dll bin msi sys so dylib bat cmd cpl scr pyc class jar war com pif"
+
+          for ext in $SUSPECT_EXT; do
+            mapfile -t FILES < <(find . -type f -iname "*.$ext" \
+              -not -path "*/.git/*" \
+              -not -path "*/node_modules/*" \
+              -not -path "*/dist/*" \
+              -not -path "*/build/*" \
+              -not -path "*/.bun/*" 2>/dev/null || true)
+            if [ ${#FILES[@]} -gt 0 ]; then
+              echo "⚠️  Fichiers .$ext détectés :"
+              printf '  - %s\n' "${FILES[@]}"
+              FOUND=1
             fi
           done
-          
-          if [ "$FOUND_BINARIES" = "true" ]; then
-            echo "❌ ERREUR CRITIQUE : Le dépôt contient des fichiers binaires."
+
+          echo "🔍 Analyse des headers (PE/ELF/Mach-O)..."
+          while IFS= read -r -d '' f; do
+            TYPE=$(file -b "$f" 2>/dev/null || true)
+            if echo "$TYPE" | grep -qE 'PE32|PE32\+|ELF|Mach-O|executable|shared object|MS-DOS executable'; then
+              if ! echo "$f" | grep -qE '\.(png|jpg|jpeg|gif|ico|woff2?|ttf|otf|svg|wasm)$'; then
+                echo "⚠️  Possible binaire : $f → $TYPE"
+                FOUND=1
+              fi
+            fi
+          done < <(find . -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -size +512c -print0 2>/dev/null | head -z -n 2000)
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "❌ Binaires / fichiers suspects détectés → build bloqué"
             exit 1
-          else
-            echo "✅ Aucun binaire pré-compilé suspect trouvé."
+          fi
+          echo "✅ Aucun binaire pré-compilé suspect"
+
+  malware-scan:
+    name: "🦠 ClamAV Malware Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Upstream
+        uses: actions/checkout@v4
+        with:
+          repository: XiaomiMiMo/MiMo-Code
+          ref: ${{ inputs.ref }}
+
+      - name: Install & update ClamAV
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav clamav-freshclam
+          sudo freshclam --quiet || true
+
+      - name: Scan repository
+        run: |
+          clamscan -r -i --bell \
+            --exclude-dir=.git \
+            --exclude-dir=node_modules \
+            --exclude-dir=dist \
+            --exclude-dir=build \
+            --max-filesize=50M \
+            --max-scansize=200M \
+            . || {
+              echo "❌ Malware / stealer / backdoor potentiel détecté par ClamAV"
+              exit 1
+            }
+          echo "✅ ClamAV clean"
+
+  secrets-scan:
+    name: "🔑 Secrets (Gitleaks)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Upstream
+        uses: actions/checkout@v4
+        with:
+          repository: XiaomiMiMo/MiMo-Code
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}   # optionnel
+
+  socket-scan:
+    name: "📦 Socket Dependency Firewall"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Upstream
+        uses: actions/checkout@v4
+        with:
+          repository: XiaomiMiMo/MiMo-Code
+          ref: ${{ inputs.ref }}
+
+      - name: Socket Security
+        uses: SocketDev/socket-security-action@v1
+        with:
+          socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }}
+          mode: "firewall"
+          # fail on high/critical by default
+
+  semgrep-scan:
+    name: "🔬 Semgrep (Security + Secrets)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Upstream
+        uses: actions/checkout@v4
+        with:
+          repository: XiaomiMiMo/MiMo-Code
+          ref: ${{ inputs.ref }}
+
+      - name: Semgrep
+        uses: semgrep/semgrep-action@v1
+        continue-on-error: true          # mets false si tu veux bloquer
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/javascript
+            p/typescript
+            p/owasp-top-ten
+
+  codeql-scan:
+    name: "🧠 CodeQL Analysis"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Upstream
+        uses: actions/checkout@v4
+        with:
+          repository: XiaomiMiMo/MiMo-Code
+          ref: ${{ inputs.ref }}
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        continue-on-error: true
+
+  # Scan complémentaire (scripts d’install + obfuscation basique)
+  suspicious-patterns:
+    name: "🕵️ Suspicious Patterns & Install Scripts"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Upstream
+        uses: actions/checkout@v4
+        with:
+          repository: XiaomiMiMo/MiMo-Code
+          ref: ${{ inputs.ref }}
+
+      - name: Check package.json install scripts + obfuscation patterns
+        run: |
+          set -euo pipefail
+          FOUND=0
+
+          echo "=== Scripts pre/postinstall suspects ==="
+          while IFS= read -r pkg; do
+            if jq -e '.scripts | (has("preinstall") or has("postinstall") or has("install") or has("prepare"))' "$pkg" >/dev/null 2>&1; then
+              echo "⚠️  $pkg contient des scripts d'installation :"
+              jq -r '.scripts | to_entries[] | select(.key | test("preinstall|postinstall|^install$|prepare")) | "  \(.key): \(.value)"' "$pkg"
+              FOUND=1
+            fi
+          done < <(find . -name package.json -not -path "*/node_modules/*" -not -path "*/.git/*")
+
+          echo ""
+          echo "=== Patterns d'obfuscation / stealer basiques ==="
+          # Patterns très suspects (à affiner selon le projet)
+          if grep -RInE --include='*.{js,ts,mjs,cjs,jsx,tsx}' \
+            -e 'eval\s*\(' \
+            -e 'Function\s*\(' \
+            -e 'atob\s*\(' \
+            -e 'fromCharCode' \
+            -e 'child_process' \
+            -e 'powershell|cmd\.exe|bitsadmin|certutil' \
+            -e 'discord\.com/api/webhooks' \
+            -e 'api\.telegram\.org' \
+            -e 'steal|keylog|clipboard|password|cookie|wallet' \
+            -e 'Buffer\.from\([^,]+,\s*["'\'']base64["'\'']' \
+            . 2>/dev/null | grep -v node_modules | head -50; then
+            echo "⚠️  Patterns suspects trouvés (vérifie manuellement)"
+            FOUND=1
           fi
 
-  # -------------------------------------------------------------------------
-  # TÂCHE 2 (Parallèle) : Analyse des failles de dépendances (Socket)
-  # -------------------------------------------------------------------------
-  socket-scan:
-    name: Socket Dependency Scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Upstream Source Code
-        uses: actions/checkout@v4
-        with:
-          repository: 'XiaomiMiMo/MiMo-Code'
-          ref: 'main'
+          if [ "$FOUND" -eq 1 ]; then
+            echo "❌ Patterns suspects → à investiguer (le job échoue volontairement)"
+            exit 1
+          fi
+          echo "✅ Pas de patterns hautement suspects"
 
-      - name: Scan Dependencies (Socket)
-        uses: SocketDev/action@v1
-        with:
-          socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }} 
-          mode: 'firewall'
-
-  # -------------------------------------------------------------------------
-  # TÂCHE 3 (Parallèle) : Analyse de la logique du code (Semgrep)
-  # -------------------------------------------------------------------------
-  semgrep-scan:
-    name: Semgrep Code Scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Upstream Source Code
-        uses: actions/checkout@v4
-        with:
-          repository: 'XiaomiMiMo/MiMo-Code'
-          ref: 'main'
-
-      - name: Scan Source Code Logic (Semgrep)
-        uses: semgrep/semgrep-action@v1
-        continue-on-error: true # Affiche les 18 failles trouvées chez Xiaomi sans bloquer
-        with:
-          config: "p/security-audit p/secrets"
-
-  # -------------------------------------------------------------------------
-  # TÂCHE 4 (Parallèle) : Compilation Réelle de MiMo-Code pour Windows
-  # -------------------------------------------------------------------------
-  build-mimo-windows:
-    name: Compile Windows x64 Executable
-    runs-on: windows-latest # Machine Windows native indispensable pour les dépendances de MiMo
+  # =========================================================================
+  # BUILD WINDOWS (démarre uniquement si les scans critiques passent)
+  # =========================================================================
+  build-windows:
+    name: "🏗️ Build Windows AMD64"
+    runs-on: windows-latest
+    needs:
+      - check-binaries
+      - malware-scan
+      - secrets-scan
+      - socket-scan
+      - suspicious-patterns
+      # semgrep + codeql sont en continue-on-error → on ne les met pas en needs strict
 
     steps:
-      # Récupération de la dernière version du code source officiel de Xiaomi
-      - name: Checkout Upstream Source Code
+      - name: Checkout Upstream Source
         uses: actions/checkout@v4
         with:
-          repository: 'XiaomiMiMo/MiMo-Code'
-          ref: 'main'
+          repository: XiaomiMiMo/MiMo-Code
+          ref: ${{ inputs.ref }}
 
-      # Installation de l'environnement Bun
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      # Installation des dépendances du projet
-      - name: Install Dependencies
+      - name: Cache Bun
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            **/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb', '**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        continue-on-error: true
+
+      - name: Install dependencies (fallback)
+        if: failure()
         run: bun install
 
-      # Compilation standalone (.exe CLI)
-      - name: Run Build Command
+      - name: Build Windows x64
         run: bun run packages/opencode/script/build.ts --single
 
-      # Génération et publication de l'artefact téléchargeable
-      - name: Upload Windows x64 Executable
+      - name: Debug – list generated executables
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+      - name: Upload Windows AMD64 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MiMo-Code-Windows-CLI-x64
-          path: '**/dist/opencode-windows-x64/bin/opencode.exe'
+          name: MiMo-Code-Windows-x64
+          path: |
+            **/dist/**/opencode.exe
+            **/dist/**/bin/opencode.exe
+            **/opencode-windows-x64/**
           if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
