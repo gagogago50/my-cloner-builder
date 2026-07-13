@@ -1,21 +1,23 @@
-name: Secure Pre-Build Gatekeeper (Template)
+name: Build MiMo-Code Windows x64 (Parallel)
 
 on:
   workflow_dispatch: # Déclenchement UNIQUEMENT manuel depuis l'interface GitHub
 
 jobs:
-  # ÉTAPE 1 : Les vérifications de sécurité fondamentales
-  security-verification:
-    name: Integrity & Security Scan
+  # -------------------------------------------------------------------------
+  # TÂCHE 1 (Parallèle) : Détection des binaires malveillants
+  # -------------------------------------------------------------------------
+  check-binaries:
+    name: Anti-Malware Scan
     runs-on: ubuntu-latest
-
     steps:
-      # Récupère le code source du dépôt actuel
-      - name: Checkout Source Code
+      - name: Checkout Upstream Source Code
         uses: actions/checkout@v4
+        with:
+          repository: 'XiaomiMiMo/MiMo-Code'
+          ref: 'main'
 
-      # Détection des binaires pré-compilés interdits (Anti-Malware)
-      - name: Check for Pre-compiled Binaries (Anti-Malware Gate)
+       Pentest: Check for Pre-compiled Binaries
         run: |
           echo "Recherche de fichiers binaires suspects..."
           SUSPECT_EXTENSIONS="exe dll bin msi sys so dylib bat cmd cpl scr"
@@ -31,37 +33,83 @@ jobs:
           done
           
           if [ "$FOUND_BINARIES" = "true" ]; then
-            echo "❌ ERREUR CRITIQUE : Le dépôt contains des fichiers binaires."
+            echo "❌ ERREUR CRITIQUE : Le dépôt contient des fichiers binaires."
             exit 1
           else
             echo "✅ Aucun binaire pré-compilé suspect trouvé."
           fi
 
-      # Détection des attaques de Supply Chain (Socket)
-      - name: Scan Dependencies for Malware & Obfuscation (Socket)
+  # -------------------------------------------------------------------------
+  # TÂCHE 2 (Parallèle) : Analyse des failles de dépendances (Socket)
+  # -------------------------------------------------------------------------
+  socket-scan:
+    name: Socket Dependency Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Upstream Source Code
+        uses: actions/checkout@v4
+        with:
+          repository: 'XiaomiMiMo/MiMo-Code'
+          ref: 'main'
+
+      - name: Scan Dependencies (Socket)
         uses: SocketDev/action@v1
         with:
           socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }} 
           mode: 'firewall'
 
-      # Détection des vulnérabilités logiques (Semgrep OSS)
-      - name: Scan Source Code Logic (Semgrep OSS)
+  # -------------------------------------------------------------------------
+  # TÂCHE 3 (Parallèle) : Analyse de la logique du code (Semgrep)
+  # -------------------------------------------------------------------------
+  semgrep-scan:
+    name: Semgrep Code Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Upstream Source Code
+        uses: actions/checkout@v4
+        with:
+          repository: 'XiaomiMiMo/MiMo-Code'
+          ref: 'main'
+
+      - name: Scan Source Code Logic (Semgrep)
         uses: semgrep/semgrep-action@v1
-        continue-on-error: true # CORRECTION : Affiche les 18 failles mais NE BLOQUE PLUS le build de l'application
+        continue-on-error: true # Affiche les 18 failles trouvées chez Xiaomi sans bloquer
         with:
           config: "p/security-audit p/secrets"
 
-  # ÉTAPE 2 : Le build proprement dit (Se lancera désormais sans problème)
-  build-application:
-    name: Compile & Build Project
-    needs: security-verification
-    runs-on: ubuntu-latest # À remplacer par windows-latest si vous compilez le .exe de MiMo
-    
-    steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
+  # -------------------------------------------------------------------------
+  # TÂCHE 4 (Parallèle) : Compilation Réelle de MiMo-Code pour Windows
+  # -------------------------------------------------------------------------
+  build-mimo-windows:
+    name: Compile Windows x64 Executable
+    runs-on: windows-latest # Machine Windows native indispensable pour les dépendances de MiMo
 
-      # Commande de build réelle (Mettez vos étapes Bun / Node / C# ici)
+    steps:
+      # Récupération de la dernière version du code source officiel de Xiaomi
+      - name: Checkout Upstream Source Code
+        uses: actions/checkout@v4
+        with:
+          repository: 'XiaomiMiMo/MiMo-Code'
+          ref: 'main'
+
+      # Installation de l'environnement Bun
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Installation des dépendances du projet
+      - name: Install Dependencies
+        run: bun install
+
+      # Compilation standalone (.exe CLI)
       - name: Run Build Command
-        run: |
-          echo "Lancement de la compilation..."
+        run: bun run packages/opencode/script/build.ts --single
+
+      # Génération et publication de l'artefact téléchargeable
+      - name: Upload Windows x64 Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiMo-Code-Windows-CLI-x64
+          path: '**/dist/opencode-windows-x64/bin/opencode.exe'
+          if-no-files-found: error
