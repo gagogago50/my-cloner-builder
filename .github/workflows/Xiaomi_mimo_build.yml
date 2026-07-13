@@ -396,32 +396,128 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb', '**/package.json') }}
-          restore-keys: ${{ runner.os }}-bun-
+          restore-keys: |
+            ${{ runner.os }}-bun-
 
-      - name: Install
-        run: bun install --frozen-lockfile
-        continue-on-error: true
-
-      - name: Install (fallback)
-        if: failure()
-        run: bun install
-
-      - name: Build
-        run: bun run packages/opencode/script/build.ts --single
-
-      - name: List exe
+      - name: Show project layout (debug)
         shell: pwsh
         run: |
-          Get-ChildItem -Path . -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
+          Write-Host "=== Root ==="
+          Get-ChildItem -Force | Format-Table Name, Mode
+          Write-Host "=== package.json scripts (root) ==="
+          if (Test-Path package.json) { Get-Content package.json | Select-Object -First 80 }
+          Write-Host "=== packages ==="
+          if (Test-Path packages) { Get-ChildItem packages -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object FullName }
 
-      - name: Upload binary
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "frozen-lockfile failed, fallback bun install"
+            bun install
+          }
+
+      - name: Build Windows x64
+        shell: pwsh
+        run: |
+          # Affiche l'aide du script si dispo
+          if (Test-Path "packages/opencode/script/build.ts") {
+            Write-Host "=== Running build.ts --single ==="
+            bun run packages/opencode/script/build.ts --single
+          } elseif (Test-Path "packages/opencode/package.json") {
+            Write-Host "=== Fallback: bun run build in packages/opencode ==="
+            Push-Location packages/opencode
+            bun run build
+            Pop-Location
+          } else {
+            Write-Host "=== Fallback: root bun run build ==="
+            bun run build
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Discover binaries (debug)
+        id: discover
+        shell: pwsh
+        run: |
+          Write-Host "=== All .exe under workspace ==="
+          $exes = Get-ChildItem -Path . -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\node_modules\\|\\\.git\\|\\\.bun\\' }
+          if ($exes) {
+            $exes | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
+            $exes | ForEach-Object { $_.FullName } | Out-File -FilePath found-exes.txt -Encoding utf8
+          } else {
+            Write-Host "NONE found"
+            "" | Out-File found-exes.txt
+          }
+
+          Write-Host "=== dist / out / bin folders ==="
+          Get-ChildItem -Path . -Recurse -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(dist|out|bin|build|release)$' -and $_.FullName -notmatch 'node_modules|\.git' } |
+            Select-Object -First 40 FullName
+
+          Write-Host "=== Recent files (last 15 min) ==="
+          Get-ChildItem -Path . -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-15) -and $_.FullName -notmatch 'node_modules|\.git|\.bun' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 50 FullName, Length, LastWriteTime
+
+      - name: Stage artifact folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact-out | Out-Null
+
+          # Chemins historiques MiMo / opencode
+          $candidates = @(
+            "**/dist/**/opencode.exe",
+            "**/dist/**/bin/opencode.exe",
+            "**/opencode-windows-x64/**",
+            "**/opencode-windows-x64-baseline/**",
+            "**/dist/opencode-windows*/**"
+          )
+
+          $copied = $false
+          foreach ($pattern in @(
+            "dist\opencode-windows-x64\bin\opencode.exe",
+            "dist\opencode-windows-x64\opencode.exe",
+            "packages\opencode\dist\opencode-windows-x64\bin\opencode.exe",
+            "packages\opencode\dist\**\opencode.exe"
+          )) {
+            $hits = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue
+            foreach ($h in $hits) {
+              Copy-Item $h.FullName -Destination artifact-out\ -Force
+              Write-Host "Copied: $($h.FullName)"
+              $copied = $true
+            }
+          }
+
+          # Filet de sécurité : tout .exe hors node_modules
+          if (-not $copied) {
+            Get-ChildItem -Path . -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '\\node_modules\\|\\\.git\\|\\\.bun\\' } |
+              ForEach-Object {
+                $rel = $_.FullName.Replace((Get-Location).Path + '\', '')
+                $destDir = Join-Path artifact-out (Split-Path $rel -Parent)
+                New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+                Copy-Item $_.FullName -Destination (Join-Path $destDir $_.Name) -Force
+                Write-Host "Fallback copied: $rel"
+                $copied = $true
+              }
+          }
+
+          if (-not $copied) {
+            Write-Host "::error::Aucun .exe produit par le build"
+            Get-ChildItem artifact-out -Recurse -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          Get-ChildItem artifact-out -Recurse | Format-Table FullName, Length
+
+      - name: Upload Windows binary
         uses: actions/upload-artifact@v4
         with:
           name: MiMo-Code-Windows-x64
-          path: |
-            **/dist/**/opencode.exe
-            **/dist/**/bin/opencode.exe
-            **/opencode-windows-x64/**
+          path: artifact-out/**
           if-no-files-found: error
           retention-days: 14
+          compression-level: 9
