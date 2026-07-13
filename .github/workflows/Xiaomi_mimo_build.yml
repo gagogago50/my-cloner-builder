@@ -214,9 +214,9 @@ jobs:
           fi
           cat "$LOG"
 
-      # ---------- 6) Socket (optionnel, skip si pas de secret) ----------
+      # ---------- 6) Socket (optionnel) ----------
       - name: "📦 Socket (optional)"
-        if: ${{ secrets.SOCKET_SECURITY_API_KEY != '' }}
+        id: socket
         continue-on-error: true
         uses: SocketDev/socket-security-action@v1
         with:
@@ -226,16 +226,21 @@ jobs:
       - name: Socket status file
         if: always()
         run: |
-          if [ ! -f results/socket.status ]; then
-            if [ -z "${{ secrets.SOCKET_SECURITY_API_KEY }}" ]; then
-              echo "WARN" > results/socket.status
-              echo "**Résultat: WARN** — SOCKET_SECURITY_API_KEY absent (scan ignoré)" > results/socket.log
-            else
+          case "${{ steps.socket.outcome }}" in
+            success)
               echo "PASS" > results/socket.status
-              echo "**Résultat: PASS** (ou voir logs Socket)" > results/socket.log
-            fi
-          fi
-
+              echo "**Résultat: PASS**" > results/socket.log
+              ;;
+            skipped)
+              echo "WARN" > results/socket.status
+              echo "**Résultat: WARN** — step skipped" > results/socket.log
+              ;;
+            *)
+              # échec = souvent token manquant ou alerte Socket
+              echo "WARN" > results/socket.status
+              echo "**Résultat: WARN** — Socket non OK (token manquant ou alerte). outcome=${{ steps.socket.outcome }}" > results/socket.log
+              ;;
+          esac
       # ---------- Rapport MD ----------
       - name: "📋 Generate SECURITY_REPORT.md"
         if: always()
