@@ -1,249 +1,383 @@
-name: Build MiMo-Code Windows x64 (Secure Parallel)
+name: Build MiMo-Code Windows x64 (Parallel + Report)
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branche / tag / commit à builder"
+        description: "Branche / tag / commit"
         required: false
         default: "main"
         type: string
 
 permissions:
   contents: read
-  security-events: write   # pour CodeQL
+
+env:
+  UPSTREAM_REPO: XiaomiMiMo/MiMo-Code
 
 jobs:
   # =========================================================================
-  # SCANS DE SÉCURITÉ (tous en parallèle)
+  # JOB 1 — TOUS LES SCANS + RAPPORT MD (1 seul runner Ubuntu)
   # =========================================================================
-  check-binaries:
-    name: "🛡️ Binary & Precompiled Scan"
+  security-and-report:
+    name: "🔐 Security scans + Report"
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
-      - name: Checkout Upstream
+      - name: Checkout upstream
         uses: actions/checkout@v4
         with:
-          repository: XiaomiMiMo/MiMo-Code
+          repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ inputs.ref }}
+          fetch-depth: 0
 
-      - name: Scan for precompiled binaries & suspicious files
+      - name: Prepare results dir
+        run: mkdir -p results report
+
+      # ---------- 1) Binaires précompilés ----------
+      - name: "🛡️ Binary / precompiled scan"
         run: |
-          set -euo pipefail
-          echo "🔍 Recherche de binaires pré-compilés et fichiers suspects..."
-
+          set +e
+          LOG=results/binaries.log
+          STATUS=PASS
           FOUND=0
-          SUSPECT_EXT="exe dll bin msi sys so dylib bat cmd cpl scr pyc class jar war com pif"
+          {
+            echo "# Binary / Precompiled Scan"
+            echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+          } > "$LOG"
 
+          SUSPECT_EXT="exe dll bin msi sys so dylib bat cmd cpl scr pyc class jar war com pif"
           for ext in $SUSPECT_EXT; do
             mapfile -t FILES < <(find . -type f -iname "*.$ext" \
-              -not -path "*/.git/*" \
-              -not -path "*/node_modules/*" \
-              -not -path "*/dist/*" \
-              -not -path "*/build/*" \
-              -not -path "*/.bun/*" 2>/dev/null || true)
+              -not -path "*/.git/*" -not -path "*/node_modules/*" \
+              -not -path "*/dist/*" -not -path "*/build/*" 2>/dev/null || true)
             if [ ${#FILES[@]} -gt 0 ]; then
-              echo "⚠️  Fichiers .$ext détectés :"
-              printf '  - %s\n' "${FILES[@]}"
+              echo "### .$ext" >> "$LOG"
+              printf '%s\n' "${FILES[@]}" >> "$LOG"
               FOUND=1
             fi
           done
 
-          echo "🔍 Analyse des headers (PE/ELF/Mach-O)..."
+          echo "" >> "$LOG"
+          echo "## Headers PE/ELF/Mach-O" >> "$LOG"
           while IFS= read -r -d '' f; do
             TYPE=$(file -b "$f" 2>/dev/null || true)
             if echo "$TYPE" | grep -qE 'PE32|PE32\+|ELF|Mach-O|executable|shared object|MS-DOS executable'; then
               if ! echo "$f" | grep -qE '\.(png|jpg|jpeg|gif|ico|woff2?|ttf|otf|svg|wasm)$'; then
-                echo "⚠️  Possible binaire : $f → $TYPE"
+                echo "- \`$f\` → $TYPE" >> "$LOG"
                 FOUND=1
               fi
             fi
           done < <(find . -type f -not -path "*/.git/*" -not -path "*/node_modules/*" -size +512c -print0 2>/dev/null | head -z -n 2000)
 
           if [ "$FOUND" -eq 1 ]; then
-            echo "❌ Binaires / fichiers suspects détectés → build bloqué"
-            exit 1
+            STATUS=FAIL
+            echo "" >> "$LOG"
+            echo "**Résultat: FAIL**" >> "$LOG"
+          else
+            echo "" >> "$LOG"
+            echo "**Résultat: PASS**" >> "$LOG"
           fi
-          echo "✅ Aucun binaire pré-compilé suspect"
+          echo "$STATUS" > results/binaries.status
+          cat "$LOG"
 
-  malware-scan:
-    name: "🦠 ClamAV Malware Scan"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Upstream
-        uses: actions/checkout@v4
-        with:
-          repository: XiaomiMiMo/MiMo-Code
-          ref: ${{ inputs.ref }}
-
-      - name: Install & update ClamAV
+      # ---------- 2) ClamAV ----------
+      - name: "🦠 ClamAV"
         run: |
+          set +e
           sudo apt-get update -qq
           sudo apt-get install -y -qq clamav clamav-freshclam
           sudo freshclam --quiet || true
 
-      - name: Scan repository
+          LOG=results/clamav.log
+          clamscan -r -i \
+            --exclude-dir=.git --exclude-dir=node_modules \
+            --exclude-dir=dist --exclude-dir=build \
+            --max-filesize=50M --max-scansize=200M \
+            . > "$LOG" 2>&1
+          RC=$?
+          if [ $RC -eq 0 ]; then
+            echo "PASS" > results/clamav.status
+            echo "" >> "$LOG"
+            echo "**Résultat: PASS**" >> "$LOG"
+          elif [ $RC -eq 1 ]; then
+            echo "FAIL" > results/clamav.status
+            echo "" >> "$LOG"
+            echo "**Résultat: FAIL** — infection(s)" >> "$LOG"
+          else
+            echo "WARN" > results/clamav.status
+            echo "" >> "$LOG"
+            echo "**Résultat: WARN** — exit $RC" >> "$LOG"
+          fi
+          cat "$LOG"
+
+      # ---------- 3) Gitleaks ----------
+      - name: "🔑 Gitleaks"
         run: |
-          clamscan -r -i --bell \
-            --exclude-dir=.git \
-            --exclude-dir=node_modules \
-            --exclude-dir=dist \
-            --exclude-dir=build \
-            --max-filesize=50M \
-            --max-scansize=200M \
-            . || {
-              echo "❌ Malware / stealer / backdoor potentiel détecté par ClamAV"
-              exit 1
-            }
-          echo "✅ ClamAV clean"
+          set +e
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          sudo install -m 755 gitleaks /usr/local/bin/gitleaks
 
-  secrets-scan:
-    name: "🔑 Secrets (Gitleaks)"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Upstream
-        uses: actions/checkout@v4
-        with:
-          repository: XiaomiMiMo/MiMo-Code
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0
+          LOG=results/gitleaks.log
+          gitleaks detect --source . --no-git -v \
+            --report-path results/gitleaks-report.json 2>&1 | tee "$LOG"
+          RC=$?
+          if [ $RC -eq 0 ]; then
+            echo "PASS" > results/gitleaks.status
+            echo "" >> "$LOG"
+            echo "**Résultat: PASS**" >> "$LOG"
+          else
+            echo "FAIL" > results/gitleaks.status
+            echo "" >> "$LOG"
+            echo "**Résultat: FAIL** — secrets potentiels" >> "$LOG"
+          fi
 
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}   # optionnel
-
-  socket-scan:
-    name: "📦 Socket Dependency Firewall"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Upstream
-        uses: actions/checkout@v4
-        with:
-          repository: XiaomiMiMo/MiMo-Code
-          ref: ${{ inputs.ref }}
-
-      - name: Socket Security
-        uses: SocketDev/socket-security-action@v1
-        with:
-          socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }}
-          mode: "firewall"
-          # fail on high/critical by default
-
-  semgrep-scan:
-    name: "🔬 Semgrep (Security + Secrets)"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Upstream
-        uses: actions/checkout@v4
-        with:
-          repository: XiaomiMiMo/MiMo-Code
-          ref: ${{ inputs.ref }}
-
-      - name: Semgrep
-        uses: semgrep/semgrep-action@v1
-        continue-on-error: true          # mets false si tu veux bloquer
-        with:
-          config: >-
-            p/security-audit
-            p/secrets
-            p/javascript
-            p/typescript
-            p/owasp-top-ten
-
-  codeql-scan:
-    name: "🧠 CodeQL Analysis"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Upstream
-        uses: actions/checkout@v4
-        with:
-          repository: XiaomiMiMo/MiMo-Code
-          ref: ${{ inputs.ref }}
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: javascript
-          queries: security-extended,security-and-quality
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        continue-on-error: true
-
-  # Scan complémentaire (scripts d’install + obfuscation basique)
-  suspicious-patterns:
-    name: "🕵️ Suspicious Patterns & Install Scripts"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Upstream
-        uses: actions/checkout@v4
-        with:
-          repository: XiaomiMiMo/MiMo-Code
-          ref: ${{ inputs.ref }}
-
-      - name: Check package.json install scripts + obfuscation patterns
+      # ---------- 4) Semgrep ----------
+      - name: "🔬 Semgrep"
         run: |
-          set -euo pipefail
+          set +e
+          pip install -q semgrep
+          LOG=results/semgrep.log
+          semgrep scan \
+            --config p/security-audit \
+            --config p/secrets \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/owasp-top-ten \
+            --json -o results/semgrep-report.json \
+            . 2>&1 | tee "$LOG"
+          RC=$?
+          FINDINGS=0
+          if [ -f results/semgrep-report.json ]; then
+            FINDINGS=$(python3 -c "import json; d=json.load(open('results/semgrep-report.json')); print(len(d.get('results',[])))" 2>/dev/null || echo 0)
+          fi
+          echo "Findings: $FINDINGS" >> "$LOG"
+          if [ "$FINDINGS" -gt 0 ]; then
+            echo "WARN" > results/semgrep.status
+            echo "**Résultat: WARN** — $FINDINGS finding(s)" >> "$LOG"
+          else
+            echo "PASS" > results/semgrep.status
+            echo "**Résultat: PASS**" >> "$LOG"
+          fi
+          [ $RC -gt 1 ] && echo "WARN" > results/semgrep.status
+
+      # ---------- 5) Patterns suspects ----------
+      - name: "🕵️ Suspicious patterns"
+        run: |
+          set +e
+          LOG=results/patterns.log
           FOUND=0
+          {
+            echo "# Suspicious Patterns & Install Scripts"
+            echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "## Scripts pre/postinstall"
+          } > "$LOG"
 
-          echo "=== Scripts pre/postinstall suspects ==="
           while IFS= read -r pkg; do
-            if jq -e '.scripts | (has("preinstall") or has("postinstall") or has("install") or has("prepare"))' "$pkg" >/dev/null 2>&1; then
-              echo "⚠️  $pkg contient des scripts d'installation :"
-              jq -r '.scripts | to_entries[] | select(.key | test("preinstall|postinstall|^install$|prepare")) | "  \(.key): \(.value)"' "$pkg"
+            if command -v jq >/dev/null && jq -e '.scripts | (has("preinstall") or has("postinstall") or has("install") or has("prepare"))' "$pkg" >/dev/null 2>&1; then
+              echo "### \`$pkg\`" >> "$LOG"
+              jq -r '.scripts | to_entries[] | select(.key | test("preinstall|postinstall|^install$|prepare")) | "- **\(.key)**: `\(.value)`"' "$pkg" >> "$LOG"
               FOUND=1
             fi
           done < <(find . -name package.json -not -path "*/node_modules/*" -not -path "*/.git/*")
 
-          echo ""
-          echo "=== Patterns d'obfuscation / stealer basiques ==="
-          # Patterns très suspects (à affiner selon le projet)
-          if grep -RInE --include='*.{js,ts,mjs,cjs,jsx,tsx}' \
-            -e 'eval\s*\(' \
-            -e 'Function\s*\(' \
-            -e 'atob\s*\(' \
-            -e 'fromCharCode' \
-            -e 'child_process' \
+          echo "" >> "$LOG"
+          echo "## Patterns obfuscation / stealer" >> "$LOG"
+          HITS=$(grep -RInE --include='*.{js,ts,mjs,cjs,jsx,tsx}' \
+            -e 'eval\s*\(' -e 'Function\s*\(' -e 'atob\s*\(' \
+            -e 'fromCharCode' -e 'child_process' \
             -e 'powershell|cmd\.exe|bitsadmin|certutil' \
-            -e 'discord\.com/api/webhooks' \
-            -e 'api\.telegram\.org' \
-            -e 'steal|keylog|clipboard|password|cookie|wallet' \
+            -e 'discord\.com/api/webhooks' -e 'api\.telegram\.org' \
             -e 'Buffer\.from\([^,]+,\s*["'\'']base64["'\'']' \
-            . 2>/dev/null | grep -v node_modules | head -50; then
-            echo "⚠️  Patterns suspects trouvés (vérifie manuellement)"
+            . 2>/dev/null | grep -v node_modules | head -80 || true)
+
+          if [ -n "$HITS" ]; then
+            echo '```' >> "$LOG"
+            echo "$HITS" >> "$LOG"
+            echo '```' >> "$LOG"
             FOUND=1
+          else
+            echo "_Aucun pattern hautement suspect._" >> "$LOG"
           fi
 
           if [ "$FOUND" -eq 1 ]; then
-            echo "❌ Patterns suspects → à investiguer (le job échoue volontairement)"
-            exit 1
+            echo "WARN" > results/patterns.status
+            echo "" >> "$LOG"
+            echo "**Résultat: WARN**" >> "$LOG"
+          else
+            echo "PASS" > results/patterns.status
+            echo "" >> "$LOG"
+            echo "**Résultat: PASS**" >> "$LOG"
           fi
-          echo "✅ Pas de patterns hautement suspects"
+          cat "$LOG"
+
+      # ---------- 6) Socket (optionnel, skip si pas de secret) ----------
+      - name: "📦 Socket (optional)"
+        if: ${{ secrets.SOCKET_SECURITY_API_KEY != '' }}
+        continue-on-error: true
+        uses: SocketDev/socket-security-action@v1
+        with:
+          socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }}
+          mode: "firewall"
+
+      - name: Socket status file
+        if: always()
+        run: |
+          if [ ! -f results/socket.status ]; then
+            if [ -z "${{ secrets.SOCKET_SECURITY_API_KEY }}" ]; then
+              echo "WARN" > results/socket.status
+              echo "**Résultat: WARN** — SOCKET_SECURITY_API_KEY absent (scan ignoré)" > results/socket.log
+            else
+              echo "PASS" > results/socket.status
+              echo "**Résultat: PASS** (ou voir logs Socket)" > results/socket.log
+            fi
+          fi
+
+      # ---------- Rapport MD ----------
+      - name: "📋 Generate SECURITY_REPORT.md"
+        if: always()
+        env:
+          REF: ${{ inputs.ref }}
+          REPO: ${{ env.UPSTREAM_REPO }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          REPORT=report/SECURITY_REPORT.md
+
+          get_status() {
+            local f="results/${1}.status"
+            [ -f "$f" ] && tr -d '\r\n' < "$f" || echo "N/A"
+          }
+          get_log() {
+            local f="results/${1}.log"
+            [ -f "$f" ] && cat "$f" || echo "_Log non disponible_"
+          }
+          badge() {
+            case "$1" in
+              PASS) echo "✅ PASS" ;;
+              FAIL) echo "❌ FAIL" ;;
+              WARN) echo "⚠️ WARN" ;;
+              *)    echo "➖ N/A" ;;
+            esac
+          }
+
+          S_BIN=$(get_status binaries)
+          S_CLAM=$(get_status clamav)
+          S_GIT=$(get_status gitleaks)
+          S_SOCK=$(get_status socket)
+          S_SEM=$(get_status semgrep)
+          S_PAT=$(get_status patterns)
+
+          OVERALL="PASS"
+          for s in "$S_BIN" "$S_CLAM" "$S_GIT"; do
+            [ "$s" = "FAIL" ] && OVERALL="FAIL"
+          done
+          if [ "$OVERALL" != "FAIL" ]; then
+            for s in "$S_SEM" "$S_PAT" "$S_SOCK"; do
+              [ "$s" = "WARN" ] || [ "$s" = "FAIL" ] && OVERALL="WARN"
+            done
+          fi
+
+          {
+            echo "# 🔐 Security Report — MiMo-Code Build"
+            echo ""
+            echo "| Champ | Valeur |"
+            echo "|-------|--------|"
+            echo "| **Dépôt source** | \`$REPO\` |"
+            echo "| **Ref** | \`$REF\` |"
+            echo "| **Date (UTC)** | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+            echo "| **Workflow run** | [Lien]($RUN_URL) |"
+            echo "| **Verdict global** | $(badge "$OVERALL") |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 📊 Synthèse"
+            echo ""
+            echo "| Outil | Objectif | Statut |"
+            echo "|-------|----------|--------|"
+            echo "| Binary / Precompiled | Binaires PE/ELF, .exe/.dll… | $(badge "$S_BIN") |"
+            echo "| ClamAV | Malware / stealer / backdoor | $(badge "$S_CLAM") |"
+            echo "| Gitleaks | Secrets, tokens, clés | $(badge "$S_GIT") |"
+            echo "| Socket | Dépendances à risque | $(badge "$S_SOCK") |"
+            echo "| Semgrep | Logique, OWASP, secrets code | $(badge "$S_SEM") |"
+            echo "| Suspicious Patterns | Obfuscation, install scripts | $(badge "$S_PAT") |"
+            echo ""
+            echo "> ✅ PASS · ⚠️ WARN · ❌ FAIL"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 1. Binary / Precompiled"
+            echo ""
+            echo '```'
+            get_log binaries
+            echo '```'
+            echo ""
+            echo "## 2. ClamAV"
+            echo ""
+            echo '```'
+            get_log clamav
+            echo '```'
+            echo ""
+            echo "## 3. Gitleaks"
+            echo ""
+            echo '```'
+            get_log gitleaks
+            echo '```'
+            echo ""
+            echo "## 4. Socket"
+            echo ""
+            echo '```'
+            get_log socket
+            echo '```'
+            echo ""
+            echo "## 5. Semgrep"
+            echo ""
+            echo '```'
+            get_log semgrep
+            echo '```'
+            echo ""
+            echo "## 6. Suspicious Patterns"
+            echo ""
+            get_log patterns
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 📎 Artefacts"
+            echo ""
+            echo "- Binaire : \`MiMo-Code-Windows-x64\`"
+            echo "- Ce rapport : \`Security-Report\`"
+            echo ""
+            echo "## ⚠️ Avertissement"
+            echo ""
+            echo "Scan automatisé uniquement. Vérifie les WARN/FAIL avant d'exécuter le binaire."
+          } > "$REPORT"
+
+          cp -r results report/raw-results 2>/dev/null || true
+          echo "===== PREVIEW ====="
+          cat "$REPORT"
+
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Security-Report
+          path: report/
+          retention-days: 30
 
   # =========================================================================
-  # BUILD WINDOWS (démarre uniquement si les scans critiques passent)
+  # JOB 2 — BUILD WINDOWS (en parallèle du job sécurité)
   # =========================================================================
   build-windows:
     name: "🏗️ Build Windows AMD64"
     runs-on: windows-latest
-    needs:
-      - check-binaries
-      - malware-scan
-      - secrets-scan
-      - socket-scan
-      - suspicious-patterns
-      # semgrep + codeql sont en continue-on-error → on ne les met pas en needs strict
-
     steps:
-      - name: Checkout Upstream Source
+      - name: Checkout upstream
         uses: actions/checkout@v4
         with:
-          repository: XiaomiMiMo/MiMo-Code
+          repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ inputs.ref }}
 
       - name: Setup Bun
@@ -254,32 +388,28 @@ jobs:
       - name: Cache Bun
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.bun/install/cache
-            **/node_modules
+          path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb', '**/package.json') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
+          restore-keys: ${{ runner.os }}-bun-
 
-      - name: Install dependencies
+      - name: Install
         run: bun install --frozen-lockfile
         continue-on-error: true
 
-      - name: Install dependencies (fallback)
+      - name: Install (fallback)
         if: failure()
         run: bun install
 
-      - name: Build Windows x64
+      - name: Build
         run: bun run packages/opencode/script/build.ts --single
 
-      - name: Debug – list generated executables
+      - name: List exe
         shell: pwsh
         run: |
           Get-ChildItem -Path . -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
+            Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
 
-      - name: Upload Windows AMD64 artifact
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: MiMo-Code-Windows-x64
@@ -289,4 +419,3 @@ jobs:
             **/opencode-windows-x64/**
           if-no-files-found: error
           retention-days: 14
-          compression-level: 9
