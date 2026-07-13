@@ -40,12 +40,12 @@ jobs:
             echo "✅ Aucun binaire pré-compilé suspect trouvé."
           fi
 
-      # Détection des attaques de Supply Chain (Socket avec votre clé API)
+# Détection des attaques de Supply Chain (Socket)
       - name: Scan Dependencies for Malware & Obfuscation (Socket)
         uses: SocketDev/action@v1
         with:
           socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }}
-          mode: 'cli' # Fixé sur 'cli' car le lancement est uniquement manuel via workflow_dispatch
+          mode: 'firewall' # Remplace 'cli' par 'firewall' pour corriger le bug
 
       # Détection des vulnérabilités logiques et patterns malveillants dans le code
       - name: Scan Source Code Logic (Semgrep OSS)
