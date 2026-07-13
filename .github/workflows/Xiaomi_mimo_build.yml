@@ -1,13 +1,7 @@
-name: Secure Pre-Build Gatekeeper
+name: Build MiMo-Code Windows x64
 
 on:
-  push:
-    branches: [ "main", "master", "develop" ]
-  pull_request:
-    branches: [ "main", "master", "develop" ]
-  workflow_dispatch: # Permet de lancer le build manuellement depuis l'interface GitHub
-  schedule:
-    - cron: '0 0 * * 1' # Optionnel : Lance un build automatique chaque lundi à minuit pour vérifier les mises à jour
+  workflow_dispatch: # Lancement UNIQUEMENT manuel pour ne jamais déclencher vos autres projets (Rizin, DXVK)
 
 jobs:
   # ÉTAPE 1 : Les vérifications de sécurité fondamentales
@@ -21,13 +15,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: 'XiaomiMiMo/MiMo-Code'
-          ref: 'main' # Se cale toujours sur la branche principale de production
+          ref: 'main'
 
       # Détection des binaires pré-compilés interdits
       - name: Check for Pre-compiled Binaries (Anti-Malware Gate)
         run: |
-          echo "Recherche de fichiers binaires suspects compilés à l'avance..."
-          
+          echo "Recherche de fichiers binaires suspects..."
           SUSPECT_EXTENSIONS="exe dll bin msi sys so dylib bat cmd cpl scr"
           FOUND_BINARIES=""
           
@@ -42,21 +35,19 @@ jobs:
           
           if [ "$FOUND_BINARIES" = "true" ]; then
             echo "❌ ERREUR CRITIQUE : Le dépôt contient des fichiers binaires pré-compilés."
-            echo "Par mesure de sécurité contre les malwares et les backdoors masquées, le build est AVORTÉ."
             exit 1
           else
-            echo "✅ Aucun binaire pré-compilé suspect trouvé dans le code source."
+            echo "✅ Aucun binaire pré-compilé suspect trouvé."
           fi
 
-# Détection des attaques de Supply Chain (Vol de données via les dépendances externes)
+      # Détection des attaques de Supply Chain (Socket avec votre clé API)
       - name: Scan Dependencies for Malware & Obfuscation (Socket)
         uses: SocketDev/action@v1
         with:
           socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }}
-          # Corrigé : 'patch' pour les Pull Requests, sinon 'cli' pour vos builds manuels
-          mode: ${{ github.event_name == 'pull_request' && 'patch' || 'cli' }}
+          mode: 'cli' # Fixé sur 'cli' car le lancement est uniquement manuel via workflow_dispatch
 
-      # Détection des vulnérabilités logiques et patterns malveillants dans votre code
+      # Détection des vulnérabilités logiques et patterns malveillants dans le code
       - name: Scan Source Code Logic (Semgrep OSS)
         uses: semgrep/semgrep-action@v1
         with:
@@ -67,7 +58,7 @@ jobs:
   build-application:
     name: Compile & Build Project (Windows x64)
     needs: security-verification
-    runs-on: windows-latest # Changé sous Windows pour assurer la compatibilité des liaisons natives (node-pty, tui)
+    runs-on: windows-latest
 
     steps:
       # Récupération de la dernière version du code source officiel
