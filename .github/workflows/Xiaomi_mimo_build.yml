@@ -214,33 +214,34 @@ jobs:
           fi
           cat "$LOG"
 
-      # ---------- 6) Socket (optionnel) ----------
-      - name: "📦 Socket (optional)"
+      # ---------- 6) Socket Firewall (action officielle qui marchait) ----------
+      - name: "📦 Socket Firewall"
         id: socket
         continue-on-error: true
-        uses: SocketDev/socket-security-action@v1
+        uses: SocketDev/action@v1
         with:
           socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }}
-          mode: "firewall"
+          mode: firewall
 
       - name: Socket status file
         if: always()
         run: |
+          mkdir -p results
           case "${{ steps.socket.outcome }}" in
             success)
               echo "PASS" > results/socket.status
-              echo "**Résultat: PASS**" > results/socket.log
+              echo "**Résultat: PASS** — Socket Firewall OK" > results/socket.log
               ;;
             skipped)
               echo "WARN" > results/socket.status
-              echo "**Résultat: WARN** — step skipped" > results/socket.log
+              echo "**Résultat: WARN** — Socket skipped" > results/socket.log
               ;;
             *)
-              # échec = souvent token manquant ou alerte Socket
-              echo "WARN" > results/socket.status
-              echo "**Résultat: WARN** — Socket non OK (token manquant ou alerte). outcome=${{ steps.socket.outcome }}" > results/socket.log
+              echo "FAIL" > results/socket.status
+              echo "**Résultat: FAIL** — Socket Firewall a bloqué / échoué (token manquant ou alerte). outcome=${{ steps.socket.outcome }}" > results/socket.log
               ;;
           esac
+          cat results/socket.log
       # ---------- Rapport MD ----------
       - name: "📋 Generate SECURITY_REPORT.md"
         if: always()
