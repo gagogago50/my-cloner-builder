@@ -1,4 +1,4 @@
-name: Secure Build Any Project
+name: Secure Build Cheat Engine
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,6 +22,16 @@ on:
         required: true
         default: "Cheat Engine/bin/**"
         type: string
+      lazarus_version:
+        description: "Version de Lazarus (2.2.2 recommandé pour CE)"
+        required: false
+        default: "2.2.2"
+        type: choice
+        options:
+          - "2.2.2"
+          - "2.2.6"
+          - "stable"
+          - "dist"
 
 permissions:
   contents: read
@@ -42,7 +52,6 @@ jobs:
 
       - name: Create Gitleaks allowlist
         run: |
-          # Correction de la syntaxe TOML (les triples quotes dans un tableau sont invalides)
           cat > .gitleaks.toml << 'EOF'
           [extend]
           useDefault = true
@@ -78,11 +87,12 @@ jobs:
         continue-on-error: true
         run: |
           echo "Recherche de motifs sensibles (non bloquant)"
-          grep -rniE "(password|secret|token|api_key)" . || true
+          grep -rniE "(password|secret|token|api_key)" --include="*.pas" --include="*.lfm" --include="*.lpi" --include="*.lpr" . || true
 
   build:
     name: "Build Windows AMD64"
     runs-on: windows-latest
+    needs: security-scans
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,58 +101,126 @@ jobs:
           ref: ${{ inputs.ref }}
           submodules: recursive
 
-      - name: Install Lazarus and FPC
-        shell: pwsh
-        run: choco install lazarus -y --no-progress
+      # ── Utiliser setup-lazarus avec version spécifique ──
+      # CRITIQUE: Cheat Engine nécessite Lazarus 2.2.2, 2.2.6 ou 3.x
+      # Les versions 4.x causent l'erreur "Cannot find laz_avl_Tree"
+      - name: Setup Lazarus
+        uses: gcarreno/setup-lazarus@v3
+        with:
+          lazarus-version: ${{ inputs.lazarus_version }}
+          with-cache: true
 
       - name: Verify lazbuild
         shell: pwsh
-        run: '& "C:\lazarus\lazbuild.exe" --version'
+        run: |
+          & "C:\lazarus\lazbuild.exe" --version
+          & "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe" -iV
 
-      # ── Enregistrer les packages personnalisés de Cheat Engine (.lpk) ──
-      - name: Register Cheat Engine Packages
+      # ── Enregistrer les packages personnalisés de Cheat Engine ──
+      - name: Register and Build Cheat Engine Packages
         shell: pwsh
         run: |
           $lazarusDir = "C:\lazarus"
           $workspace = $env:GITHUB_WORKSPACE
+          $ceDir = Join-Path $workspace "Cheat Engine"
           
-          # Trouver tous les fichiers .lpk dans le repo
-          $packages = Get-ChildItem -Path $workspace -Filter "*.lpk" -Recurse
+          Write-Host "::group::Recherche des packages .lpk"
+          $packages = Get-ChildItem -Path $ceDir -Filter "*.lpk" -Recurse | Sort-Object Name
+          Write-Host "Packages trouvés: $($packages.Count)"
+          $packages | ForEach-Object { Write-Host "  - $($_.Name)" }
+          Write-Host "::endgroup::"
           
+          # Ajouter les packages dans l'ordre (dépendances d'abord)
           foreach ($pkg in $packages) {
-              Write-Host "Enregistrement du package: $($pkg.FullName)"
-              & "$lazarusDir\lazbuild.exe" --add-package "$($pkg.FullName)"
+              Write-Host "::group::Ajout du package: $($pkg.Name)"
+              try {
+                  & "$lazarusDir\lazbuild.exe" --add-package "$($pkg.FullName)" 2>&1
+                  if ($LASTEXITCODE -ne 0) {
+                      Write-Warning "Erreur lors de l'ajout de $($pkg.Name), code: $LASTEXITCODE"
+                  }
+              } catch {
+                  Write-Warning "Exception lors de l'ajout de $($pkg.Name): $_"
+              }
+              Write-Host "::endgroup::"
           }
-
-      # ── Construire les packages enregistrés ──
-      - name: Build Registered Packages
-        shell: pwsh
-        run: |
-          $lazarusDir = "C:\lazarus"
-          $workspace = $env:GITHUB_WORKSPACE
           
-          $packages = Get-ChildItem -Path $workspace -Filter "*.lpk" -Recurse
-          
-          foreach ($pkg in $packages) {
-              Write-Host "Compilation du package: $($pkg.Name)"
-              & "$lazarusDir\lazbuild.exe" --build-package "$($pkg.Name)"
-          }
+          # Reconstruire le fichier de configuration Lazarus
+          Write-Host "::group::Reconstruction de la configuration Lazarus"
+          & "$lazarusDir\lazbuild.exe" --build-ide= 2>&1 | Out-Null
+          Write-Host "::endgroup::"
 
-      # ── Construire Cheat Engine ──
+      # ── Construire Cheat Engine 64-bit Release ──
       - name: Build Cheat Engine 64-bit Release
         shell: pwsh
         run: |
-          & "C:\lazarus\lazbuild.exe" `
+          $lazarusDir = "C:\lazarus"
+          $workspace = $env:GITHUB_WORKSPACE
+          $projectPath = Join-Path $workspace "Cheat Engine\cheatengine.lpi"
+          
+          Write-Host "::group::Configuration du build"
+          Write-Host "Projet: $projectPath"
+          Write-Host "Lazarus: $lazarusDir"
+          Write-Host "::endgroup::"
+          
+          # Vérifier que le projet existe
+          if (-not (Test-Path $projectPath)) {
+              throw "Projet non trouvé: $projectPath"
+          }
+          
+          # Build avec les options recommandées pour Cheat Engine
+          Write-Host "::group::Compilation du projet"
+          & "$lazarusDir\lazbuild.exe" `
             --build-mode="Release" `
             --cpu=x86_64 `
             --os=win64 `
             --ws=win32 `
-            "$env:GITHUB_WORKSPACE\Cheat Engine\cheatengine.lpi"
+            --max-process-count=4 `
+            "$projectPath" 2>&1
+          
+          $exitCode = $LASTEXITCODE
+          Write-Host "::endgroup::"
+          
+          if ($exitCode -ne 0) {
+              throw "La compilation a échoué avec le code de sortie: $exitCode"
+          }
+          
+          Write-Host "::group::Vérification des sorties"
+          $binDir = Join-Path $workspace "Cheat Engine\bin"
+          if (Test-Path $binDir) {
+              Get-ChildItem -Path $binDir -Filter "*.exe" | ForEach-Object {
+                  Write-Host "Binaire généré: $($_.Name) ($($_.Length) bytes)"
+              }
+          }
+          Write-Host "::endgroup::"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cheat-engine-win64
+          name: cheat-engine-win64-${{ inputs.ref || 'master' }}
           path: ${{ inputs.artifact_path }}
           if-no-files-found: error
           retention-days: 14
+
+      # ── Optionnel: Créer une release ──
+      - name: Create Release Archive
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $workspace = $env:GITHUB_WORKSPACE
+          $binDir = Join-Path $workspace "Cheat Engine\bin"
+          $outputDir = Join-Path $workspace "release"
+          
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+          
+          # Créer un zip avec les binaires
+          $zipPath = Join-Path $outputDir "cheat-engine-win64.zip"
+          Compress-Archive -Path "$binDir\*.exe", "$binDir\*.dll" -DestinationPath $zipPath -Force
+          
+          Write-Host "Archive créée: $zipPath"
+
+      - name: Upload Release Asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
