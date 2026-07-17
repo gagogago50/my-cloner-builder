@@ -11,7 +11,7 @@ on:
       ref:
         description: "branch / tag / sha"
         required: false
-        default: "master" # Cheat Engine utilise 'master' comme branche principale
+        default: "master"
         type: string
       build_mode:
         description: "Mode de build (ex: Release, Debug)"
@@ -60,14 +60,26 @@ jobs:
           choco install lazarus -y --no-progress
         shell: pwsh
 
-      - name: Configuration de la compilation parallèle
+      - name: Configure Parallel Compilation (-j4)
+        run: |
+          # Recherche dynamique du fichier fpc.cfg dans le dossier d'installation de Lazarus
+          $fpcCfg = (Get-ChildItem -Path "C:\lazarus" -Filter "fpc.cfg" -Recurse | Select-Object -First 1).FullName
+          
+          if ($fpcCfg) {
+              Write-Host "Fichier de configuration trouvé ici : $fpcCfg"
+              # Ajout de l'option -j4 à la fin du fichier pour activer le multi-threading
+              Add-Content -Path $fpcCfg -Value "`n-j4"
+              Write-Host "Optimisation -j4 injectée avec succès."
+          } else {
+              Write-Error "Impossible de localiser le fichier fpc.cfg dans C:\lazarus"
+              exit 1
+          }
         shell: pwsh
-        run: Add-Content (Get-Command fpc).Source.Replace('fpc.exe', 'fpc.cfg') "`n-j4"
 
       - name: Build Cheat Engine
-        shell: pwsh
         run: |
-          & "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
+          & "C:\lazarus\lazbuild.exe" --build-mode="${{ inputs.build_mode }}" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
+        shell: pwsh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
