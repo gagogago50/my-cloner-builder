@@ -60,8 +60,13 @@ jobs:
           choco install lazarus -y --no-progress
         shell: pwsh
 
+      - name: Configuration de la compilation parallèle
+        shell: pwsh
+        run: Add-Content (Get-Command fpc).Source.Replace('fpc.exe', 'fpc.cfg') "`n-j4"
+
       - name: Build Cheat Engine
-       run: |
+        shell: pwsh
+        run: |
           & "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
 
       - name: Upload artifact
