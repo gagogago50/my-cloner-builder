@@ -25,12 +25,11 @@ on:
       lazarus_version:
         description: "Version de Lazarus (2.2.2 recommandé pour CE)"
         required: false
-        default: "2.2.2"
+        default: "2.2.6"
         type: choice
         options:
-          - "2.2.2"
           - "2.2.6"
-          - "stable"
+          - "2.2.2"
 
 permissions:
   contents: read
@@ -54,7 +53,6 @@ jobs:
           cat > .gitleaks.toml << 'EOF'
           [extend]
           useDefault = true
-
           [allowlist]
           description = "Faux positifs connus - code source Cheat Engine tiers"
           paths = [
@@ -85,7 +83,6 @@ jobs:
       - name: Pattern scan
         continue-on-error: true
         run: |
-          echo "Recherche de motifs sensibles (non bloquant)"
           grep -rniE "(password|secret|token|api_key)" --include="*.pas" --include="*.lfm" --include="*.lpi" --include="*.lpr" . || true
 
   build:
@@ -106,30 +103,57 @@ jobs:
         with:
           msbuild-architecture: x64
 
+      # ── Setup Lazarus (version 2.2.x recommandée) ──
+      - name: Setup Lazarus
+        uses: gcarreno/setup-lazarus@v3
+        with:
+          lazarus-version: ${{ inputs.lazarus_version }}
+          with-cache: true
+
       # ── Installer le cross-compiler i386-win32 (requis pour le mode "Release 32-Bit") ──
       # Sans ceci: "ppc386.exe can't be executed, error code: 2"
-      # Le README officiel de Cheat Engine impose:
-      #   "First install lazarus-X-fpc-3.2.2-win64.exe
-      #    and then lazarus-X-fpc-3.2.2-cross-i386-win32-win64.exe"
-      - name: Install i386 cross-compiler (ppc386)
+      - name: Resolve Lazarus directory
+        id: lazdir
         shell: pwsh
         run: |
-          $lazbuild = Get-Command lazbuild -ErrorAction Stop
-          $lazDir = Split-Path -Parent $lazbuild.Source
-          # remonter jusqu'à la racine d'installation de Lazarus
-          while ($lazDir -and -not (Test-Path (Join-Path $lazDir "fpc"))) {
-              $lazDir = Split-Path -Parent $lazDir
+          # Essayer via Get-Command d'abord (chemin normal)
+          $lazbuild = Get-Command lazbuild -ErrorAction SilentlyContinue
+          $lazDir = $null
+          if ($lazbuild) {
+              $lazDir = Split-Path -Parent $lazbuild.Source
+              while ($lazDir -and -not (Test-Path (Join-Path $lazDir "fpc"))) {
+                  $lazDir = Split-Path -Parent $lazDir
+              }
+          }
+          # Fallback: emplacement typique de gcarreno/setup-lazarus sur windows-latest
+          $candidates = @(
+              "D:\a\_temp\installers\lazarus",
+              "C:\lazarus",
+              "C:\Program Files\Lazarus"
+          )
+          if (-not $lazDir) {
+              foreach ($c in $candidates) {
+                  if (Test-Path (Join-Path $c "lazbuild.exe")) { $lazDir = $c; break }
+              }
           }
           if (-not $lazDir) {
-              # fallback: utiliser le chemin typique de gcarreno/setup-lazarus
-              $lazDir = "D:\a\_temp\installers\lazarus"
+              $found = Get-ChildItem -Path "D:\" -Filter "lazbuild.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $lazDir = Split-Path -Parent $found.FullName }
           }
+          if (-not $lazDir) { throw "Dossier Lazarus introuvable" }
           Write-Host "Racine Lazarus: $lazDir"
           echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
+          "lazdir=$lazDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-          $fpcVer = "3.2.2"   # version FPC livrée avec Lazarus 2.2.x
-          # extraire la version Lazarus depuis lazbuild --version
-          $lazVerRaw = & lazbuild --version 2>&1 | Select-String -Pattern "^Lazarus" | Select-Object -First 1
+      - name: Install i386 cross-compiler (ppc386)
+        shell: pwsh
+        env:
+          LAZARUS_DIR: ${{ env.LAZARUS_DIR }}
+        run: |
+          $lazDir = $env:LAZARUS_DIR
+          # Dla version Lazarus / FPC
+          $fpcVer = "3.2.2"
+          $lazVerRaw = & lazbuild --version 2>&1 | Select-String -Pattern "Lazarus\s+(\d+\.\d+\.\d+)" | Select-Object -First 1
           if ($lazVerRaw -match "(\d+\.\d+\.\d+)") { $lazVer = $matches[1] } else { $lazVer = "${{ inputs.lazarus_version }}" }
           Write-Host "Version Lazarus détectée: $lazVer"
 
@@ -138,14 +162,15 @@ jobs:
           $dest = Join-Path $env:RUNNER_TEMP $crossInstaller
 
           Write-Host "Téléchargement: $url"
-          # /silent /verysilent /suppressmsgboxes /norestart /nocloseapplications
-          # dir=LazDir : installe dans le même Lazarus que le principal
-          $maxAttempts = 4
+          $maxAttempts = 5
           for ($i = 1; $i -le $maxAttempts; $i++) {
-              & curl.exe -L -sS -o "$dest" "$url" 2>&1
-              if (Test-Path $dest) { break }
-              Write-Warning "Tentative $i échouée, retry..."
-              Start-Sleep -Seconds 5
+              try {
+                  Invoke-WebRequest -Uri $url -OutFile "$dest" -UseBasicParsing -ErrorAction Stop
+                  break
+              } catch {
+                  Write-Warning "Tentative $i échouée: $($_.Exception.Message)"
+                  Start-Sleep -Seconds 5
+              }
           }
           if (-not (Test-Path $dest)) { throw "Téléchargement cross-compiler i386 impossible: $url" }
           $size = (Get-Item $dest).Length
@@ -153,62 +178,44 @@ jobs:
           if ($size -lt 1MB) {
               $body = Get-Content $dest -Raw -ErrorAction SilentlyContinue
               Write-Host "Contenu inattendu: $body"
-              throw "Le téléchargement ne semble pas être l'installeur (taille trop petite)."
+              throw "Le téléchargement n'est pas l'installeur (trop petit)."
           }
 
           Write-Host "::group::Installation cross-compiler i386"
-          # Installation silencieuse dans le même dossier que Lazarus (clé /DIR)
-          Start-Process -FilePath "$dest" `
-            -ArgumentList "/verysilent /suppressmsgboxes /norestart /nocloseapplications /DIR=`"$lazDir`"" `
-            -Wait -NoNewWindow
+          $logFile = Join-Path $env:RUNNER_TEMP "laz_cross_install.log"
+          $p = Start-Process -FilePath "$dest" `
+            -ArgumentList "/verysilent /suppressmsgboxes /norestart /nocloseapplications /DIR=`"$lazDir`" /LOG=`"$logFile`"" `
+            -Wait -PassThru -NoNewWindow
+          Write-Host "Code de sortie: $($p.ExitCode)"
           Write-Host "::endgroup::"
+          if (Test-Path $logFile) {
+              Write-Host "::group::Log d'installation (dernières lignes)"
+              Get-Content $logFile -Tail 30 | ForEach-Object { Write-Host $_ }
+              Write-Host "::endgroup::"
+          }
 
-          # Vérifier que ppc386.exe est maintenant disponible
+          # Vérifier ppc386.exe
           $ppc386 = Get-ChildItem -Path $lazDir -Filter "ppc386.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($ppc386) {
               Write-Host "ppc386.exe trouvé: $($ppc386.FullName)"
-              # S'assurer que le dossier bin du cross-compiler est dans le PATH de fpc
               $fpcBinDir = Split-Path -Parent $ppc386.FullName
-              if (-not ($env:PATH -split ';' -contains $fpcBinDir)) {
-                  echo "$fpcBinDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-                  $env:PATH = "$fpcBinDir;$env:PATH"
-              }
+              # Ajouter au PATH des steps suivants
+              echo "$fpcBinDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+              # Ajouter au PATH du step courant
+              $env:PATH = "$fpcBinDir;$env:PATH"
+              # Mettre à jour fpc.cfg si nécessaire (parfois requis)
+              $fpcCfg = Get-ChildItem -Path $lazDir -Filter "fpc.cfg" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($fpcCfg) { Write-Host "fpc.cfg: $($fpcCfg.FullName)" }
           } else {
-              Write-Warning "ppc386.exe introuvable après installation — le mode 32-bit échouera"
+              Write-Warning "ppc386.exe introuvable après installation — le mode 32-bit échouera (non-fatal)"
           }
-
-          # Vérifier les versions
-          & lazbuild --version
-          fpc -iV
-
-      - name: Verify lazbuild and find install path
-        shell: pwsh
-        run: |
-          $lazDir = $env:LAZARUS_DIR
-          Write-Host "Répertoire Lazarus: $lazDir"
-          # Re-confirme LAZARUS_DIR si le step précédent a échoué silencieusement
-          if (-not $lazDir) {
-              $lazbuild = Get-Command lazbuild -ErrorAction SilentlyContinue
-              if ($lazbuild) {
-                  $lazDir = Split-Path -Parent $lazbuild.Source
-                  while ($lazDir -and -not (Test-Path (Join-Path $lazDir "fpc"))) {
-                      $lazDir = Split-Path -Parent $lazDir
-                  }
-                  if (-not $lazDir) { $lazDir = "D:\a\_temp\installers\lazarus" }
-                  echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
-              }
-          }
-
-          # Localiser MSBuild et cl (pour tcclib.sln etc.)
-          $msbuild = Get-Command msbuild -ErrorAction SilentlyContinue
-          if ($msbuild) { Write-Host "msbuild trouvé: $($msbuild.Source)" } else { Write-Warning "msbuild NON trouvé" }
-
 
       # ── Enregistrer les packages personnalisés de Cheat Engine ──
       - name: Register and Build Cheat Engine Packages
         shell: pwsh
+        env:
+          LAZARUS_DIR: ${{ env.LAZARUS_DIR }}
         run: |
-          $lazarusDir = $env:LAZARUS_DIR
           $workspace = $env:GITHUB_WORKSPACE
           $ceDir = Join-Path $workspace "Cheat Engine"
 
@@ -218,7 +225,6 @@ jobs:
           $packages | ForEach-Object { Write-Host "  - $($_.Name)" }
           Write-Host "::endgroup::"
 
-          # Ajouter les packages (dépendances d'abord)
           foreach ($pkg in $packages) {
               Write-Host "::group::Ajout du package: $($pkg.Name)"
               try {
@@ -232,13 +238,11 @@ jobs:
               Write-Host "::endgroup::"
           }
 
-          # Reconstruire la configuration Lazarus
           Write-Host "::group::Reconstruction de la configuration Lazarus"
           & lazbuild --build-ide= 2>&1 | Out-Null
           Write-Host "::endgroup::"
 
-      # ── Construire Cheat Engine principal : modes 64-bit, 64-bit AVX2 et 32-bit ──
-      # Le mode "Release 64-Bit O4 AVX2" produit cheatengine-x86_64-SSE4-AVX2.exe
+      # ── Construire Cheat Engine principal : 64-bit, 64-bit AVX2, 32-bit ──
       - name: Build Cheat Engine (all release modes)
         shell: pwsh
         run: |
@@ -252,8 +256,6 @@ jobs:
           }
           Write-Host "::endgroup::"
 
-          # Liste explicite des modes Release à compiler.
-          # Les noms correspondent à ceux définis dans cheatengine.lpi (sensibles à la casse).
           $modes = @(
               "Release 64-Bit",
               "Release 64-Bit O4 AVX2",
@@ -263,14 +265,11 @@ jobs:
           $globalFail = $false
           foreach ($mode in $modes) {
               Write-Host "::group::Compilation mode: $mode"
-              & lazbuild `
-                --build-mode="$mode" `
-                --max-process-count=4 `
-                "$projectPath" 2>&1
+              & lazbuild --build-mode="$mode" --max-process-count=4 "$projectPath" 2>&1
               $exitCode = $LASTEXITCODE
               Write-Host "::endgroup::"
               if ($exitCode -ne 0) {
-                  Write-Warning "Échec du mode '$mode' (code $exitCode) — on continue avec les autres modes."
+                  Write-Warning "Échec du mode '$mode' (code $exitCode) — on continue."
                   $globalFail = $true
               }
           }
@@ -281,13 +280,9 @@ jobs:
               Get-ChildItem -Path $binDir -Filter "*.exe" | ForEach-Object {
                   Write-Host "Binaire généré: $($_.Name) ($($_.Length) bytes)"
               }
-          } else {
-              Write-Warning "Le dossier bin n'existe pas encore"
           }
           Write-Host "::endgroup::"
 
-          # On ne faille pas ici: certains modes peuvent échouer selon la source/commit,
-          # mais au moins un mode 64-bit doit réussir.
           if ($globalFail) {
               $has64 = Test-Path (Join-Path $binDir "cheatengine-x86_64.exe")
               $has64Avx2 = Test-Path (Join-Path $binDir "cheatengine-x86_64-SSE4-AVX2.exe")
@@ -297,161 +292,72 @@ jobs:
               Write-Host "Build partiellement réussi — au moins un binaire 64-bit présent."
           }
 
-      # ── Construire TOUS les sous-projets Lazarus (.lpi/.lpr) ──
-      # Stratégie inspirée de l'appveyor.yml officiel : compiler tous les .lpi récursivement.
-      # Cela couvre: speedhack, luaclient, vehdebug, tutorial, betterControls, plugin (exemples), etc.
-      - name: Build all Lazarus sub-projects (.lpi)
+      # ── Construire TOUS les sous-projets Lazarus ──
+      - name: Build all Lazarus sub-projects (.lpi/.lpr)
         shell: pwsh
         run: |
           $workspace = $env:GITHUB_WORKSPACE
           $ceDir = Join-Path $workspace "Cheat Engine"
 
-          # Liste blanche: on évite de recompiler le projet principal (déjà fait ci-dessus).
-          # On cible les sous-dossiers connus contenant des .lpi secondaires.
           $subProjectDirs = @(
-              "speedhack",
-              "luaclient",
-              "VEHDebug",
-              "Tutorial",
-              "betterControls",
-              "plugin",
-              "launcher",
-              "windowsrepair",
-              "ceregreset",
-              "common",
-              "winhook",
-              "xmplayer",
-              "sfx",
-              "release"
+              "speedhack","luaclient","VEHDebug","Tutorial","betterControls",
+              "plugin","launcher","windowsrepair","ceregreset","common",
+              "winhook","xmplayer","sfx","release"
           )
 
           $lpiFiles = @()
-          foreach ($sub in $subProjectDirs) {
-              $subPath = Join-Path $ceDir $sub
-              if (Test-Path $subPath) {
-                  $found = Get-ChildItem -Path $subPath -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
-                  if ($found) { $lpiFiles += $found }
-              }
-          }
-
-          # Aussi: tous les .lpr (projets sans .lpi ou projets programme pur) des mêmes dossiers
           $lprFiles = @()
           foreach ($sub in $subProjectDirs) {
               $subPath = Join-Path $ceDir $sub
               if (Test-Path $subPath) {
-                  $found = Get-ChildItem -Path $subPath -Filter "*.lpr" -Recurse -ErrorAction SilentlyContinue
-                  if ($found) { $lprFiles += $found }
+                  $lpiFiles += Get-ChildItem -Path $subPath -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
+                  $lprFiles += Get-ChildItem -Path $subPath -Filter "*.lpr" -Recurse -ErrorAction SilentlyContinue
               }
           }
 
-          Write-Host "::group::Sous-projets Lazarus (.lpi) trouvés: $($lpiFiles.Count)"
-          $lpiFiles | ForEach-Object { Write-Host "  LPI: $($_.FullName)" }
-          Write-Host "::endgroup::"
-
-          Write-Host "::group::Sous-projets Lazarus (.lpr) trouvés: $($lprFiles.Count)"
-          $lprFiles | ForEach-Object { Write-Host "  LPR: $($_.FullName)" }
-          Write-Host "::endgroup::"
-
-          # Compile chaque .lpi (build-all pour gérer les dépendances entre configurations 32/64)
-          $failCount = 0
           foreach ($lpi in $lpiFiles) {
               Write-Host "::group::lazbuild $($lpi.Name)"
               & lazbuild --build-all --max-process-count=4 "$($lpi.FullName)" 2>&1
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "Échec $($lpi.Name) (code $LASTEXITCODE)"
-                  $failCount++
-              }
+              if ($LASTEXITCODE -ne 0) { Write-Warning "Échec $($lpi.Name) (code $LASTEXITCODE)" }
               Write-Host "::endgroup::"
           }
-
-          # Compile chaque .lpr (programme)
           foreach ($lpr in $lprFiles) {
               Write-Host "::group::lazbuild $($lpr.Name)"
               & lazbuild --max-process-count=4 "$($lpr.FullName)" 2>&1
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "Échec $($lpr.Name) (code $LASTEXITCODE)"
-                  $failCount++
-              }
+              if ($LASTEXITCODE -ne 0) { Write-Warning "Échec $($lpr.Name) (code $LASTEXITCODE)" }
               Write-Host "::endgroup::"
           }
-
-          Write-Host "Sous-projets Lazarus terminés. Échecs: $failCount/$($lpiFiles.Count + $lprFiles.Count)"
-          # Non fatal — on continue vers les .sln
+          Write-Host "Sous-projets Lazarus terminés."
 
       # ── Construire les sous-projets Visual Studio (.sln) ──
-      # tcclib, DirectXMess, DotNetCompiler, MonoDataCollector, DotNetDataCollector,
-      # DotNetInvasiveDataCollector, CEJVMTI, DBKKernel
       - name: Build Visual Studio sub-projects (.sln)
         shell: pwsh
         run: |
           $workspace = $env:GITHUB_WORKSPACE
-          $binDir = Join-Path $workspace "Cheat Engine\bin"
-
-          # Recherche récursive de tous les .sln dans Cheat Engine/
           $slnFiles = Get-ChildItem -Path (Join-Path $workspace "Cheat Engine") -Filter "*.sln" -Recurse -ErrorAction SilentlyContinue
           Write-Host "::group::Solutions Visual Studio trouvées: $($slnFiles.Count)"
           $slnFiles | ForEach-Object { Write-Host "  SLN: $($_.FullName)" }
           Write-Host "::endgroup::"
 
-          $failCount = 0
           foreach ($sln in $slnFiles) {
               Write-Host "::group::msbuild $($sln.Name)"
-
-              # Restaurer les packages NuGet si un packages.config ou .csproj existe nearby
-              $nugetProj = Get-ChildItem -Path $sln.DirectoryName -Filter "*.csproj" -ErrorAction SilentlyContinue | Select-Object -First 1
-              if (Test-Path (Join-Path $workspace '.nuget')) {
-                  & nuget restore "$($sln.FullName)" 2>&1 | Out-Null
-              }
-
-              # Build en Release pour x86 ET x64 (多位 des .sln CE gèrent Platform=Win32|Win64)
               foreach ($platform in @("x86", "x64")) {
-                  & msbuild "$($sln.FullName)" `
-                    /nologo /verbosity:minimal `
-                    /p:Configuration=Release `
-                    /p:Platform="$platform" 2>&1
+                  & msbuild "$($sln.FullName)" /nologo /verbosity:minimal /p:Configuration=Release /p:Platform="$platform" 2>&1
                   if ($LASTEXITCODE -ne 0) {
-                      # Retry sans Platform (certains sln n'acceptent pas x86/x64)
-                      & msbuild "$($sln.FullName)" `
-                        /nologo /verbosity:minimal `
-                        /p:Configuration=Release 2>&1
-                      if ($LASTEXITCODE -ne 0) {
-                          Write-Warning "Échec msbuild $($sln.Name) [$platform] (code $LASTEXITCODE)"
-                          $failCount++
-                      }
+                      & msbuild "$($sln.FullName)" /nologo /verbosity:minimal /p:Configuration=Release 2>&1
+                      if ($LASTEXITCODE -ne 0) { Write-Warning "Échec msbuild $($sln.Name)" }
+                      break
                   }
               }
               Write-Host "::endgroup::"
           }
 
-          Write-Host "Solutions VS terminées. Échecs: $failCount"
-
-      # ── tcclib spécial: configurations 32-32, 64-32, 64-64 ──
-      # Le README précise 3 configs distinctes; le step précédent couvre x86+x64 Release,
-      # mais certaines configurations de projet tcclib utilisent des noms custom.
-      - name: Build tcclib special configurations
+      # ── tcclib copies vers bin ──
+      - name: Copy tcclib DLLs to bin
         shell: pwsh
         run: |
           $workspace = $env:GITHUB_WORKSPACE
-          $tcclibDir = Join-Path $workspace "Cheat Engine\tcclib"
-          if (-not (Test-Path $tcclibDir)) {
-              Write-Host "Dossier tcclib introuvable, recherche récursive du .sln..."
-              $tcclibSln = Get-ChildItem -Path (Join-Path $workspace "Cheat Engine") -Filter "tcclib*.sln" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($tcclibSln) { $tcclibDir = $tcclibSln.DirectoryName; $tcclibSlnPath = $tcclibSln.FullName }
-              else { Write-Host "Aucun tcclib.sln trouvé — skip"; return }
-          } else {
-              $tcclibSln = Get-ChildItem -Path $tcclibDir -Filter "*.sln" -ErrorAction SilentlyContinue | Select-Record -First 1 2>$null
-              # fallback robuste
-              $tcclibSln = Get-ChildItem -Path $tcclibDir -Filter "tcclib*.sln" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($tcclibSln) { $tcclibSlnPath = $tcclibSln.FullName } else { Write-Host "Aucun .sln tcclib — skip"; return }
-          }
-
-          Write-Host "::group::tcclib: msbuild $tcclibSlnPath"
-          # Lister les configurations disponibles dans la solution
-          & msbuild "$tcclibSlnPath" /nologo /v:minimal /t:Build /p:Configuration=Release 2>&1
-          Write-Host "::endgroup::"
-
-          # Copier les dll tcclib générées vers bin si trouvé
-          $tcclibOut = Get-ChildItem -Path (Split-Path $tcclibSlnPath -Parent) -Filter "*.dll" -Recurse -ErrorAction SilentlyContinue |
+          $tcclibOut = Get-ChildItem -Path (Join-Path $workspace "Cheat Engine\tcclib") -Filter "*.dll" -Recurse -ErrorAction SilentlyContinue |
               Where-Object { $_.Name -match "tcclib" }
           if ($tcclibOut) {
               $binDir = Join-Path $workspace "Cheat Engine\bin"
@@ -459,23 +365,20 @@ jobs:
                   Copy-Item $dll.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
                   Write-Host "Copié $($dll.Name) -> bin"
               }
-          }
+          } else { Write-Host "Aucune DLL tcclib trouvée." }
 
-      # ── Résumé final: lister tout le contenu de bin/ ──
+      # ── Résumé final ──
       - name: List final bin folder
         shell: pwsh
         run: |
-          $workspace = $env:GITHUB_WORKSPACE
-          $binDir = Join-Path $workspace "Cheat Engine\bin"
+          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
           Write-Host "::group::Contenu final de $binDir"
           if (Test-Path $binDir) {
               Get-ChildItem -Path $binDir -Recurse -File | Sort-Object FullName | ForEach-Object {
                   $rel = $_.FullName.Substring($binDir.Length + 1)
                   Write-Host ("  {0,-50} {1,12} bytes" -f $rel, $_.Length)
               }
-          } else {
-              Write-Warning "bin introuvable!"
-          }
+          } else { Write-Warning "bin introuvable!" }
           Write-Host "::endgroup::"
 
       - name: Upload artifact
