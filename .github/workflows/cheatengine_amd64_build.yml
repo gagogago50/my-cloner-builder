@@ -47,58 +47,50 @@ permissions:
   security-events: write
 
 jobs:
+  # Ce job regroupe tous les scans à la chaîne (1 seul runner utilisé)
   security-scans:
-    name: "Security Scans (non bloquants)"
+    name: "Sequential Security Scans"
     runs-on: ubuntu-latest
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        scan: [binaries, clamav, gitleaks, socket, patterns]
     steps:
       - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          fetch-depth: ${{ matrix.scan == 'gitleaks' && '0' || '1' }}
+          fetch-depth: 0 # Requis à 0 pour que Gitleaks puisse analyser tout l'historique
 
       - name: Run Gitleaks
-        if: matrix.scan == 'gitleaks'
         uses: gitleaks/gitleaks-action@v2
         env:
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
       - name: Setup ClamAV
-        if: matrix.scan == 'clamav'
         run: |
           sudo apt-get update
           sudo apt-get install -y clamav clamav-daemon
           sudo freshclam --quiet || true
 
       - name: Scan repository with ClamAV
-        if: matrix.scan == 'clamav'
         run: clamscan --recursive --infected --quiet . || true
 
       - name: Pattern scan
-        if: matrix.scan == 'patterns'
         run: |
           echo "Recherche de motifs sensibles (non bloquant)"
           grep -rniE "(password|secret|token|api_key)" . || true
 
       - name: Socket scan placeholder
-        if: matrix.scan == 'socket'
         run: |
           echo "Socket scan - a personnaliser (socket.dev, etc.)"
 
       - name: Binaries scan placeholder
-        if: matrix.scan == 'binaries'
         run: |
           echo "Binaries scan - a personnaliser (trivy, syft/grype...)"
 
+  # Ce job se lance EN MÊME TEMPS que le job security-scans (2ème runner utilisé)
   build:
     name: "Build ${{ inputs.runs_on }}"
     runs-on: ${{ inputs.runs_on }}
-    needs: security-scans
+    # Pas de "needs: security-scans" ici pour permettre l'exécution parallèle
     steps:
       - uses: actions/checkout@v4
         with:
