@@ -98,36 +98,57 @@ jobs:
         shell: pwsh
         run: '& "C:\lazarus\lazbuild.exe" --version'
 
-      # Compiler LazUtils pour x86_64-win64 (LCL sera compilée automatiquement)
-      - name: Build Lazarus packages (Win64)
+      # ── Initialiser une configuration lazbuild propre ──
+      - name: Create custom lazbuild config
         shell: pwsh
         run: |
-          Write-Host "Compiling LazUtils for x86_64-win64..."
-          & "C:\lazarus\lazbuild.exe" --cpu=x86_64 --os=win64 "C:\lazarus\components\lazutils\lazutils.lpk"
+          $configDir = "$env:RUNNER_TEMP\lazarus_config"
+          New-Item -ItemType Directory -Force -Path $configDir
+          # Créer le fichier idemake.cfg avec les chemins d'unités de base
+          # (les guillemets simples évitent l'expansion des variables)
+          @"
+          -FuC:\lazarus\lcl\units\x86_64-win64
+          -FuC:\lazarus\components\lazutils\lib\x86_64-win64
+          -FuC:\lazarus\packager\units\x86_64-win64
+          -dLCLwin32
+          "@ | Out-File -FilePath "$configDir\idemake.cfg" -Encoding ASCII
+          Write-Host "Config file created at $configDir\idemake.cfg"
+          # Sauvegarder le chemin pour les étapes suivantes
+          "CONFIG_DIR=$configDir" | Out-File -FilePath "$env:GITHUB_ENV" -Append -Encoding utf8
+
+      # ── Compiler LazUtils pour x86_64-win64 ──
+      - name: Build LazUtils (Win64)
+        shell: pwsh
+        run: |
+          & "C:\lazarus\lazbuild.exe" `
+            --primary-config-path="$env:CONFIG_DIR" `
+            --lazarusdir="C:\lazarus" `
+            --cpu=x86_64 --os=win64 `
+            "C:\lazarus\components\lazutils\lazutils.lpk"
         timeout-minutes: 10
 
-      - name: Configure Lazarus Package Path
+      # ── Ajouter les éventuels chemins de packages Cheat Engine ──
+      # (pas besoin de modifier environmentoptions.xml, on va utiliser le fichier idemake.cfg déjà créé)
+      - name: Append Cheat Engine paths to config
         shell: pwsh
         run: |
-          $configPath = "$env:LOCALAPPDATA\lazarus\environmentoptions.xml"
-          if (Test-Path $configPath) {
-            Write-Host "Lazarus config found at $configPath"
-            Copy-Item $configPath "$configPath.bak"
+          $configDir = $env:CONFIG_DIR
+          $cheatEngineDir = "$env:GITHUB_WORKSPACE\Cheat Engine"
+          # Ajouter les sous-répertoires de Cheat Engine si nécessaire (selon le projet)
+          # Ici on ajoute simplement le dossier racine du projet, l'unité laz_avl_tree n'est pas dedans.
+          # On le fait quand même pour préserver l'idée d'ajout de PackagePath.
+          Add-Content -Path "$configDir\idemake.cfg" -Value "-Fu$cheatEngineDir"
 
-            [xml]$xml = Get-Content $configPath
-            $packageNode = $xml.SelectSingleNode("//EnvironmentOptions/PackagePath")
-            if ($packageNode) {
-              $cheatEngineDir = '${{ github.workspace }}\Cheat Engine'
-              $packageNode.InnerText = "$cheatEngineDir;$($packageNode.InnerText)"
-            }
-            $xml.Save($configPath)
-          } else {
-            Write-Warning "Lazarus config not found at $configPath – lazbuild might fail unless you run Lazarus once first."
-          }
-
+      # ── Construire Cheat Engine ──
       - name: Build Cheat Engine 64-bit Release
         shell: pwsh
-        run: '& "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "${{ github.workspace }}\Cheat Engine\cheatengine.lpi"'
+        run: |
+          & "C:\lazarus\lazbuild.exe" `
+            --primary-config-path="$env:CONFIG_DIR" `
+            --lazarusdir="C:\lazarus" `
+            --build-mode="Release" `
+            --cpu=x86_64 --os=win64 `
+            "$env:GITHUB_WORKSPACE\Cheat Engine\cheatengine.lpi"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
