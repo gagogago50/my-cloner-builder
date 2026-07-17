@@ -60,11 +60,9 @@ jobs:
           choco install lazarus -y --no-progress
         shell: pwsh
 
-      - name: Build Cheat Engine (Parallel Compilation)
-        run: |
-          # --threads=4 force l'utilisation de 4 threads (ou retire l'option pour utiliser tous les coeurs du runner)
-          & "C:\lazarus\lazbuild.exe" --build-mode="${{ inputs.build_mode }}" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi" --threads=4
-        shell: pwsh
+      - name: Build Cheat Engine
+       run: |
+          & "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
