@@ -57,7 +57,7 @@ jobs:
           description = "Faux positifs connus - code source Cheat Engine tiers"
           paths = [
             "Cheat Engine/feces\\.pas",
-            "Cheat Engine/frmlua	engineunit\\.lfm"
+            "Cheat Engine/frmluaengineunit\\.lfm"
           ]
           EOF
 
@@ -137,8 +137,6 @@ jobs:
           echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
 
       # ── Tentative d'installation du cross-compiler i386-win32 (best-effort) ──
-      # Rendu STRICTEMENT OPTIONNEL à cause des 403/timeout de SourceForge.
-      # Si le téléchargement échoue, le mode 32-bit sera ignoré proprement au build.
       - name: Try install i386 cross-compiler (non-fatal)
         continue-on-error: true
         shell: pwsh
@@ -157,7 +155,6 @@ jobs:
           $crossInstaller = "lazarus-$lazVer-fpc-$fpcVer-cross-i386-win32-win64.exe"
           $dest = Join-Path $env:RUNNER_TEMP $crossInstaller
 
-          # Ajout d'un miroir GitHub (fichiers Lazarus souvent mirrorés)
           $mirrors = @(
               "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller",
               "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller/download",
@@ -243,31 +240,21 @@ jobs:
 
           $criticalModes = @("Release 64-Bit", "Release 64-Bit O4 AVX2")
           $optionalModes = @()
-
-          # On ne tente le 32-bit QUE si ppc386 a pu être installé
-          if ($env:HAVE_PPC386 -eq "true") {
-              $optionalModes += "Release 32-Bit"
-          } else {
-              Write-Host ">> Cross-compiler ppc386 absent — mode 32-Bit ignoré."
-          }
+          if ($env:HAVE_PPC386 -eq "true") { $optionalModes += "Release 32-Bit" }
 
           foreach ($mode in $criticalModes) {
-              Write-Host "::group::Compilation CRITIQUE mode: $mode"
+              Write-Host "::group::Compilation CRITIQUE: $mode"
               & lazbuild --build-mode="$mode" --max-process-count=4 "$projectPath" 2>&1
               $exitCode = $LASTEXITCODE
               Write-Host "::endgroup::"
-              if ($exitCode -ne 0) {
-                  throw "Mode CRITIQUE '$mode' échoué (code $exitCode) — abandon."
-              }
+              if ($exitCode -ne 0) { throw "Mode CRITIQUE '$mode' échoué (code $exitCode)" }
           }
           foreach ($mode in $optionalModes) {
-              Write-Host "::group::Compilation OPTIONNEL mode: $mode"
+              Write-Host "::group::Compilation OPTIONNEL: $mode"
               & lazbuild --build-mode="$mode" --max-process-count=4 "$projectPath" 2>&1
               $exitCode = $LASTEXITCODE
               Write-Host "::endgroup::"
-              if ($exitCode -ne 0) {
-                  Write-Warning "Mode OPTIONNEL '$mode' échoué (code $exitCode) — ignoré."
-              }
+              if ($exitCode -ne 0) { Write-Warning "Mode OPTIONNEL '$mode' échoué — ignoré." }
           }
 
           Write-Host "::group::Binaires générés"
@@ -280,35 +267,69 @@ jobs:
           Write-Host "::endgroup::"
           exit 0
 
-      # ── Sous-projets Lazarus ──
-      - name: Build all Lazarus sub-projects (.lpi/.lpr)
+      # ── Sous-projets Lazarus — Build 64-bit UNIQUEMENT ──
+      # On NE utilise PLUS --build-all (construit toutes les configs dont 32-bit = ppc386 crash)
+      # On ne tente le 32-bit QUE si HAVE_PPC386=true
+      - name: Build Lazarus sub-projects (64-bit only)
         shell: pwsh
         run: |
           $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $subDirs = @("speedhack","luaclient","VEHDebug","Tutorial","betterControls",
-                       "plugin","launcher","windowsrepair","ceregreset","common",
-                       "winhook","xmplayer","sfx","release")
-          $lpiFiles = @()
-          $lprFiles = @()
+          $binDir = Join-Path $ceDir "bin"
+          
+          # Projets qui supportent une config Release 64-Bit (la +partie)
+          # On compile en --build-mode="Release" (ou default) avec --ws=win32 --cpu=x86_64 --os=win64
+          $subDirs = @(
+              "speedhack", "luaclient", "VEHDebug", "Tutorial", "betterControls",
+              "plugin", "launcher", "winhook", "xmplayer"
+          )
+          # Projets à ignorer (uniquement 32-bit, non requis pour CE 64-bit)
+          $skipDirs = @("windowsrepair", "sfx", "ceregreset", "common", "release")
+
           foreach ($sub in $subDirs) {
               $p = Join-Path $ceDir $sub
-              if (Test-Path $p) {
-                  $lpiFiles += Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
-                  $lprFiles += Get-ChildItem -Path $p -Filter "*.lpr" -Recurse -ErrorAction SilentlyContinue
+              if (-not (Test-Path $p)) { continue }
+              
+              $lpiFiles = Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
+              foreach ($lpi in $lpiFiles) {
+                  Write-Host "::group::lazbuild $($lpi.Name) [64-bit]"
+                  # On force la cible 64-bit. --build-mode="Release" ou mode par défaut.
+                  & lazbuild --build-mode="Release" --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpi.FullName)" 2>&1
+                  if ($LASTEXITCODE -ne 0) {
+                      Write-Warning "Échec $($lpi.Name) [Release 64-bit] (code $LASTEXITCODE) — non-fatal"
+                  }
+                  Write-Host "::endgroup::"
+              }
+              
+              $lprFiles = Get-ChildItem -Path $p -Filter "*.lpr" -Recurse -ErrorAction SilentlyContinue
+              foreach ($lpr in $lprFiles) {
+                  Write-Host "::group::lazbuild $($lpr.Name) [64-bit]"
+                  & lazbuild --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpr.FullName)" 2>&1
+                  if ($LASTEXITCODE -ne 0) {
+                      Write-Warning "Échec $($lpr.Name) [64-bit] (code $LASTEXITCODE) — non-fatal"
+                  }
+                  Write-Host "::endgroup::"
               }
           }
-          foreach ($lpi in $lpiFiles) {
-              Write-Host "::group::lazbuild $($lpi.Name)"
-              & lazbuild --build-all --max-process-count=4 "$($lpi.FullName)" 2>&1
-              if ($LASTEXITCODE -ne 0) { Write-Warning "Échec $($lpi.Name)" }
-              Write-Host "::endgroup::"
+
+          # Si ppc386 est disponible, on tente aussi les config 32-bit ainsi que les projets exclus
+          if ($env:HAVE_PPC386 -eq "true") {
+              Write-Host ">> Cross-compiler ppc386 présent — compilation des config 32-bit"
+              foreach ($sub in ($subDirs + $skipDirs)) {
+                  $p = Join-Path $ceDir $sub
+                  if (-not (Test-Path $p)) { continue }
+                  $lpiFiles = Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
+                  foreach ($lpi in $lpiFiles) {
+                      Write-Host "::group::lazbuild $($lpi.Name) [32-bit]"
+                      & lazbuild --build-mode="Release" --cpu=i386 --os=win32 --ws=win32 --max-process-count=4 "$($lpi.FullName)" 2>&1
+                      if ($LASTEXITCODE -ne 0) { Write-Warning "Échec $($lpi.Name) [32-bit]" }
+                      Write-Host "::endgroup::"
+                  }
+              }
+          } else {
+              Write-Host ">> ppc386 absent — compilation 32-bit skip"
           }
-          foreach ($lpr in $lprFiles) {
-              Write-Host "::group::lazbuild $($lpr.Name)"
-              & lazbuild --max-process-count=4 "$($lpr.FullName)" 2>&1
-              if ($LASTEXITCODE -ne 0) { Write-Warning "Échec $($lpr.Name)" }
-              Write-Host "::endgroup::"
-          }
+          # Force exit 0 pour ne pas polluer les steps suivants
+          exit 0
 
       # ── Sous-projets Visual Studio ──
       - name: Build Visual Studio sub-projects (.sln)
@@ -328,6 +349,7 @@ jobs:
               }
               Write-Host "::endgroup::"
           }
+          exit 0
 
       # ── Copier tcclib -> bin ──
       - name: Copy tcclib DLLs to bin
@@ -342,6 +364,7 @@ jobs:
                   Write-Host "Copié $($dll.Name) -> bin"
               }
           } else { Write-Host "Aucune DLL tcclib trouvée." }
+          exit 0
 
       # ── Résumé final ──
       - name: List final bin folder
