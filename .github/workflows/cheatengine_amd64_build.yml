@@ -88,7 +88,7 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          submodules: true
+          submodules: recursive
 
       - name: Install Lazarus and FPC
         shell: pwsh
@@ -98,9 +98,26 @@ jobs:
         shell: pwsh
         run: '& "C:\lazarus\lazbuild.exe" --version'
 
+      - name: Configure Lazarus Package Path
+        shell: pwsh
+        run: |
+          $configPath = "C:\Users\runneradmin\AppData\Local\lazarus\environmentoptions.xml"
+          # Create backup
+          if (Test-Path $configPath) {
+            Copy-Item $configPath "$configPath.bak"
+          }
+          
+          # Update package path to include Cheat Engine directory
+          [xml]$xml = Get-Content $configPath
+          $packagePath = $xml.SelectSingleNode("//EnvironmentOptions/PackagePath")
+          if ($packagePath) {
+            $packagePath.InnerText = "${{ github.workspace }}\Cheat Engine;" + $packagePath.InnerText
+          }
+          $xml.Save($configPath)
+
       - name: Build Cheat Engine 64-bit Release
         shell: pwsh
-        run: '& "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"'
+        run: '& "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "${{ github.workspace }}\Cheat Engine\cheatengine.lpi"'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
