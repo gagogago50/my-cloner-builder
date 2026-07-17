@@ -1,4 +1,4 @@
-name: Secure Build Any Project (Template)
+name: Secure Build Any Project
 
 on:
   workflow_dispatch:
@@ -14,12 +14,12 @@ on:
         default: "master"
         type: string
       build_command:
-        description: "Commande de build (non utilisée pour Lazarus/FPC)"
+        description: "Commande de build (non utilisee pour Lazarus/FPC)"
         required: false
         default: ""
         type: string
       artifact_path:
-        description: "Glob du binaire à uploader"
+        description: "Glob du binaire a uploader"
         required: true
         default: "Cheat Engine/bin/**"
         type: string
@@ -48,9 +48,9 @@ permissions:
 
 jobs:
   security-scans:
-    name: "Security Scans (non‑bloquants)"
+    name: "Security Scans (non bloquants)"
     runs-on: ubuntu-latest
-    continue-on-error: true          # ← les échecs internes n’empêchent pas la suite
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -62,51 +62,43 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: ${{ matrix.scan == 'gitleaks' && 0 || 1 }}
 
-      # ---------- Gitleaks (sans input invalide) ----------
       - name: Run Gitleaks
         if: matrix.scan == 'gitleaks'
         uses: gitleaks/gitleaks-action@v2
         env:
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-        # L’action utilise automatiquement .gitleaks.toml s’il existe, sinon config par défaut.
-        # Aucun paramètre 'config-path' nécessaire.
 
-      # ---------- ClamAV (sortie propre même si code !=0) ----------
       - name: Setup ClamAV
         if: matrix.scan == 'clamav'
         run: |
           sudo apt-get update
           sudo apt-get install -y clamav clamav-daemon
-          sudo freshclam --quiet || true   # base de données parfois non dispo
+          sudo freshclam --quiet || true
+
       - name: Scan repository with ClamAV
         if: matrix.scan == 'clamav'
-        run: clamscan --recursive --infected --quiet . || true   # exit 2 traité
+        run: clamscan --recursive --infected --quiet . || true
 
-      # ---------- Pattern scan ----------
       - name: Pattern scan
         if: matrix.scan == 'patterns'
         run: |
           echo "Recherche de motifs sensibles (non bloquant)"
           grep -rniE "(password|secret|token|api_key)" . || true
 
-      # ---------- Placeholders pour socket / binaries ----------
       - name: Socket scan placeholder
         if: matrix.scan == 'socket'
         run: |
-          echo "Socket scan – à personnaliser (socket.dev, etc.)"
-          # Exemple: npm install -g @socketsecurity/cli && socket scan .
+          echo "Socket scan - a personnaliser (socket.dev, etc.)"
 
       - name: Binaries scan placeholder
         if: matrix.scan == 'binaries'
         run: |
-          echo "Binaries scan – à personnaliser (trivy, syft/grype…)"
-          # Exemple: wget https://github.com/aquasecurity/trivy/releases/download/v0.50.1/trivy_0.50.1_Linux-64bit.deb
-          # sudo dpkg -i trivy*.deb && trivy fs --skip-dirs Cheat\ Engine/bin  .
+          echo "Binaries scan - a personnaliser (trivy, syft/grype...)"
 
   build:
     name: "Build ${{ inputs.runs_on }}"
     runs-on: ${{ inputs.runs_on }}
-    needs: security-scans           # le job est toujours considéré comme réussi (continue-on-error)
+    needs: security-scans
     steps:
       - uses: actions/checkout@v4
         with:
