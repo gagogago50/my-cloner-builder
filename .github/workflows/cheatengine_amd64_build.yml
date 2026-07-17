@@ -1,4 +1,6 @@
 name: Secure Build Any Project
+
+# Annule automatiquement les anciennes exécutions en cours si tu relances le workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,41 +18,18 @@ on:
         required: false
         default: "master"
         type: string
-      build_command:
-        description: "Commande de build (non utilisee pour Lazarus/FPC)"
-        required: false
-        default: ""
-        type: string
       artifact_path:
         description: "Glob du binaire a uploader"
         required: true
         default: "Cheat Engine/bin/**"
         type: string
-      runs_on:
-        description: "Runner"
-        required: false
-        default: "windows-latest"
-        type: choice
-        options:
-          - windows-latest
-          - ubuntu-latest
-          - macos-latest
-      node_or_bun:
-        description: "Runtime (choisir none pour Pascal/Lazarus)"
-        required: false
-        default: "none"
-        type: choice
-        options:
-          - bun
-          - node
-          - none
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
-  # Ce job regroupe tous les scans à la chaîne (1 seul runner utilisé)
+  # Étape 1 : Les scans s'exécutent à la chaîne sur 1 seul runner (économie de slots)
   security-scans:
     name: "Sequential Security Scans"
     runs-on: ubuntu-latest
@@ -60,8 +39,9 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          fetch-depth: 0 # Requis à 0 pour que Gitleaks puisse analyser tout l'historique
+          fetch-depth: 0
 
+          # Le jeton '0' sous forme de chaîne évite le bug du 0 falsy de GitHub
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
@@ -81,19 +61,10 @@ jobs:
           echo "Recherche de motifs sensibles (non bloquant)"
           grep -rniE "(password|secret|token|api_key)" . || true
 
-      - name: Socket scan placeholder
-        run: |
-          echo "Socket scan - a personnaliser (socket.dev, etc.)"
-
-      - name: Binaries scan placeholder
-        run: |
-          echo "Binaries scan - a personnaliser (trivy, syft/grype...)"
-
-  # Ce job se lance EN MÊME TEMPS que le job security-scans (2ème runner utilisé)
+  # Étape 2 : Le build Windows tourne EN MÊME TEMPS que le job de scan (2ème runner)
   build:
-    name: "Build ${{ inputs.runs_on }}"
-    runs-on: ${{ inputs.runs_on }}
-    # Pas de "needs: security-scans" ici pour permettre l'exécution parallèle
+    name: "Build Windows AMD64"
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -110,15 +81,18 @@ jobs:
           & "C:\lazarus\lazbuild.exe" --version
         shell: pwsh
 
-      - name: Build Cheat Engine (64-bit Release)
+      # CORRECTION : L'argument --fpcb a été définitivement supprimé.
+      # Le changement de build-mode à "Release" correspond à la configuration par défaut de Cheat Engine.
+      # Les drapeaux --cpu et --os forcent proprement la compilation AMD64.
+       villains-name: Build Cheat Engine (64-bit Release)
         run: |
-          & "C:\lazarus\lazbuild.exe" --build-mode="Release_64" "Cheat Engine/cheatengine.lpi"
+          & "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
         shell: pwsh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: build-${{ inputs.runs_on }}
+          name: cheat-engine-win64
           path: ${{ inputs.artifact_path }}
           if-no-files-found: error
           retention-days: 14
