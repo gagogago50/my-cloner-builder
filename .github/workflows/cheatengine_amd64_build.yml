@@ -42,6 +42,7 @@ jobs:
 
       - name: Create Gitleaks allowlist
         run: |
+          # Correction de la syntaxe TOML (les triples quotes dans un tableau sont invalides)
           cat > .gitleaks.toml << 'EOF'
           [extend]
           useDefault = true
@@ -49,8 +50,8 @@ jobs:
           [allowlist]
           description = "Faux positifs connus - code source Cheat Engine tiers"
           paths = [
-            '''Cheat Engine/feces\.pas''',
-            '''Cheat Engine/frmluaengineunit\.lfm'''
+            "Cheat Engine/feces\\.pas",
+            "Cheat Engine/frmluaengineunit\\.lfm"
           ]
           EOF
 
@@ -98,56 +99,44 @@ jobs:
         shell: pwsh
         run: '& "C:\lazarus\lazbuild.exe" --version'
 
-      # ── Initialiser une configuration lazbuild propre ──
-      - name: Create custom lazbuild config
+      # ── Enregistrer les packages personnalisés de Cheat Engine (.lpk) ──
+      - name: Register Cheat Engine Packages
         shell: pwsh
         run: |
-          $configDir = "$env:RUNNER_TEMP\lazarus_config"
-          New-Item -ItemType Directory -Force -Path $configDir
-          # Créer le fichier idemake.cfg avec les chemins d'unités de base
-          # (les guillemets simples évitent l'expansion des variables)
-          @"
-          -FuC:\lazarus\lcl\units\x86_64-win64
-          -FuC:\lazarus\components\lazutils\lib\x86_64-win64
-          -FuC:\lazarus\packager\units\x86_64-win64
-          -dLCLwin32
-          "@ | Out-File -FilePath "$configDir\idemake.cfg" -Encoding ASCII
-          Write-Host "Config file created at $configDir\idemake.cfg"
-          # Sauvegarder le chemin pour les étapes suivantes
-          "CONFIG_DIR=$configDir" | Out-File -FilePath "$env:GITHUB_ENV" -Append -Encoding utf8
+          $lazarusDir = "C:\lazarus"
+          $workspace = $env:GITHUB_WORKSPACE
+          
+          # Trouver tous les fichiers .lpk dans le repo
+          $packages = Get-ChildItem -Path $workspace -Filter "*.lpk" -Recurse
+          
+          foreach ($pkg in $packages) {
+              Write-Host "Enregistrement du package: $($pkg.FullName)"
+              & "$lazarusDir\lazbuild.exe" --add-package "$($pkg.FullName)"
+          }
 
-      # ── Compiler LazUtils pour x86_64-win64 ──
-      - name: Build LazUtils (Win64)
+      # ── Construire les packages enregistrés ──
+      - name: Build Registered Packages
         shell: pwsh
         run: |
-          & "C:\lazarus\lazbuild.exe" `
-            --primary-config-path="$env:CONFIG_DIR" `
-            --lazarusdir="C:\lazarus" `
-            --cpu=x86_64 --os=win64 `
-            "C:\lazarus\components\lazutils\lazutils.lpk"
-        timeout-minutes: 10
-
-      # ── Ajouter les éventuels chemins de packages Cheat Engine ──
-      # (pas besoin de modifier environmentoptions.xml, on va utiliser le fichier idemake.cfg déjà créé)
-      - name: Append Cheat Engine paths to config
-        shell: pwsh
-        run: |
-          $configDir = $env:CONFIG_DIR
-          $cheatEngineDir = "$env:GITHUB_WORKSPACE\Cheat Engine"
-          # Ajouter les sous-répertoires de Cheat Engine si nécessaire (selon le projet)
-          # Ici on ajoute simplement le dossier racine du projet, l'unité laz_avl_tree n'est pas dedans.
-          # On le fait quand même pour préserver l'idée d'ajout de PackagePath.
-          Add-Content -Path "$configDir\idemake.cfg" -Value "-Fu$cheatEngineDir"
+          $lazarusDir = "C:\lazarus"
+          $workspace = $env:GITHUB_WORKSPACE
+          
+          $packages = Get-ChildItem -Path $workspace -Filter "*.lpk" -Recurse
+          
+          foreach ($pkg in $packages) {
+              Write-Host "Compilation du package: $($pkg.Name)"
+              & "$lazarusDir\lazbuild.exe" --build-package "$($pkg.Name)"
+          }
 
       # ── Construire Cheat Engine ──
       - name: Build Cheat Engine 64-bit Release
         shell: pwsh
         run: |
           & "C:\lazarus\lazbuild.exe" `
-            --primary-config-path="$env:CONFIG_DIR" `
-            --lazarusdir="C:\lazarus" `
             --build-mode="Release" `
-            --cpu=x86_64 --os=win64 `
+            --cpu=x86_64 `
+            --os=win64 `
+            --ws=win32 `
             "$env:GITHUB_WORKSPACE\Cheat Engine\cheatengine.lpi"
 
       - name: Upload artifact
