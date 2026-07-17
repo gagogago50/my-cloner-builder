@@ -18,7 +18,7 @@ on:
         default: "master"
         type: string
       artifact_path:
-        description: "Glob du binaire a uploader"
+        description: "Glob du binaire à uploader"
         required: true
         default: "Cheat Engine/bin/**"
         type: string
@@ -98,26 +98,24 @@ jobs:
         shell: pwsh
         run: '& "C:\lazarus\lazbuild.exe" --version'
 
-       - name: Configure Lazarus Package Path
+      - name: Configure Lazarus Package Path
         shell: pwsh
         run: |
-          $configPath = "C:\Users\runneradmin\AppData\Local\lazarus\environmentoptions.xml"
-          
-          # Check if config file exists
+          $configPath = "$env:LOCALAPPDATA\lazarus\environmentoptions.xml"
           if (Test-Path $configPath) {
             Write-Host "Lazarus config found at $configPath"
-            # Create backup
             Copy-Item $configPath "$configPath.bak"
-            
-            # Update package path to include Cheat Engine directory
+
             [xml]$xml = Get-Content $configPath
-            $packagePath = $xml.SelectSingleNode("//EnvironmentOptions/PackagePath")
-            if ($packagePath) {
-              $packagePath.InnerText = "${{ github.workspace }}\Cheat Engine;" + $packagePath.InnerText
+            $packageNode = $xml.SelectSingleNode("//EnvironmentOptions/PackagePath")
+            if ($packageNode) {
+              $cheatEngineDir = '${{ github.workspace }}\Cheat Engine'
+              # Ajout du répertoire en tête du chemin de paquets
+              $packageNode.InnerText = "$cheatEngineDir;$($packageNode.InnerText)"
             }
             $xml.Save($configPath)
           } else {
-            Write-Warning "Lazarus config not found at $configPath - will use default Lazarus settings"
+            Write-Warning "Lazarus config not found at $configPath – lazbuild might fail unless you run Lazarus once first."
           }
 
       - name: Build Cheat Engine 64-bit Release
