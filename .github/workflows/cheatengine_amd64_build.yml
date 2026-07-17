@@ -28,26 +28,26 @@ permissions:
   security-events: write
 
 jobs:
-  # Étape 1 : Scans séquentiels sur 1 seul runner, non bloquants (le build continue même si des trucs sont détectés)
   security-scans:
     name: "Sequential Security Scans"
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           fetch-depth: 0
 
-      - name: Create Gitleaks allowlist (faux positifs connus du repo cible)
+      - name: Create Gitleaks allowlist
         run: |
           cat > .gitleaks.toml << 'EOF'
           [extend]
           useDefault = true
 
           [allowlist]
-          description = "Faux positifs connus - code source Cheat Engine tiers, pas nos secrets"
+          description = "Faux positifs connus - code source Cheat Engine tiers"
           paths = [
             '''Cheat Engine/feces\.pas''',
             '''Cheat Engine/frmluaengineunit\.lfm'''
@@ -79,28 +79,28 @@ jobs:
           echo "Recherche de motifs sensibles (non bloquant)"
           grep -rniE "(password|secret|token|api_key)" . || true
 
-  # Étape 2 : Build Windows en parallèle sur un 2ème runner, indépendant des scans
   build:
     name: "Build Windows AMD64"
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           submodules: true
 
-      - name: Install Lazarus & FPC
+      - name: Install Lazarus and FPC
         shell: pwsh
         run: choco install lazarus -y --no-progress
 
       - name: Verify lazbuild
         shell: pwsh
-        run: &"C:\lazarus\lazbuild.exe" --version
+        run: '& "C:\lazarus\lazbuild.exe" --version'
 
-      - name: Build Cheat Engine (64-bit Release)
+      - name: Build Cheat Engine 64-bit Release
         shell: pwsh
-        run: &"C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
+        run: '& "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
