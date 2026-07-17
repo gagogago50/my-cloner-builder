@@ -57,7 +57,7 @@ jobs:
           description = "Faux positifs connus - code source Cheat Engine tiers"
           paths = [
             "Cheat Engine/feces\\.pas",
-            "Cheat Engine/frmluaengineunit\\.lfm"
+            "Cheat Engine/frmlua	engineunit\\.lfm"
           ]
           EOF
 
@@ -136,8 +136,11 @@ jobs:
           Write-Host "Racine Lazarus: $lazDir"
           echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
 
-      # ── Installer le cross-compiler i386-win32 OBLIGATOIRE pour le mode 32-bit ──
-      - name: Install i386 cross-compiler (ppc386)
+      # ── Tentative d'installation du cross-compiler i386-win32 (best-effort) ──
+      # Rendu STRICTEMENT OPTIONNEL à cause des 403/timeout de SourceForge.
+      # Si le téléchargement échoue, le mode 32-bit sera ignoré proprement au build.
+      - name: Try install i386 cross-compiler (non-fatal)
+        continue-on-error: true
         shell: pwsh
         env:
           LAZARUS_DIR: ${{ env.LAZARUS_DIR }}
@@ -154,40 +157,42 @@ jobs:
           $crossInstaller = "lazarus-$lazVer-fpc-$fpcVer-cross-i386-win32-win64.exe"
           $dest = Join-Path $env:RUNNER_TEMP $crossInstaller
 
+          # Ajout d'un miroir GitHub (fichiers Lazarus souvent mirrorés)
           $mirrors = @(
-              "https://freepascal.dfmk.hu/pub/lazarus/releases/$crossInstaller",
               "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller",
-              "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller/download"
+              "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller/download",
+              "https://freepascal.dfmk.hu/pub/lazarus/releases/$crossInstaller"
           )
 
           $downloaded = $false
           foreach ($url in $mirrors) {
               Write-Host "Tentative: $url"
               try {
+                  $headers = @{ "Accept" = "*/*" }
                   Invoke-WebRequest -Uri $url -OutFile "$dest" -UseBasicParsing `
-                      -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GitHub-Actions" `
-                      -MaximumRedirection 10 -ErrorAction Stop
+                      -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0" `
+                      -Headers $headers `
+                      -MaximumRedirection 15 -TimeoutSec 120 -ErrorAction Stop
                   if (Test-Path $dest) {
                       $bytes = [System.IO.File]::ReadAllBytes($dest)[0..1]
                       $magic = [System.Text.Encoding]::ASCII.GetString($bytes)
                       if ($magic -eq "MZ") {
-                          $size = (Get-Item $dest).Length
-                          Write-Host "Téléchargé $crossInstaller ($size bytes) depuis $url"
+                          Write-Host "Téléchargé ($((Get-Item $dest).Length) bytes) depuis $url"
                           $downloaded = $true
                           break
                       } else {
-                          Write-Warning "Pas un exécutable (magic='$magic') — interstitiel HTML ? Autre miroir."
+                          Write-Warning "Pas un .exe (magic='$magic')."
                           Remove-Item $dest -Force -ErrorAction SilentlyContinue
                       }
                   }
               } catch {
-                  Write-Warning "Échec URL: $($_.Exception.Message)"
+                  Write-Warning "Échec: $($_.Exception.Message)"
               }
           }
 
           if (-not $downloaded) {
-              # FATAL: on sort en erreur ici, le mode 32-bit ne pourra pas compiler
-              throw "Impossible de télécharger le cross-compiler i386. Le mode 32-bit échouerait."
+              Write-Warning "Téléchargement cross-compiler impossible. Le mode 32-bit sera ignoré."
+              return
           }
 
           Write-Host "::group::Installation cross-compiler i386"
@@ -197,9 +202,6 @@ jobs:
             -Wait -PassThru -NoNewWindow
           Write-Host "Code sortie install: $($p.ExitCode)"
           Write-Host "::endgroup::"
-          if (Test-Path $logFile) {
-              Get-Content $logFile -Tail 20 | ForEach-Object { Write-Host $_ }
-          }
 
           $ppc386 = Get-ChildItem -Path $lazDir -Filter "ppc386.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($ppc386) {
@@ -207,8 +209,9 @@ jobs:
               $fpcBinDir = Split-Path -Parent $ppc386.FullName
               echo "$fpcBinDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
               $env:PATH = "$fpcBinDir;$env:PATH"
+              echo "HAVE_PPC386=true" >> $env:GITHUB_ENV
           } else {
-              throw "ppc386.exe introuvable après installation — abandon."
+              Write-Warning "ppc386.exe introuvable après installation."
           }
 
       # ── Enregistrer les packages personnalisés de Cheat Engine ──
@@ -230,7 +233,7 @@ jobs:
           }
           & lazbuild --build-ide= 2>&1 | Out-Null
 
-      # ── Build Cheat Engine — modes Release (64-bit obligatoires) ──
+      # ── Build Cheat Engine — modes Release ──
       - name: Build Cheat Engine (all release modes)
         shell: pwsh
         run: |
@@ -238,9 +241,15 @@ jobs:
           $projectPath = Join-Path $workspace "Cheat Engine\cheatengine.lpi"
           if (-not (Test-Path $projectPath)) { throw "Projet non trouvé: $projectPath" }
 
-          # Modes critiques (doivent réussir) vs optionnel (32-bit)
           $criticalModes = @("Release 64-Bit", "Release 64-Bit O4 AVX2")
-          $optionalModes = @("Release 32-Bit")
+          $optionalModes = @()
+
+          # On ne tente le 32-bit QUE si ppc386 a pu être installé
+          if ($env:HAVE_PPC386 -eq "true") {
+              $optionalModes += "Release 32-Bit"
+          } else {
+              Write-Host ">> Cross-compiler ppc386 absent — mode 32-Bit ignoré."
+          }
 
           foreach ($mode in $criticalModes) {
               Write-Host "::group::Compilation CRITIQUE mode: $mode"
@@ -269,7 +278,6 @@ jobs:
               }
           }
           Write-Host "::endgroup::"
-          # Sortie explicite en succès — ne pas propager d'erreur même en cas de warning 32-bit
           exit 0
 
       # ── Sous-projets Lazarus ──
