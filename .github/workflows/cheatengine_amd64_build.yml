@@ -96,11 +96,11 @@ jobs:
 
       - name: Verify lazbuild
         shell: pwsh
-        run: & "C:\lazarus\lazbuild.exe" --version
+        run: &"C:\lazarus\lazbuild.exe" --version
 
       - name: Build Cheat Engine (64-bit Release)
         shell: pwsh
-        run: & "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
+        run: &"C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
