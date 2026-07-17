@@ -176,9 +176,9 @@ jobs:
 
           $binDir = Join-Path $workspace "Cheat Engine\bin"
           $avxExeCandidates = @(
-            Join-Path $binDir "cheatengine-x86_64-SSE4-AVX2.exe",
-            Join-Path $binDir "cheatengine-x86_64-sse4-avx2.exe",
-            Join-Path $binDir "cheatengine_x64sse_avx2.exe"
+            (Join-Path $binDir "cheatengine-x86_64-SSE4-AVX2.exe"),
+            (Join-Path $binDir "cheatengine-x86_64-sse4-avx2.exe"),
+            (Join-Path $binDir "cheatengine_x64sse_avx2.exe")
           )
           $avxExe = $avxExeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $avxExe) { throw "Executable AVX2 introuvable dans $binDir" }
