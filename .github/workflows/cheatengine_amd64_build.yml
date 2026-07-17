@@ -1,10 +1,10 @@
-name: Secure Build Cheat Engine (Windows AMD64)
+name: Secure Build Any Project (Template)
 
 on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "owner/repo"
+        description: "owner/repo (ex: XiaomiMiMo/MiMo-Code)"
         required: true
         default: "cheat-engine/cheat-engine"
         type: string
@@ -13,16 +13,34 @@ on:
         required: false
         default: "master"
         type: string
-      build_mode:
-        description: "Mode de build (ex: Release, Debug)"
+      build_command:
+        description: "Commande de build (non utilisée pour Lazarus/FPC)"
         required: false
-        default: "Release"
+        default: ""
         type: string
       artifact_path:
-        description: "Glob des fichiers à uploader"
+        description: "Glob du binaire à uploader"
         required: true
         default: "Cheat Engine/bin/**"
         type: string
+      runs_on:
+        description: "Runner"
+        required: false
+        default: "windows-latest"
+        type: choice
+        options:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+      node_or_bun:
+        description: "Runtime (choisir none pour Pascal/Lazarus)"
+        required: false
+        default: "none"
+        type: choice
+        options:
+          - bun
+          - node
+          - none
 
 permissions:
   contents: read
@@ -43,11 +61,11 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: ${{ matrix.scan == 'gitleaks' && 0 || 1 }}
 
-      # ... (conserve ici tes étapes de scan conditionnées par matrix.scan)
+      # ... (conserve ici tes étapes de scan conditionnées avec if: matrix.scan == 'xxx')
 
   build:
-    name: "Build Windows AMD64"
-    runs-on: windows-latest
+    name: "Build ${{ inputs.runs_on }}"
+    runs-on: ${{ inputs.runs_on }}
     needs: security-scans
     steps:
       - uses: actions/checkout@v4
@@ -60,31 +78,17 @@ jobs:
           choco install lazarus -y --no-progress
         shell: pwsh
 
-      - name: Configure Parallel Compilation (-j4)
-        run: |
-          # Recherche dynamique du fichier fpc.cfg dans le dossier d'installation de Lazarus
-          $fpcCfg = (Get-ChildItem -Path "C:\lazarus" -Filter "fpc.cfg" -Recurse | Select-Object -First 1).FullName
-          
-          if ($fpcCfg) {
-              Write-Host "Fichier de configuration trouvé ici : $fpcCfg"
-              # Ajout de l'option -j4 à la fin du fichier pour activer le multi-threading
-              Add-Content -Path $fpcCfg -Value "`n-j4"
-              Write-Host "Optimisation -j4 injectée avec succès."
-          } else {
-              Write-Error "Impossible de localiser le fichier fpc.cfg dans C:\lazarus"
-              exit 1
-          }
-        shell: pwsh
-
+      # Le build se lance directement ici, sans modification risquée de fpc.cfg
+      # lazbuild gère la configuration du projet automatiquement.
       - name: Build Cheat Engine
         run: |
-          & "C:\lazarus\lazbuild.exe" --build-mode="${{ inputs.build_mode }}" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
+          & "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
         shell: pwsh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cheat-engine-win64
+          name: build-${{ inputs.runs_on }}
           path: ${{ inputs.artifact_path }}
           if-no-files-found: error
           retention-days: 14
