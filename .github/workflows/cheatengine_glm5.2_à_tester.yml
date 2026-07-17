@@ -106,37 +106,103 @@ jobs:
         with:
           msbuild-architecture: x64
 
-      # ── Setup Lazarus avec version spécifique ──
-      # CRITIQUE: Cheat Engine nécessite Lazarus 2.2.2, 2.2.6 ou 3.x
-      # Les versions 4.x causent l'erreur "Cannot find laz_avl_Tree"
-      - name: Setup Lazarus
-        uses: gcarreno/setup-lazarus@v3
-        with:
-          lazarus-version: ${{ inputs.lazarus_version }}
-          with-cache: true
-
-      - name: Verify lazbuild and find install path
+      # ── Installer le cross-compiler i386-win32 (requis pour le mode "Release 32-Bit") ──
+      # Sans ceci: "ppc386.exe can't be executed, error code: 2"
+      # Le README officiel de Cheat Engine impose:
+      #   "First install lazarus-X-fpc-3.2.2-win64.exe
+      #    and then lazarus-X-fpc-3.2.2-cross-i386-win32-win64.exe"
+      - name: Install i386 cross-compiler (ppc386)
         shell: pwsh
         run: |
-          # Vérifier que lazbuild est dans le PATH
-          $lazbuild = Get-Command lazbuild -ErrorAction SilentlyContinue
-          if (-not $lazbuild) {
-              throw "lazbuild n'est pas dans le PATH"
-          }
-          Write-Host "lazbuild trouvé: $($lazbuild.Source)"
-
-          # Répertoire d'installation de Lazarus
+          $lazbuild = Get-Command lazbuild -ErrorAction Stop
           $lazDir = Split-Path -Parent $lazbuild.Source
-          Write-Host "Répertoire Lazarus: $lazDir"
+          # remonter jusqu'à la racine d'installation de Lazarus
+          while ($lazDir -and -not (Test-Path (Join-Path $lazDir "fpc"))) {
+              $lazDir = Split-Path -Parent $lazDir
+          }
+          if (-not $lazDir) {
+              # fallback: utiliser le chemin typique de gcarreno/setup-lazarus
+              $lazDir = "D:\a\_temp\installers\lazarus"
+          }
+          Write-Host "Racine Lazarus: $lazDir"
           echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
+
+          $fpcVer = "3.2.2"   # version FPC livrée avec Lazarus 2.2.x
+          # extraire la version Lazarus depuis lazbuild --version
+          $lazVerRaw = & lazbuild --version 2>&1 | Select-String -Pattern "^Lazarus" | Select-Object -First 1
+          if ($lazVerRaw -match "(\d+\.\d+\.\d+)") { $lazVer = $matches[1] } else { $lazVer = "${{ inputs.lazarus_version }}" }
+          Write-Host "Version Lazarus détectée: $lazVer"
+
+          $crossInstaller = "lazarus-$lazVer-fpc-$fpcVer-cross-i386-win32-win64.exe"
+          $url = "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller"
+          $dest = Join-Path $env:RUNNER_TEMP $crossInstaller
+
+          Write-Host "Téléchargement: $url"
+          # /silent /verysilent /suppressmsgboxes /norestart /nocloseapplications
+          # dir=LazDir : installe dans le même Lazarus que le principal
+          $maxAttempts = 4
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+              & curl.exe -L -sS -o "$dest" "$url" 2>&1
+              if (Test-Path $dest) { break }
+              Write-Warning "Tentative $i échouée, retry..."
+              Start-Sleep -Seconds 5
+          }
+          if (-not (Test-Path $dest)) { throw "Téléchargement cross-compiler i386 impossible: $url" }
+          $size = (Get-Item $dest).Length
+          Write-Host "Téléchargé $dest ($size bytes)"
+          if ($size -lt 1MB) {
+              $body = Get-Content $dest -Raw -ErrorAction SilentlyContinue
+              Write-Host "Contenu inattendu: $body"
+              throw "Le téléchargement ne semble pas être l'installeur (taille trop petite)."
+          }
+
+          Write-Host "::group::Installation cross-compiler i386"
+          # Installation silencieuse dans le même dossier que Lazarus (clé /DIR)
+          Start-Process -FilePath "$dest" `
+            -ArgumentList "/verysilent /suppressmsgboxes /norestart /nocloseapplications /DIR=`"$lazDir`"" `
+            -Wait -NoNewWindow
+          Write-Host "::endgroup::"
+
+          # Vérifier que ppc386.exe est maintenant disponible
+          $ppc386 = Get-ChildItem -Path $lazDir -Filter "ppc386.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($ppc386) {
+              Write-Host "ppc386.exe trouvé: $($ppc386.FullName)"
+              # S'assurer que le dossier bin du cross-compiler est dans le PATH de fpc
+              $fpcBinDir = Split-Path -Parent $ppc386.FullName
+              if (-not ($env:PATH -split ';' -contains $fpcBinDir)) {
+                  echo "$fpcBinDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+                  $env:PATH = "$fpcBinDir;$env:PATH"
+              }
+          } else {
+              Write-Warning "ppc386.exe introuvable après installation — le mode 32-bit échouera"
+          }
 
           # Vérifier les versions
           & lazbuild --version
           fpc -iV
 
-          # Localiser MSBuild et cl (compilateur C pour tcclib.sln)
+      - name: Verify lazbuild and find install path
+        shell: pwsh
+        run: |
+          $lazDir = $env:LAZARUS_DIR
+          Write-Host "Répertoire Lazarus: $lazDir"
+          # Re-confirme LAZARUS_DIR si le step précédent a échoué silencieusement
+          if (-not $lazDir) {
+              $lazbuild = Get-Command lazbuild -ErrorAction SilentlyContinue
+              if ($lazbuild) {
+                  $lazDir = Split-Path -Parent $lazbuild.Source
+                  while ($lazDir -and -not (Test-Path (Join-Path $lazDir "fpc"))) {
+                      $lazDir = Split-Path -Parent $lazDir
+                  }
+                  if (-not $lazDir) { $lazDir = "D:\a\_temp\installers\lazarus" }
+                  echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
+              }
+          }
+
+          # Localiser MSBuild et cl (pour tcclib.sln etc.)
           $msbuild = Get-Command msbuild -ErrorAction SilentlyContinue
           if ($msbuild) { Write-Host "msbuild trouvé: $($msbuild.Source)" } else { Write-Warning "msbuild NON trouvé" }
+
 
       # ── Enregistrer les packages personnalisés de Cheat Engine ──
       - name: Register and Build Cheat Engine Packages
