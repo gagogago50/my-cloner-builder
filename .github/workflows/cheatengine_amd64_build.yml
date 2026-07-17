@@ -111,7 +111,7 @@ jobs:
         shell: pwsh
 
       - name: Verify lazbuild
-        run: & "C:\lazarus\lazbuild.exe" --version
+        run: &"C:\lazarus\lazbuild.exe" --version
         shell: pwsh
 
       - name: Build Cheat Engine (64-bit Release)
