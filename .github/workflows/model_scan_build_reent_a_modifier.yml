@@ -1,101 +1,257 @@
-name: Secure Build Any Project (Template)
+name: Secure Build Template
+# ============================================================================
+# MODELE GENERIQUE - a adapter par projet
+# Ce workflow build UNIQUEMENT sur declenchement manuel (workflow_dispatch).
+# Il ne se lance jamais sur push/pull_request/schedule, donc il ne peut pas
+# declencher en cascade d'autres workflows du repo cible.
+#
+# Structure :
+#   1. security-scans  -> scans sequentiels sur 1 runner (non bloquants)
+#   2. build-windows    -> compile en parallele sur runner Windows (AMD64)
+#   3. build-linux       -> compile en parallele sur runner Ubuntu (AMD64)
+#
+# Les sections a modifier pour un projet donne sont marquees :
+#   # ==== ADAPTER ICI ====
+# ============================================================================
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "owner/repo (ex: XiaomiMiMo/MiMo-Code)"
+        description: "owner/repo du projet a builder"
         required: true
+        default: "owner/repo"
         type: string
       ref:
         description: "branch / tag / sha"
         required: false
         default: "main"
         type: string
-      build_command:
-        description: "Commande de build (ex: bun run build ou npm run build)"
-        required: true
-        type: string
-      artifact_path:
-        description: "Glob du binaire à uploader (ex: dist/**/*.exe)"
-        required: true
-        type: string
-      runs_on:
-        description: "Runner"
+      build_windows:
+        description: "Builder la version Windows AMD64 ?"
         required: false
-        default: "windows-latest"
-        type: choice
-        options:
-          - windows-latest
-          - ubuntu-latest
-          - macos-latest
-      node_or_bun:
-        description: "Runtime"
+        default: true
+        type: boolean
+      build_linux:
+        description: "Builder la version Linux Ubuntu AMD64 ?"
         required: false
-        default: "bun"
-        type: choice
-        options:
-          - bun
-          - node
-          - none
+        default: true
+        type: boolean
+      artifact_path_windows:
+        description: "Glob du binaire Windows a uploader"
+        required: false
+        default: "dist/windows/**"
+        type: string
+      artifact_path_linux:
+        description: "Glob du binaire Linux a uploader"
+        required: false
+        default: "dist/linux/**"
+        type: string
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
+  # ==========================================================================
+  # JOB 1 : SCANS DE SECURITE (sequentiels, non bloquants, 1 seul runner)
+  # ==========================================================================
   security-scans:
-    name: "Security Scans (parallel)"
+    name: "Security Scans (sequential)"
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        scan: [binaries, clamav, gitleaks, socket, patterns]
+    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          fetch-depth: ${{ matrix.scan == 'gitleaks' && 0 || 1 }}
+          fetch-depth: 0
 
-      # ... (tu peux copier-coller les étapes de scan du workflow précédent
-      #      et les conditionner avec if: matrix.scan == 'xxx')
-
-  build:
-    name: "Build ${{ inputs.runs_on }}"
-    runs-on: ${{ inputs.runs_on }}
-    needs: security-scans
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.repository }}
-          ref: ${{ inputs.ref }}
-
-      - name: Setup Bun
-        if: inputs.node_or_bun == 'bun'
-        uses: oven-sh/setup-bun@v2
-
-      - name: Setup Node
-        if: inputs.node_or_bun == 'node'
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-
-      - name: Install & Build
+      # --- 1. Secrets (Gitleaks) -------------------------------------------
+      - name: Create Gitleaks allowlist
         run: |
-          if [ "${{ inputs.node_or_bun }}" = "bun" ]; then
-            bun install
-          elif [ "${{ inputs.node_or_bun }}" = "node" ]; then
-            npm ci || npm install
-          fi
-          ${{ inputs.build_command }}
-        shell: bash
+          cat > .gitleaks.toml << 'EOF'
+          [extend]
+          useDefault = true
 
-      - name: Upload artifact
+          [allowlist]
+          description = "Faux positifs verifies manuellement pour ce projet"
+          # ==== ADAPTER ICI : ajouter les chemins de fichiers verifies comme faux positifs ====
+          paths = [
+            # '''path/to/known/false/positive\.ext'''
+          ]
+          EOF
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
+
+      # --- 2. SAST : code suspect / logique malveillante (Semgrep) ---------
+      # Config "p/ci" = ruleset curate officiel, faible taux de faux positifs.
+      # Gratuit, aucun compte requis pour ce ruleset public.
+      - name: Setup Semgrep
+        continue-on-error: true
+        run: python3 -m pip install --quiet semgrep
+
+      - name: Run Semgrep SAST scan
+        continue-on-error: true
+        run: |
+          semgrep scan --config p/ci --config p/secrets \
+            --error --metrics=off \
+            --output semgrep-results.txt . || true
+          echo "=== Resume Semgrep ==="
+          cat semgrep-results.txt || true
+
+      - name: Upload Semgrep report
+        if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: build-${{ inputs.runs_on }}
-          path: ${{ inputs.artifact_path }}
+          name: semgrep-report
+          path: semgrep-results.txt
+          retention-days: 14
+
+      # --- 3. IOC / YARA : backdoors, webshells, stealers connus (Loki) ----
+      # Loki (Neo23x0) = version gratuite et open-source (GPLv3) de THOR,
+      # sans fichier de license requis. Utilise le ruleset signature-base.
+      - name: Setup Loki IOC/YARA scanner
+        continue-on-error: true
+        run: |
+          git clone --depth 1 --recursive https://github.com/Neo23x0/Loki.git /tmp/loki
+          python3 -m pip install --quiet colorama yara-python psutil netaddr
+
+      - name: Run Loki scan
+        continue-on-error: true
+        run: |
+          cd /tmp/loki
+          python3 loki.py -p "$GITHUB_WORKSPACE" --noprocscan --intense --csv --dontwait > /tmp/loki-results.csv || true
+          echo "=== Resume Loki ==="
+          cat /tmp/loki-results.csv || true
+
+      - name: Upload Loki report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: loki-report
+          path: /tmp/loki-results.csv
+          retention-days: 14
+
+      # --- 4. Antivirus signatures connues (ClamAV) -------------------------
+      - name: Setup ClamAV
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clamav clamav-daemon
+          sudo freshclam --quiet || true
+
+      - name: Scan repository with ClamAV
+        continue-on-error: true
+        run: clamscan --recursive --infected --quiet . || true
+
+      # --- 5. Binaires precompiles commit dans le repo (dll/exe/so/etc.) ---
+      # Un backdoor se cache souvent dans un binaire precompile plutot que
+      # dans du code source lisible. On liste ici tout fichier binaire
+      # versionne pour verification manuelle -- ce n'est pas normal dans
+      # un repo de code source, sauf exception justifiee (lib tierce, etc.)
+      - name: Detect committed prebuilt binaries
+        continue-on-error: true
+        run: |
+          echo "=== Binaires precompiles trouves dans le repo ==="
+          git ls-files | grep -iE '\.(exe|dll|so|dylib|bin|a|lib|o|msi|sys|drv|elf|out)$' || echo "Aucun binaire precompile detecte."
+          echo ""
+          echo "ATTENTION : si des fichiers apparaissent ci-dessus, verifiez"
+          echo "manuellement leur origine et leur necessite avant de faire confiance au build."
+
+      # --- 6. Pattern scan simple (mots-cles sensibles) ---------------------
+      - name: Pattern scan
+        continue-on-error: true
+        run: |
+          echo "Recherche de motifs sensibles (non bloquant)"
+          grep -rniE "(password|secret|token|api_key)" . || true
+
+  # ==========================================================================
+  # JOB 2 : BUILD WINDOWS AMD64 (en parallele des scans)
+  # ==========================================================================
+  build-windows:
+    name: "Build Windows AMD64"
+    if: ${{ inputs.build_windows }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: true
+
+      # ==== ADAPTER ICI : installation des outils de build ====
+      # Exemples :
+      #   choco install <package> -y --no-progress          (Chocolatey)
+      #   winget install <package>                            (winget)
+      #   actions/setup-dotnet@v4 / actions/setup-python@v5 / etc.
+      - name: Install build toolchain
+        shell: pwsh
+        run: |
+          echo "TODO: installer ici les dependances de build (compilateur, SDK...)"
+
+      # ==== ADAPTER ICI : commande(s) de compilation ====
+      - name: Build project (Windows)
+        shell: pwsh
+        run: |
+          echo "TODO: remplacer par la vraie commande de build, ex:"
+          echo '& "C:\path\to\compiler.exe" --target=x86_64 --release "project.sln"'
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-windows-amd64
+          path: ${{ inputs.artifact_path_windows }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # ==========================================================================
+  # JOB 3 : BUILD LINUX UBUNTU AMD64 (en parallele des scans)
+  # ==========================================================================
+  build-linux:
+    name: "Build Linux Ubuntu AMD64"
+    if: ${{ inputs.build_linux }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: true
+
+      # ==== ADAPTER ICI : installation des outils de build ====
+      # Exemples :
+      #   sudo apt-get update && sudo apt-get install -y <packages>
+      #   actions/setup-python@v5 / actions/setup-node@v4 / actions/setup-go@v5
+      - name: Install build toolchain
+        run: |
+          echo "TODO: installer ici les dependances de build (compilateur, SDK...)"
+
+      # ==== ADAPTER ICI : commande(s) de compilation ====
+      - name: Build project (Linux)
+        run: |
+          echo "TODO: remplacer par la vraie commande de build, ex:"
+          echo "make CC=gcc ARCH=amd64 release"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-linux-amd64
+          path: ${{ inputs.artifact_path_linux }}
           if-no-files-found: error
           retention-days: 14
