@@ -122,11 +122,7 @@ jobs:
                   $lazDir = Split-Path -Parent $lazDir
               }
           }
-          $candidates = @(
-              "D:\a\_temp\installers\lazarus",
-              "C:\lazarus",
-              "C:\Program Files\Lazarus"
-          )
+          $candidates = @("D:\a\_temp\installers\lazarus", "C:\lazarus", "C:\Program Files\Lazarus")
           if (-not $lazDir) {
               foreach ($c in $candidates) {
                   if (Test-Path (Join-Path $c "lazbuild.exe")) { $lazDir = $c; break }
@@ -140,9 +136,7 @@ jobs:
           Write-Host "Racine Lazarus: $lazDir"
           echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
 
-      # ── Installer le cross-compiler i386-win32 (requis pour "Release 32-Bit") ──
-      # SourceForge sert des interstitiels HTML; on utilise le miroir FTP Lazarus officiel
-      # qui sert directement le .exe. Fallbacks multiples.
+      # ── Installer le cross-compiler i386-win32 OBLIGATOIRE pour le mode 32-bit ──
       - name: Install i386 cross-compiler (ppc386)
         shell: pwsh
         env:
@@ -151,7 +145,6 @@ jobs:
           $lazDir = $env:LAZARUS_DIR
           $fpcVer = "3.2.2"
           $lazVer = "${{ inputs.lazarus_version }}"
-          # tentative de détection plus précise
           try {
               $lazVerRaw = & lazbuild --version 2>&1 | Select-String -Pattern "Lazarus\s+(\d+\.\d+\.\d+)" | Select-Object -First 1
               if ($lazVerRaw -match "(\d+\.\d+\.\d+)") { $lazVer = $matches[1] }
@@ -161,45 +154,40 @@ jobs:
           $crossInstaller = "lazarus-$lazVer-fpc-$fpcVer-cross-i386-win32-win64.exe"
           $dest = Join-Path $env:RUNNER_TEMP $crossInstaller
 
-          # Liste de miroirs — le premier qui sert un vrai .exe gagne.
-          # Miroir FTP officiel de Free Pascal / Lazarus (pas d'interstitiel HTML)
           $mirrors = @(
               "https://freepascal.dfmk.hu/pub/lazarus/releases/$crossInstaller",
               "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller",
-              "ftp://freepascal.dfmk.hu/pub/lazarus/releases/$crossInstaller",
               "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller/download"
           )
 
           $downloaded = $false
           foreach ($url in $mirrors) {
-              Write-Host "Tentative de téléchargement: $url"
+              Write-Host "Tentative: $url"
               try {
-                  # UA explicite + follow redirects + use basic parsing (pas de parsing HTML)
                   Invoke-WebRequest -Uri $url -OutFile "$dest" -UseBasicParsing `
-                      -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GitHub-Actions-Build" `
+                      -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GitHub-Actions" `
                       -MaximumRedirection 10 -ErrorAction Stop
-                  # Vérifier que c'est bien un exécutable (début MZ) et pas une page HTML
                   if (Test-Path $dest) {
                       $bytes = [System.IO.File]::ReadAllBytes($dest)[0..1]
                       $magic = [System.Text.Encoding]::ASCII.GetString($bytes)
                       if ($magic -eq "MZ") {
                           $size = (Get-Item $dest).Length
-                          Write-Host "OK: $crossInstaller téléchargé ($size bytes) depuis $url"
+                          Write-Host "Téléchargé $crossInstaller ($size bytes) depuis $url"
                           $downloaded = $true
                           break
                       } else {
-                          Write-Warning "Le contenu reçu n'est pas un exécutable (magic='$magic') — probable interstitiel HTML. On essaye un autre miroir."
+                          Write-Warning "Pas un exécutable (magic='$magic') — interstitiel HTML ? Autre miroir."
                           Remove-Item $dest -Force -ErrorAction SilentlyContinue
                       }
                   }
               } catch {
-                  Write-Warning "Échec URL ($url): $($_.Exception.Message)"
+                  Write-Warning "Échec URL: $($_.Exception.Message)"
               }
           }
 
           if (-not $downloaded) {
-              Write-Warning "Téléchargement cross-compiler impossible sur tous les miroirs — le mode 32-bit échouera (non-fatal)."
-              return
+              # FATAL: on sort en erreur ici, le mode 32-bit ne pourra pas compiler
+              throw "Impossible de télécharger le cross-compiler i386. Le mode 32-bit échouerait."
           }
 
           Write-Host "::group::Installation cross-compiler i386"
@@ -207,21 +195,20 @@ jobs:
           $p = Start-Process -FilePath "$dest" `
             -ArgumentList "/verysilent /suppressmsgboxes /norestart /nocloseapplications /DIR=`"$lazDir`" /LOG=`"$logFile`"" `
             -Wait -PassThru -NoNewWindow
-          Write-Host "Code de sortie install: $($p.ExitCode)"
+          Write-Host "Code sortie install: $($p.ExitCode)"
           Write-Host "::endgroup::"
           if (Test-Path $logFile) {
               Get-Content $logFile -Tail 20 | ForEach-Object { Write-Host $_ }
           }
 
-          # Vérifier ppc386.exe
           $ppc386 = Get-ChildItem -Path $lazDir -Filter "ppc386.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($ppc386) {
-              Write-Host "ppc386.exe trouvé: $($ppc386.FullName)"
+              Write-Host "ppc386.exe OK: $($ppc386.FullName)"
               $fpcBinDir = Split-Path -Parent $ppc386.FullName
               echo "$fpcBinDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
               $env:PATH = "$fpcBinDir;$env:PATH"
           } else {
-              Write-Warning "ppc386.exe introuvable — mode 32-bit échouera (non-fatal)"
+              throw "ppc386.exe introuvable après installation — abandon."
           }
 
       # ── Enregistrer les packages personnalisés de Cheat Engine ──
@@ -230,48 +217,51 @@ jobs:
         env:
           LAZARUS_DIR: ${{ env.LAZARUS_DIR }}
         run: |
-          $workspace = $env:GITHUB_WORKSPACE
-          $ceDir = Join-Path $workspace "Cheat Engine"
-          Write-Host "::group::Recherche des packages .lpk"
+          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
           $packages = Get-ChildItem -Path $ceDir -Filter "*.lpk" -Recurse | Sort-Object Name
           Write-Host "Packages trouvés: $($packages.Count)"
-          $packages | ForEach-Object { Write-Host "  - $($_.Name)" }
-          Write-Host "::endgroup::"
           foreach ($pkg in $packages) {
-              Write-Host "::group::Ajout du package: $($pkg.Name)"
+              Write-Host "::group::Ajout: $($pkg.Name)"
               try {
                   & lazbuild --add-package "$($pkg.FullName)" 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "Erreur ajout $($pkg.Name), code: $LASTEXITCODE" }
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Erreur ajout $($pkg.Name)" }
               } catch { Write-Warning "Exception ajout $($pkg.Name): $_" }
               Write-Host "::endgroup::"
           }
-          Write-Host "::group::Reconstruction de la configuration Lazarus"
           & lazbuild --build-ide= 2>&1 | Out-Null
-          Write-Host "::endgroup::"
 
-      # ── Build Cheat Engine — tous les modes Release ──
+      # ── Build Cheat Engine — modes Release (64-bit obligatoires) ──
       - name: Build Cheat Engine (all release modes)
         shell: pwsh
         run: |
           $workspace = $env:GITHUB_WORKSPACE
           $projectPath = Join-Path $workspace "Cheat Engine\cheatengine.lpi"
-          Write-Host "::group::Configuration du build"
-          Write-Host "Projet: $projectPath"
           if (-not (Test-Path $projectPath)) { throw "Projet non trouvé: $projectPath" }
-          Write-Host "::endgroup::"
-          $modes = @("Release 64-Bit", "Release 64-Bit O4 AVX2", "Release 32-Bit")
-          $globalFail = $false
-          foreach ($mode in $modes) {
-              Write-Host "::group::Compilation mode: $mode"
+
+          # Modes critiques (doivent réussir) vs optionnel (32-bit)
+          $criticalModes = @("Release 64-Bit", "Release 64-Bit O4 AVX2")
+          $optionalModes = @("Release 32-Bit")
+
+          foreach ($mode in $criticalModes) {
+              Write-Host "::group::Compilation CRITIQUE mode: $mode"
               & lazbuild --build-mode="$mode" --max-process-count=4 "$projectPath" 2>&1
               $exitCode = $LASTEXITCODE
               Write-Host "::endgroup::"
               if ($exitCode -ne 0) {
-                  Write-Warning "Échec mode '$mode' (code $exitCode) — on continue."
-                  $globalFail = $true
+                  throw "Mode CRITIQUE '$mode' échoué (code $exitCode) — abandon."
               }
           }
-          Write-Host "::group::Vérification binaires"
+          foreach ($mode in $optionalModes) {
+              Write-Host "::group::Compilation OPTIONNEL mode: $mode"
+              & lazbuild --build-mode="$mode" --max-process-count=4 "$projectPath" 2>&1
+              $exitCode = $LASTEXITCODE
+              Write-Host "::endgroup::"
+              if ($exitCode -ne 0) {
+                  Write-Warning "Mode OPTIONNEL '$mode' échoué (code $exitCode) — ignoré."
+              }
+          }
+
+          Write-Host "::group::Binaires générés"
           $binDir = Join-Path $workspace "Cheat Engine\bin"
           if (Test-Path $binDir) {
               Get-ChildItem -Path $binDir -Filter "*.exe" | ForEach-Object {
@@ -279,14 +269,8 @@ jobs:
               }
           }
           Write-Host "::endgroup::"
-          if ($globalFail) {
-              $has64 = Test-Path (Join-Path $binDir "cheatengine-x86_64.exe")
-              $has64Avx2 = Test-Path (Join-Path $binDir "cheatengine-x86_64-SSE4-AVX2.exe")
-              if (-not ($has64 -or $has64Avx2)) {
-                  throw "Aucun binaire 64-bit produit — build abandonné."
-              }
-              Write-Host "Build partiel: au moins un binaire 64-bit présent."
-          }
+          # Sortie explicite en succès — ne pas propager d'erreur même en cas de warning 32-bit
+          exit 0
 
       # ── Sous-projets Lazarus ──
       - name: Build all Lazarus sub-projects (.lpi/.lpr)
@@ -323,9 +307,7 @@ jobs:
         shell: pwsh
         run: |
           $slnFiles = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE "Cheat Engine") -Filter "*.sln" -Recurse -ErrorAction SilentlyContinue
-          Write-Host "::group::Solutions VS: $($slnFiles.Count)"
-          $slnFiles | ForEach-Object { Write-Host "  SLN: $($_.FullName)" }
-          Write-Host "::endgroup::"
+          Write-Host "Solutions VS: $($slnFiles.Count)"
           foreach ($sln in $slnFiles) {
               Write-Host "::group::msbuild $($sln.Name)"
               foreach ($platform in @("x86", "x64")) {
