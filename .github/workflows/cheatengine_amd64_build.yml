@@ -61,7 +61,47 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: ${{ matrix.scan == 'gitleaks' && 0 || 1 }}
 
-      # ... (conserve ici tes étapes de scan conditionnées avec if: matrix.scan == 'xxx')
+      # ---- Gitleaks: détection de secrets ----
+      - name: Run Gitleaks
+        if: matrix.scan == 'gitleaks'
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        with:
+          config-path: .gitleaks.toml
+
+      # ---- ClamAV: analyse antivirus ----
+      - name: Setup ClamAV
+        if: matrix.scan == 'clamav'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clamav clamav-daemon
+          sudo freshclam --quiet
+
+      - name: Scan repository with ClamAV
+        if: matrix.scan == 'clamav'
+        run: clamscan --recursive --infected --quiet .
+
+      # ---- Scan de motifs (patterns) ----
+      - name: Pattern scan
+        if: matrix.scan == 'patterns'
+        run: |
+          echo "Recherche de motifs sensibles..."
+          grep -rniE "(password|secret|token|api_key)" . || true
+
+      # ---- Scan socket & binaries (exemples) ----
+      - name: Socket scan placeholder
+        if: matrix.scan == 'socket'
+        run: |
+          echo "Socket scan – à implémenter selon vos besoins (ex: socket.dev CLI)"
+          # Exemple: npm install -g @socketsecurity/cli && socket scan .
+
+      - name: Binaries scan placeholder
+        if: matrix.scan == 'binaries'
+        run: |
+          echo "Binaries scan – à implémenter (ex: trivy, syft/grype, ou VirusTotal)"
+          # Exemple: wget https://github.com/aquasecurity/trivy/releases/download/v0.50.1/trivy_0.50.1_Linux-64bit.deb
+          # sudo dpkg -i trivy*.deb && trivy fs --skip-dirs Cheat\ Engine/bin  .
 
   build:
     name: "Build ${{ inputs.runs_on }}"
@@ -72,17 +112,22 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
+          submodules: true          # Indispensable : CE utilise plusieurs sous-modules !
 
       - name: Install Lazarus & FPC
         run: |
           choco install lazarus -y --no-progress
         shell: pwsh
 
-      # Le build se lance directement ici, sans modification risquée de fpc.cfg
-      # lazbuild gère la configuration du projet automatiquement.
-      - name: Build Cheat Engine
+      - name: Verify lazbuild
         run: |
-          & "C:\lazarus\lazbuild.exe" --build-mode="Release" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi"
+          & "C:\lazarus\lazbuild.exe" --version
+        shell: pwsh
+
+      - name: Build Cheat Engine (64-bit Release)
+        run: |
+          # Le mode Release_64 est le mode natif 64 bits du projet CE
+          & "C:\lazarus\lazbuild.exe" --build-mode="Release_64" "Cheat Engine/cheatengine.lpi"
         shell: pwsh
 
       - name: Upload artifact
