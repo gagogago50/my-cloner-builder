@@ -1,0 +1,223 @@
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "owner/repo (ex: cheat-engine/cheat-engine)"
+        required: true
+        default: "cheat-engine/cheat-engine"
+        type: string
+      ref:
+        description: "branch / tag / sha"
+        required: false
+        default: "master"
+        type: string
+      artifact_path:
+        description: "Glob du binaire à uploader"
+        required: true
+        default: "Cheat Engine/bin/**"
+        type: string
+      lazarus_version:
+        description: "Version de Lazarus (2.2.2 recommandé pour CE)"
+        required: false
+        default: "2.2.2"
+        type: choice
+        options:
+          - "2.2.2"
+          - "2.2.6"
+          - "stable"
+          - "dist"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security-scans:
+    name: "Sequential Security Scans"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Create Gitleaks allowlist
+        run: |
+          cat > .gitleaks.toml << 'EOF'
+          [extend]
+          useDefault = true
+
+          [allowlist]
+          description = "Faux positifs connus - code source Cheat Engine tiers"
+          paths = [
+            "Cheat Engine/feces\.pas",
+            "Cheat Engine/frmluaengineunit\.lfm"
+          ]
+          EOF
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
+
+      - name: Setup ClamAV
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clamav clamav-daemon
+          sudo freshclam --quiet || true
+
+      - name: Scan repository with ClamAV
+        continue-on-error: true
+        run: clamscan --recursive --infected --quiet . || true
+
+      - name: Pattern scan
+        continue-on-error: true
+        run: |
+          echo "Recherche de motifs sensibles (non bloquant)"
+          grep -rniE "(password|secret|token|api_key)" --include="*.pas" --include="*.lfm" --include="*.lpi" --include="*.lpr" . || true
+
+  build:
+    name: "Build Windows AMD64"
+    runs-on: windows-latest
+    needs: security-scans
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+
+      - name: Setup Lazarus
+        uses: gcarreno/setup-lazarus@v3
+        with:
+          lazarus-version: ${{ inputs.lazarus_version }}
+          with-cache: true
+
+      - name: Verify lazbuild and find install path
+        shell: pwsh
+        run: |
+          $lazbuild = Get-Command lazbuild -ErrorAction SilentlyContinue
+          if (-not $lazbuild) { throw "lazbuild n'est pas dans le PATH" }
+          Write-Host "lazbuild trouvé: $($lazbuild.Source)"
+          $lazDir = Split-Path -Parent $lazbuild.Source
+          Write-Host "Répertoire Lazarus: $lazDir"
+          echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
+          & lazbuild --version
+          fpc -iV
+
+      - name: Register and Build Cheat Engine Packages
+        shell: pwsh
+        run: |
+          $lazarusDir = $env:LAZARUS_DIR
+          $workspace = $env:GITHUB_WORKSPACE
+          $ceDir = Join-Path $workspace "Cheat Engine"
+
+          Write-Host "::group::Recherche des packages .lpk"
+          $packages = Get-ChildItem -Path $ceDir -Filter "*.lpk" -Recurse | Sort-Object Name
+          Write-Host "Packages trouvés: $($packages.Count)"
+          $packages | ForEach-Object { Write-Host "  - $($_.Name)" }
+          Write-Host "::endgroup::"
+
+          foreach ($pkg in $packages) {
+            Write-Host "::group::Ajout du package: $($pkg.Name)"
+            try {
+              & lazbuild --add-package "$($pkg.FullName)" 2>&1
+              if ($LASTEXITCODE -ne 0) { Write-Warning "Erreur lors de l'ajout de $($pkg.Name), code: $LASTEXITCODE" }
+            } catch {
+              Write-Warning "Exception lors de l'ajout de $($pkg.Name): $_"
+            }
+            Write-Host "::endgroup::"
+          }
+
+          Write-Host "::group::Reconstruction de la configuration Lazarus"
+          & lazbuild --build-ide= 2>&1 | Out-Null
+          Write-Host "::endgroup::"
+
+      - name: Build Cheat Engine (Release + AVX2)
+        shell: pwsh
+        run: |
+          $workspace   = $env:GITHUB_WORKSPACE
+          $projectPath = Join-Path $workspace "Cheat Engine\cheatengine.lpi"
+          if (-not (Test-Path $projectPath)) { throw "Projet non trouvé: $projectPath" }
+
+          $modeMatches = Select-String -Path $projectPath -Pattern 'Name="([^"]+)"' -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value }
+          $modes = $modeMatches | Sort-Object -Unique
+
+          $releaseMode = $modes | Where-Object { $_ -like "Release*64*" } | Select-Object -First 1
+          if (-not $releaseMode) { $releaseMode = ($modes | Where-Object { $_ -like "Release*" } | Select-Object -First 1) }
+          if (-not $releaseMode) { throw "Aucun mode Release trouvé" }
+
+          $avxMode = $modes | Where-Object { $_ -match "AVX2" } | Select-Object -First 1
+          if (-not $avxMode) { throw "Aucun mode AVX2 trouvé dans cheatengine.lpi" }
+
+          Write-Host "Modes détectés:"; $releaseMode; $avxMode
+
+          Write-Host "::group::Build Release ($releaseMode)"
+          & lazbuild --build-mode="$releaseMode" --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$projectPath"
+          if ($LASTEXITCODE -ne 0) { throw "Compilation Release échouée (code $LASTEXITCODE)" }
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::Build AVX2 ($avxMode)"
+          & lazbuild --build-mode="$avxMode" --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$projectPath"
+          if ($LASTEXITCODE -ne 0) { throw "Compilation AVX2 échouée (code $LASTEXITCODE)" }
+          Write-Host "::endgroup::"
+
+          $binDir = Join-Path $workspace "Cheat Engine\bin"
+          $avxExeCandidates = @(
+            Join-Path $binDir "cheatengine-x86_64-SSE4-AVX2.exe",
+            Join-Path $binDir "cheatengine-x86_64-sse4-avx2.exe",
+            Join-Path $binDir "cheatengine_x64sse_avx2.exe"
+          )
+          $avxExe = $avxExeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $avxExe) { throw "Executable AVX2 introuvable dans $binDir" }
+
+          $targetAvx = Join-Path $binDir "cheatengine_x64sse_avx2.exe"
+          if ($avxExe -ne $targetAvx) { Copy-Item $avxExe $targetAvx -Force }
+
+          Write-Host "::group::Binaries présents"
+          Get-ChildItem -Path $binDir -Filter "*.exe" | ForEach-Object { Write-Host "- $($_.Name) ($($_.Length) bytes)" }
+          Write-Host "::endgroup::"
+
+      - name: Build tcclib & plugin (msbuild)
+        shell: pwsh
+        run: |
+          $workspace = $env:GITHUB_WORKSPACE
+          $solutions = @(
+            @{ Name = "tcclib"; Path = Join-Path $workspace "Cheat Engine\tcclib\tcclib.sln" },
+            @{ Name = "plugin"; Path = Join-Path $workspace "Cheat Engine\plugin\plugin.sln" }
+          ) | Where-Object { Test-Path $_.Path }
+
+          if (-not $solutions) { Write-Warning "Aucun tcclib/plugin .sln trouvé"; return }
+
+          foreach ($sln in $solutions) {
+            foreach ($platform in @("Win32", "x64")) {
+              Write-Host "::group::Build $($sln.Name) ($platform)"
+              & msbuild "$($sln.Path)" /t:Build /p:Configuration=Release /p:Platform=$platform /m
+              $code = $LASTEXITCODE
+              Write-Host "::endgroup::"
+              if ($code -ne 0) { throw "msbuild a échoué pour $($sln.Name) $platform (code $code)" }
+            }
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cheat-engine-win64-${{ inputs.ref || 'master' }}-full
+          path: |
+            Cheat Engine/bin/**
+            Cheat Engine/tcclib/**
+            Cheat Engine/plugin/**
+          if-no-files-found: error
+          retention-days: 14
