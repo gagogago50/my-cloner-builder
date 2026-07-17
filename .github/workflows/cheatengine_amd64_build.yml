@@ -98,6 +98,16 @@ jobs:
         shell: pwsh
         run: '& "C:\lazarus\lazbuild.exe" --version'
 
+      # ── Nouvelle étape : compiler les packages Lazarus requis pour Win64 ──
+      - name: Build Lazarus packages (Win64)
+        shell: pwsh
+        run: |
+          Write-Host "Compiling LazUtils for x86_64-win64..."
+          & "C:\lazarus\lazbuild.exe" --cpu=x86_64 --os=win64 --build-ide=0 "C:\lazarus\components\lazutils\lazutils.lpk"
+          Write-Host "Compiling LCL for x86_64-win64..."
+          & "C:\lazarus\lazbuild.exe" --cpu=x86_64 --os=win64 --build-ide=0 "C:\lazarus\lcl\lcl.lpk"
+        timeout-minutes: 10
+
       - name: Configure Lazarus Package Path
         shell: pwsh
         run: |
@@ -110,7 +120,6 @@ jobs:
             $packageNode = $xml.SelectSingleNode("//EnvironmentOptions/PackagePath")
             if ($packageNode) {
               $cheatEngineDir = '${{ github.workspace }}\Cheat Engine'
-              # Ajout du répertoire en tête du chemin de paquets
               $packageNode.InnerText = "$cheatEngineDir;$($packageNode.InnerText)"
             }
             $xml.Save($configPath)
