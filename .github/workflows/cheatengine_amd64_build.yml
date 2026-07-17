@@ -101,7 +101,7 @@ jobs:
           ref: ${{ inputs.ref }}
           submodules: recursive
 
-      # ── Utiliser setup-lazarus avec version spécifique ──
+      # ── Setup Lazarus avec version spécifique ──
       # CRITIQUE: Cheat Engine nécessite Lazarus 2.2.2, 2.2.6 ou 3.x
       # Les versions 4.x causent l'erreur "Cannot find laz_avl_Tree"
       - name: Setup Lazarus
@@ -110,17 +110,30 @@ jobs:
           lazarus-version: ${{ inputs.lazarus_version }}
           with-cache: true
 
-      - name: Verify lazbuild
+      - name: Verify lazbuild and find install path
         shell: pwsh
         run: |
-          & "C:\lazarus\lazbuild.exe" --version
-          & "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe" -iV
+          # Vérifier que lazbuild est dans le PATH
+          $lazbuild = Get-Command lazbuild -ErrorAction SilentlyContinue
+          if (-not $lazbuild) {
+              throw "lazbuild n'est pas dans le PATH"
+          }
+          Write-Host "lazbuild trouvé: $($lazbuild.Source)"
+          
+          # Essayer de trouver le répertoire d'installation
+          $lazDir = Split-Path -Parent $lazbuild.Source
+          Write-Host "Répertoire Lazarus: $lazDir"
+          echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
+          
+          # Vérifier les versions
+          & lazbuild --version
+          fpc -iV
 
       # ── Enregistrer les packages personnalisés de Cheat Engine ──
       - name: Register and Build Cheat Engine Packages
         shell: pwsh
         run: |
-          $lazarusDir = "C:\lazarus"
+          $lazarusDir = $env:LAZARUS_DIR
           $workspace = $env:GITHUB_WORKSPACE
           $ceDir = Join-Path $workspace "Cheat Engine"
           
@@ -134,7 +147,7 @@ jobs:
           foreach ($pkg in $packages) {
               Write-Host "::group::Ajout du package: $($pkg.Name)"
               try {
-                  & "$lazarusDir\lazbuild.exe" --add-package "$($pkg.FullName)" 2>&1
+                  & lazbuild --add-package "$($pkg.FullName)" 2>&1
                   if ($LASTEXITCODE -ne 0) {
                       Write-Warning "Erreur lors de l'ajout de $($pkg.Name), code: $LASTEXITCODE"
                   }
@@ -146,20 +159,18 @@ jobs:
           
           # Reconstruire le fichier de configuration Lazarus
           Write-Host "::group::Reconstruction de la configuration Lazarus"
-          & "$lazarusDir\lazbuild.exe" --build-ide= 2>&1 | Out-Null
+          & lazbuild --build-ide= 2>&1 | Out-Null
           Write-Host "::endgroup::"
 
       # ── Construire Cheat Engine 64-bit Release ──
       - name: Build Cheat Engine 64-bit Release
         shell: pwsh
         run: |
-          $lazarusDir = "C:\lazarus"
           $workspace = $env:GITHUB_WORKSPACE
           $projectPath = Join-Path $workspace "Cheat Engine\cheatengine.lpi"
           
           Write-Host "::group::Configuration du build"
           Write-Host "Projet: $projectPath"
-          Write-Host "Lazarus: $lazarusDir"
           Write-Host "::endgroup::"
           
           # Vérifier que le projet existe
@@ -169,7 +180,7 @@ jobs:
           
           # Build avec les options recommandées pour Cheat Engine
           Write-Host "::group::Compilation du projet"
-          & "$lazarusDir\lazbuild.exe" `
+          & lazbuild `
             --build-mode="Release" `
             --cpu=x86_64 `
             --os=win64 `
