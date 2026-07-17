@@ -62,9 +62,8 @@ jobs:
 
       - name: Build Cheat Engine (Parallel Compilation)
         run: |
-          # --cpu=x86_64 et --os=win64 ciblent explicitement l'architecture AMD64 Windows
-          # --fpcb="-j4" demande au compilateur Free Pascal de compiler les unités en parallèle (4 threads)
-          & "C:\lazarus\lazbuild.exe" --build-mode="${{ inputs.build_mode }}" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi" --fpcb="-j4"
+          # --threads=4 force l'utilisation de 4 threads (ou retire l'option pour utiliser tous les coeurs du runner)
+          & "C:\lazarus\lazbuild.exe" --build-mode="${{ inputs.build_mode }}" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi" --threads=4
         shell: pwsh
 
       - name: Upload artifact
