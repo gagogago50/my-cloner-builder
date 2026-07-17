@@ -1,0 +1,76 @@
+name: Secure Build Cheat Engine (Windows AMD64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "owner/repo"
+        required: true
+        default: "cheat-engine/cheat-engine"
+        type: string
+      ref:
+        description: "branch / tag / sha"
+        required: false
+        default: "master" # Cheat Engine utilise 'master' comme branche principale
+        type: string
+      build_mode:
+        description: "Mode de build (ex: Release, Debug)"
+        required: false
+        default: "Release"
+        type: string
+      artifact_path:
+        description: "Glob des fichiers à uploader"
+        required: true
+        default: "Cheat Engine/bin/**"
+        type: string
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security-scans:
+    name: "Security Scans (parallel)"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scan: [binaries, clamav, gitleaks, socket, patterns]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: ${{ matrix.scan == 'gitleaks' && 0 || 1 }}
+
+      # ... (conserve ici tes étapes de scan conditionnées par matrix.scan)
+
+  build:
+    name: "Build Windows AMD64"
+    runs-on: windows-latest
+    needs: security-scans
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+
+      - name: Install Lazarus & FPC
+        run: |
+          choco install lazarus -y --no-progress
+        shell: pwsh
+
+      - name: Build Cheat Engine (Parallel Compilation)
+        run: |
+          # --cpu=x86_64 et --os=win64 ciblent explicitement l'architecture AMD64 Windows
+          # --fpcb="-j4" demande au compilateur Free Pascal de compiler les unités en parallèle (4 threads)
+          & "C:\lazarus\lazbuild.exe" --build-mode="${{ inputs.build_mode }}" --cpu=x86_64 --os=win64 "Cheat Engine/cheatengine.lpi" --fpcb="-j4"
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cheat-engine-win64
+          path: ${{ inputs.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
