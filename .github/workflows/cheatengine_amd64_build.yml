@@ -98,22 +98,27 @@ jobs:
         shell: pwsh
         run: '& "C:\lazarus\lazbuild.exe" --version'
 
-      - name: Configure Lazarus Package Path
+       - name: Configure Lazarus Package Path
         shell: pwsh
         run: |
           $configPath = "C:\Users\runneradmin\AppData\Local\lazarus\environmentoptions.xml"
-          # Create backup
-          if (Test-Path $configPath) {
-            Copy-Item $configPath "$configPath.bak"
-          }
           
-          # Update package path to include Cheat Engine directory
-          [xml]$xml = Get-Content $configPath
-          $packagePath = $xml.SelectSingleNode("//EnvironmentOptions/PackagePath")
-          if ($packagePath) {
-            $packagePath.InnerText = "${{ github.workspace }}\Cheat Engine;" + $packagePath.InnerText
+          # Check if config file exists
+          if (Test-Path $configPath) {
+            Write-Host "Lazarus config found at $configPath"
+            # Create backup
+            Copy-Item $configPath "$configPath.bak"
+            
+            # Update package path to include Cheat Engine directory
+            [xml]$xml = Get-Content $configPath
+            $packagePath = $xml.SelectSingleNode("//EnvironmentOptions/PackagePath")
+            if ($packagePath) {
+              $packagePath.InnerText = "${{ github.workspace }}\Cheat Engine;" + $packagePath.InnerText
+            }
+            $xml.Save($configPath)
+          } else {
+            Write-Warning "Lazarus config not found at $configPath - will use default Lazarus settings"
           }
-          $xml.Save($configPath)
 
       - name: Build Cheat Engine 64-bit Release
         shell: pwsh
