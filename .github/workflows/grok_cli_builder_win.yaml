@@ -20,12 +20,12 @@ env:
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
   GROK_DIR: "grok-build"
+  # Version de protoc cohérente avec bin/protoc (v29.3)
+  PROTOC_VERSION: "29.3"
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 1 : BUILD WINDOWS AMD64
-  # FIX PROTOC : arduino/setup-protoc installe protoc natif Windows
-  #              + PROTOC env var → bypasse totalement DotSlash pour protoc
   # ─────────────────────────────────────────────────────────────────────────────
   build-windows-amd64:
     name: "🏗️ Build – Windows AMD64 (Rust)"
@@ -40,48 +40,124 @@ jobs:
       - name: "📥 Clone xai-org/grok-build"
         shell: pwsh
         run: |
-          Write-Host "Cloning xai-org/grok-build..."
           git clone --depth 1 https://github.com/xai-org/grok-build.git $env:GROK_DIR
-          Write-Host "=== Contents ==="
+          Write-Host "=== Cloned files ==="
           Get-ChildItem $env:GROK_DIR | Select-Object -ExpandProperty Name
 
-      # ── FIX PROTOC ────────────────────────────────────────────────────────
-      # arduino/setup-protoc installe protoc précompilé pour Windows x64
-      # et l'ajoute au PATH + expose $PROTOC automatiquement
-      # Le build script xai_proto_build lit $PROTOC en priorité absolue
-      # → plus besoin de DotSlash pour protoc
-      - name: "⚙️ Install protoc (bypass DotSlash on Windows)"
+      # ── INSTALL PROTOC NATIF WINDOWS ──────────────────────────────────────
+      # arduino/setup-protoc installe protoc.exe Windows x64 et le met dans PATH
+      - name: "⚙️ Install protoc ${{ env.PROTOC_VERSION }} (Windows native)"
         uses: arduino/setup-protoc@v3
         with:
-          version: "25.x"   # Dernière version stable protobuf
+          version: "${{ env.PROTOC_VERSION }}"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-          # include-pre-releases: false (défaut)
 
-      # Vérifier que protoc est bien dans PATH et accessible
-      - name: "🔍 Verify protoc installation"
+      # ── FIX CRITIQUE : Patcher bin/protoc pour ajouter l'entrée Windows ──
+      # Le manifeste DotSlash de bin/protoc ne contient que macOS + Linux.
+      # find_protoc.rs appelle ce fichier EN PREMIER via DotSlash.
+      # DotSlash ne trouve pas de plateforme "windows-x86_64" → panic unwrap.
+      # Solution : injecter l'entrée Windows dans le JSON DotSlash,
+      # en pointant vers le vrai protoc.exe installé par arduino/setup-protoc.
+      - name: "🔧 Patch bin/protoc DotSlash manifest (add Windows entry)"
         shell: pwsh
         run: |
-          $protocPath = (Get-Command protoc -ErrorAction Stop).Source
-          Write-Host "✅ protoc found at: $protocPath"
+          # Trouver le chemin absolu de protoc.exe installé
+          $protocExe = (Get-Command protoc -ErrorAction Stop).Source
+          Write-Host "✅ protoc found at: $protocExe"
           protoc --version
-          # Exporter PROTOC explicitement pour les steps suivants
-          echo "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # DotSlash reste installé pour les AUTRES outils hermétiques sous bin/
-      # (pas pour bin/protoc qui est bypassé via PROTOC env var)
-      - name: "🔧 Install DotSlash (pour outils hermétiques bin/*)"
-        uses: facebook/install-dotslash@latest
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Écrire le chemin dans GITHUB_ENV pour les steps suivants
+          "PROTOC=$protocExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Lire le fichier DotSlash actuel
+          $dotslashFile = "$env:GROK_DIR\bin\protoc"
+          Write-Host "=== Original bin/protoc content ==="
+          Get-Content $dotslashFile
+
+          # Patcher avec Python : ajouter la plateforme windows-x86_64
+          # Le format DotSlash JSON a une clé "platforms" avec les OS/arch
+          python3 @"
+          import json, sys
+
+          path = r'$dotslashFile'.replace('\\', '/')
+          protoc_exe = r'$protocExe'.replace('\\', '/')
+
+          with open(path, 'r') as f:
+              content = f.read()
+
+          # Le fichier DotSlash commence par un shebang #!/usr/bin/env dotslash
+          # suivi d'un JSON. Trouver le début du JSON.
+          json_start = content.find('{')
+          shebang = content[:json_start]
+          json_str = content[json_start:]
+
+          data = json.loads(json_str)
+
+          # Ajouter l'entrée Windows si absente
+          platforms = data.get('platforms', {})
+          if 'windows-x86_64' not in platforms:
+              # On crée une entrée Windows qui utilise le protoc natif installé
+              # Format : path vers un exécutable local (DotSlash supporte "path")
+              platforms['windows-x86_64'] = {
+                  'source': {
+                      'type': 'local',
+                      'path': protoc_exe
+                  }
+              }
+              data['platforms'] = platforms
+              print(f'✅ Added windows-x86_64 entry pointing to: {protoc_exe}')
+          else:
+              print('ℹ️  windows-x86_64 already present in manifest')
+
+          patched = shebang + json.dumps(data, indent=2)
+          with open(path, 'w') as f:
+              f.write(patched)
+
+          print('✅ bin/protoc patched successfully')
+          print('=== Patched content ===')
+          print(patched[:500])
+          "@
+
+          Write-Host "=== Patched bin/protoc ==="
+          Get-Content $dotslashFile | Select-Object -First 30
+
+      # ── ALTERNATIVE ROBUSTE : wrapper batch qui bypass DotSlash ──────────
+      # Si le format DotSlash "local" n'est pas supporté par la version installée,
+      # on crée un fallback : un script batch bin/protoc.bat qui appelle protoc.exe
+      # DotSlash sur Windows cherche bin/protoc.bat en priorité sur bin/protoc
+      - name: "🔧 Create bin/protoc.bat wrapper (DotSlash bypass fallback)"
+        shell: pwsh
+        run: |
+          $protocExe = $env:PROTOC
+          $batFile   = "$env:GROK_DIR\bin\protoc.bat"
+
+          # Créer un wrapper .bat minimal
+          @"
+          @echo off
+          "$protocExe" %*
+          "@ | Out-File -FilePath $batFile -Encoding ascii
+
+          Write-Host "✅ Created $batFile -> $protocExe"
+          Get-Content $batFile
+
+          # Aussi créer bin/protoc.exe comme simple copie pour les cas où
+          # le build script cherche exactement ce nom dans le même dossier
+          $binDir = "$env:GROK_DIR\bin"
+          Copy-Item $protocExe "$binDir\protoc.exe" -Force
+          Write-Host "✅ Copied protoc.exe to $binDir\protoc.exe"
+
+          # Mettre bin/ en tête du PATH pour que cargo build le trouve en premier
+          "$binDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "✅ $binDir added to PATH"
 
       - name: "🦀 Install Rust toolchain (depuis grok-build/rust-toolchain.toml)"
         shell: pwsh
         run: |
           Set-Location $env:GROK_DIR
-          # rustup lit automatiquement rust-toolchain.toml dans le CWD
-          rustup show
+          rustup show    # installe la toolchain épinglée dans rust-toolchain.toml
           rustup target add x86_64-pc-windows-msvc
-          Write-Host "=== Rust ===" ; rustc --version ; cargo --version
+          rustc --version
+          cargo --version
 
       - name: "💾 Cache Cargo registry & build artifacts"
         uses: actions/cache@v4
@@ -95,35 +171,50 @@ jobs:
           restore-keys: |
             windows-amd64-cargo-
 
-      - name: "🔍 Verify full environment"
+      - name: "🔧 Install DotSlash (pour autres outils hermétiques bin/*)"
+        uses: facebook/install-dotslash@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "🔍 Verify full environment before build"
         shell: pwsh
         run: |
           Write-Host "=== rustc ===" ; rustc --version
           Write-Host "=== cargo ===" ; cargo --version
           Write-Host "=== dotslash ===" ; dotslash --version
-          Write-Host "=== protoc ===" ; protoc --version
+          Write-Host "=== protoc (PATH) ===" ; protoc --version
           Write-Host "=== PROTOC env ===" ; Write-Host $env:PROTOC
-          Write-Host "=== Cargo.toml present ===" ; Test-Path "$env:GROK_DIR\Cargo.toml"
+          Write-Host "=== bin/ contents ==="
+          Get-ChildItem "$env:GROK_DIR\bin"
+          Write-Host "=== PATH (first 5 entries) ==="
+          $env:PATH -split ';' | Select-Object -First 5
 
-      # PROTOC est dans l'env GitHub → le build script le trouvera directement
+      # ── BUILD ──────────────────────────────────────────────────────────────
+      # PROTOC est dans GITHUB_ENV (écrit au step "Patch") → visible par cargo
+      # bin/protoc.bat + bin/protoc.exe sont dans bin/ en tête de PATH
+      # → find_protoc.rs trouvera protoc sans paniquer
       - name: "🏗️ cargo build --release (xai-grok-pager-bin)"
         shell: pwsh
         working-directory: ${{ env.GROK_DIR }}
         run: |
+          # Redéfinir PROTOC dans le scope PowerShell courant
+          # (GITHUB_ENV est lu au début du step, pas besoin de le relire)
+          Write-Host "PROTOC = $env:PROTOC"
+          Write-Host "protoc version: $(protoc --version)"
+
           cargo build `
             -p xai-grok-pager-bin `
             --release `
             --target x86_64-pc-windows-msvc
         env:
-          # PROTOC est déjà dans GITHUB_ENV, on le redéclare explicitement
-          # pour être certain que le build script Rust le voit
+          # Déclaration explicite : PROTOC doit être visible par le build script Rust
+          # ${{ env.PROTOC }} lit depuis GITHUB_ENV (écrit au step Patch)
           PROTOC: ${{ env.PROTOC }}
 
       - name: "✅ Verify produced binary"
         shell: pwsh
         run: |
           $releaseDir = "$env:GROK_DIR\target\x86_64-pc-windows-msvc\release"
-          # Le binaire s'appelle xai-grok-pager (sans -bin) selon le README
           $candidates = @(
             "$releaseDir\xai-grok-pager.exe",
             "$releaseDir\xai-grok-pager-bin.exe",
@@ -138,7 +229,7 @@ jobs:
             }
           }
           if (-not $found) {
-            Write-Host "⚠️ Binaires attendus non trouvés, listing du dossier release:"
+            Write-Host "⚠️ Listing all .exe in $releaseDir :"
             Get-ChildItem $releaseDir -Filter "*.exe" -ErrorAction SilentlyContinue |
               Where-Object { $_.Name -notmatch "build-script" } |
               ForEach-Object { Write-Host "  Found: $($_.FullName)" }
@@ -183,9 +274,7 @@ jobs:
             . grok-build \
             || true
 
-          # Garantir un SARIF JSON valide
           if ! python3 -c "import json; json.load(open('semgrep.sarif'))" 2>/dev/null; then
-            echo "⚠️ SARIF invalide → fallback"
             printf '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep","rules":[]}},"results":[]}]}' \
               > semgrep.sarif
           fi
@@ -233,7 +322,6 @@ jobs:
             echo "=== Scanning $f ==="
             guarddog pypi verify "$f" --output-format json \
               > "guarddog-pypi-$(basename "$f" .txt).json" 2>&1 || true
-            cat "guarddog-pypi-$(basename "$f" .txt).json"
           done
           [ "$FOUND" = true ] || echo "ℹ️ Aucun requirements.txt – scan PyPI ignoré"
 
@@ -246,7 +334,6 @@ jobs:
             echo "=== Scanning $f ==="
             guarddog npm verify "$f" --output-format json \
               > "guarddog-npm-$(echo "$f" | tr '/' '-').json" 2>&1 || true
-            cat "guarddog-npm-$(echo "$f" | tr '/' '-').json"
           done
           [ "$FOUND" = true ] || echo "ℹ️ Aucun package.json – scan npm ignoré"
 
@@ -390,8 +477,7 @@ jobs:
           retention-days: 7
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 7 : BEARER
-  # FIX SARIF : patcher runs[].results null → [] avec Python avant upload
+  # JOB 7 : BEARER – CLI directe + sanitize SARIF
   # ───────────────────────────────────────────────────────────────────────────
   bearer:
     name: "🛡️ Bearer – SAST & Secrets"
@@ -416,8 +502,6 @@ jobs:
             | sh -s -- -b /usr/local/bin
           bearer version
 
-      # --scanner secrets fonctionne sur tout langage (agnostique)
-      # || true : ne jamais bloquer même si Bearer trouve des issues
       - name: "🛡️ Run Bearer scan"
         run: |
           bearer scan . grok-build \
@@ -428,71 +512,49 @@ jobs:
             --quiet \
             || true
 
-      # FIX SARIF : patch complet en Python
-      # Problème : Bearer génère parfois "results": null au lieu de "results": []
-      # GitHub SARIF validator rejette null → on normalise TOUS les champs critiques
       - name: "🔧 Sanitize Bearer SARIF (null → [])"
         run: |
           python3 << 'PYEOF'
           import json, os, sys
 
-          SARIF_SKELETON = {
+          SKELETON = {
             "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
             "version": "2.1.0",
             "runs": [{
               "tool": {"driver": {"name": "Bearer", "version": "2.x", "rules": []}},
-              "results": []
+              "results": [],
+              "artifacts": []
             }]
           }
 
-          raw_path = "bearer-raw.sarif"
-          out_path = "bearer.sarif"
+          raw = "bearer-raw.sarif"
+          out = "bearer.sarif"
 
-          # Cas 1 : fichier absent
-          if not os.path.exists(raw_path):
-            print("⚠️  bearer-raw.sarif absent → écriture du squelette vide")
-            with open(out_path, "w") as f:
-              json.dump(SARIF_SKELETON, f, indent=2)
+          if not os.path.exists(raw):
+            print("⚠️ bearer-raw.sarif absent → squelette vide")
+            json.dump(SKELETON, open(out, "w"), indent=2)
             sys.exit(0)
 
-          # Cas 2 : fichier présent, tenter de parser
           try:
-            with open(raw_path) as f:
-              data = json.load(f)
+            data = json.load(open(raw))
           except json.JSONDecodeError as e:
-            print(f"⚠️  JSON invalide ({e}) → écriture du squelette vide")
-            with open(out_path, "w") as f:
-              json.dump(SARIF_SKELETON, f, indent=2)
+            print(f"⚠️ JSON invalide: {e} → squelette vide")
+            json.dump(SKELETON, open(out, "w"), indent=2)
             sys.exit(0)
 
-          # Cas 3 : JSON valide — patch de chaque run
-          patched = 0
           for run in data.get("runs", []):
-            # results null ou absent → []
-            if not isinstance(run.get("results"), list):
-              run["results"] = []
-              patched += 1
-            # artifacts null ou absent → []
-            if not isinstance(run.get("artifacts"), list):
-              run["artifacts"] = []
-            # tool.driver.rules null → []
-            driver = run.get("tool", {}).get("driver", {})
-            if not isinstance(driver.get("rules"), list):
-              driver["rules"] = []
+            if not isinstance(run.get("results"),   list): run["results"]   = []
+            if not isinstance(run.get("artifacts"), list): run["artifacts"] = []
+            drv = run.get("tool", {}).get("driver", {})
+            if not isinstance(drv.get("rules"), list):     drv["rules"]     = []
 
-          print(f"✅ SARIF patché : {patched} run(s) corrigés, "
-                f"{len(data.get('runs', []))} run(s) total")
+          json.dump(data, open(out, "w"), indent=2)
 
-          with open(out_path, "w") as f:
-            json.dump(data, f, indent=2)
-
-          # Vérification finale
-          with open(out_path) as f:
-            check = json.load(f)
+          # Validation finale
+          check = json.load(open(out))
           for i, r in enumerate(check.get("runs", [])):
-            assert isinstance(r["results"], list), \
-              f"run[{i}].results toujours pas une liste!"
-          print(f"✅ Validation finale OK — bearer.sarif prêt pour upload")
+            assert isinstance(r["results"], list), f"run[{i}].results n'est pas une liste!"
+          print(f"✅ bearer.sarif valide — {len(check['runs'])} run(s), prêt pour upload")
           PYEOF
 
       - name: "📤 Upload Bearer SARIF to GitHub Security"
@@ -544,7 +606,7 @@ jobs:
           | 🔑 Gitleaks           | ${{ needs.gitleaks.result }} |
           | 🛡️ Bearer              | ${{ needs.bearer.result }} |
 
-          > 🔍 Résultats dans **Security > Code scanning** (SARIF uploadés).
+          > 🔍 Résultats dans **Security > Code scanning**.
           > 📦 Binaire Windows dans les **Artifacts** de ce run.
           > ℹ️ CodeQL ignoré si aucun langage supporté détecté (repo Rust pur).
           EOF
