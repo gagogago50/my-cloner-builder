@@ -21,14 +21,25 @@ env:
   RUST_BACKTRACE: "1"
   GROK_DIR: "grok-build"
   PROTOC_VERSION: "29.3"
+  # Cross-compilation target : Windows AMD64 via MinGW (depuis Linux)
+  CARGO_TARGET: "x86_64-pc-windows-gnu"
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 1 : BUILD WINDOWS AMD64
+  # JOB 1 : BUILD WINDOWS AMD64 — CROSS-COMPILATION DEPUIS LINUX
+  #
+  # POURQUOI ubuntu-latest et non windows-latest ?
+  #   Le build script xai-proto-build appelle :
+  #     protoc --descriptor_set_out=/dev/stdout ...
+  #   /dev/stdout est un pseudo-fichier Unix UNIQUEMENT.
+  #   Sur Windows : "No such file or directory" → panic → exit 101.
+  #   C'est une limite du code source (non patchable sans fork).
+  #   Solution : build scripts tournent sur Linux (/dev/stdout ✅)
+  #              binaire produit cible Windows AMD64 (.exe ✅)
   # ─────────────────────────────────────────────────────────────────────────────
   build-windows-amd64:
-    name: "🏗️ Build – Windows AMD64 (Rust)"
-    runs-on: windows-latest
+    name: "🏗️ Build – Windows AMD64 (cross depuis Linux)"
+    runs-on: ubuntu-latest    # ← Linux : /dev/stdout existe, build scripts OK
 
     steps:
       - name: "📥 Checkout current repo"
@@ -37,79 +48,60 @@ jobs:
           fetch-depth: 1
 
       - name: "📥 Clone xai-org/grok-build"
-        shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/xai-org/grok-build.git $env:GROK_DIR
-          Write-Host "=== Cloned files ==="
-          Get-ChildItem $env:GROK_DIR | Select-Object -ExpandProperty Name
+          git clone --depth 1 https://github.com/xai-org/grok-build.git $GROK_DIR
+          echo "=== Cloned files ==="
+          ls -la $GROK_DIR
 
-      # ── INSTALL PROTOC NATIF WINDOWS ──────────────────────────────────────
-      - name: "⚙️ Install protoc ${{ env.PROTOC_VERSION }} (Windows native)"
+      # ── OUTILS CROSS-COMPILATION ──────────────────────────────────────────
+      # mingw-w64 : toolchain GCC pour produire des .exe Windows depuis Linux
+      # gcc-mingw-w64-x86-64 : compilateur C cross (requis par certaines crates)
+      # binutils-mingw-w64-x86-64 : linker + outils binaires Windows
+      - name: "🔧 Install MinGW-w64 cross-compilation toolchain"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 \
+            binutils-mingw-w64-x86-64 \
+            mingw-w64-x86-64-dev
+          echo "=== MinGW versions ==="
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-ld --version | head -1
+
+      # ── PROTOC (version cohérente avec grok-build : 29.3) ─────────────────
+      # arduino/setup-protoc fonctionne sur Linux aussi
+      # protoc tourne sur Linux → /dev/stdout disponible ✅
+      - name: "⚙️ Install protoc ${{ env.PROTOC_VERSION }}"
         uses: arduino/setup-protoc@v3
         with:
           version: "${{ env.PROTOC_VERSION }}"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── FIX PROTOC : écrire PROTOC dans GITHUB_ENV ───────────────────────
-      - name: "🔍 Capture protoc path → GITHUB_ENV"
-        shell: pwsh
+      - name: "🔍 Capture protoc path"
         run: |
-          $protocExe = (Get-Command protoc -ErrorAction Stop).Source
-          Write-Host "✅ protoc at: $protocExe"
+          PROTOC_PATH=$(which protoc)
+          echo "✅ protoc at: $PROTOC_PATH"
           protoc --version
-          # Écrire dans GITHUB_ENV pour tous les steps suivants
-          "PROTOC=$protocExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "PROTOC=$PROTOC_PATH" >> "$GITHUB_ENV"
 
-      # ── FIX CRITIQUE : supprimer bin/protoc (DotSlash launcher) ──────────
-      #
-      # POURQUOI :
-      #   bin/protoc est un manifeste DotSlash qui ne contient QUE :
-      #     macos-aarch64, linux-x86_64, linux-aarch64
-      #   → aucune entrée "windows-x86_64"
-      #   → DotSlash panic → unwrap_failed AVANT d'atteindre le fallback $PROTOC
-      #
-      # find_protoc.rs suit cette priorité :
-      #   1. bin/protoc via DotSlash   ← PANIC si pas d'entrée Windows
-      #   2. $PROTOC env var           ← notre protoc.exe installé
-      #   3. protoc dans PATH
-      #
-      # En supprimant bin/protoc, find_protoc.rs passe directement à $PROTOC
-      # qui pointe vers le protoc.exe installé par arduino/setup-protoc
-      # ─────────────────────────────────────────────────────────────────────
-      - name: "🔧 Remove bin/protoc DotSlash launcher (bypass Windows panic)"
-        shell: pwsh
+      # ── RUST + TARGET WINDOWS GNU ─────────────────────────────────────────
+      # dtolnay/rust-toolchain lit rust-toolchain.toml automatiquement
+      # On ajoute le target Windows GNU pour la cross-compilation
+      - name: "🦀 Install Rust toolchain + target x86_64-pc-windows-gnu"
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      # Vérifier que la toolchain épinglée dans grok-build est aussi installée
+      - name: "🦀 Install grok-build pinned toolchain"
         run: |
-          $binProtoc = "$env:GROK_DIR\bin\protoc"
-
-          Write-Host "=== bin/ before ==="
-          Get-ChildItem "$env:GROK_DIR\bin"
-
-          if (Test-Path $binProtoc) {
-            Remove-Item $binProtoc -Force
-            Write-Host "✅ Removed $binProtoc"
-            Write-Host "   find_protoc.rs utilisera maintenant PROTOC=$env:PROTOC"
-          } else {
-            Write-Host "ℹ️ bin/protoc déjà absent"
-          }
-
-          Write-Host "=== bin/ after ==="
-          Get-ChildItem "$env:GROK_DIR\bin"
-
-          # Vérification : PROTOC doit pointer vers un exe valide
-          if (-not (Test-Path $env:PROTOC)) {
-            Write-Error "❌ PROTOC=$env:PROTOC introuvable!"
-            exit 1
-          }
-          Write-Host "✅ PROTOC=$env:PROTOC ($(& $env:PROTOC --version))"
-
-      # ── RUST ──────────────────────────────────────────────────────────────
-      - name: "🦀 Install Rust toolchain (depuis grok-build/rust-toolchain.toml)"
-        shell: pwsh
-        run: |
-          Set-Location $env:GROK_DIR
-          rustup show    # installe la toolchain épinglée dans rust-toolchain.toml
-          rustup target add x86_64-pc-windows-msvc
+          cd $GROK_DIR
+          rustup show       # installe la toolchain depuis rust-toolchain.toml
+          rustup target add x86_64-pc-windows-gnu
+          echo "=== Rust ==="
           rustc --version ; cargo --version
+          echo "=== Installed targets ==="
+          rustup target list --installed
 
       - name: "💾 Cache Cargo registry & build artifacts"
         uses: actions/cache@v4
@@ -119,71 +111,85 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             ${{ env.GROK_DIR }}/target/
-          key: windows-amd64-cargo-${{ hashFiles(format('{0}/Cargo.lock', env.GROK_DIR)) }}
+          key: linux-cross-windows-gnu-${{ hashFiles(format('{0}/Cargo.lock', env.GROK_DIR)) }}
           restore-keys: |
-            windows-amd64-cargo-
+            linux-cross-windows-gnu-
 
-      - name: "🔧 Install DotSlash (pour autres outils hermétiques bin/*)"
-        uses: facebook/install-dotslash@latest
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # DotSlash pour les autres outils hermétiques sous bin/ (pas protoc)
+      # Sur Linux, bin/protoc DotSlash fonctionnerait mais on préfère protoc système
+      # pour la cohérence des versions et la rapidité
+      - name: "🔧 Install DotSlash"
+        run: |
+          curl -sL https://github.com/facebook/dotslash/releases/latest/download/dotslash-ubuntu-22.04.tar.gz \
+            | tar -xz -C /usr/local/bin
+          dotslash --version
 
       - name: "🔍 Verify full environment before build"
-        shell: pwsh
         run: |
-          Write-Host "=== rustc ===" ; rustc --version
-          Write-Host "=== cargo ===" ; cargo --version
-          Write-Host "=== dotslash ===" ; dotslash --version
-          Write-Host "=== protoc ===" ; protoc --version
-          Write-Host "=== PROTOC env var ===" ; Write-Host "PROTOC=$env:PROTOC"
-          Write-Host "=== bin/ contents ==="
-          Get-ChildItem "$env:GROK_DIR\bin" | Select-Object Name, Length
+          echo "=== rustc ==="    ; rustc --version
+          echo "=== cargo ==="    ; cargo --version
+          echo "=== dotslash ===" ; dotslash --version
+          echo "=== protoc ==="   ; protoc --version
+          echo "=== PROTOC ==="   ; echo "PROTOC=$PROTOC"
+          echo "=== MinGW GCC ===" ; x86_64-w64-mingw32-gcc --version | head -1
+          echo "=== bin/ contents ==="
+          ls -la $GROK_DIR/bin/
 
-      # ── BUILD ──────────────────────────────────────────────────────────────
-      - name: "🏗️ cargo build --release (xai-grok-pager-bin)"
-        shell: pwsh
+      # ── BUILD CROSS ────────────────────────────────────────────────────────
+      # - Build scripts tournent sur Linux → /dev/stdout ✅
+      # - Output : binaire .exe ciblant Windows AMD64
+      # - CC et LINKER pointent vers MinGW pour la cross-compilation
+      # - PROTOC : protoc Linux (exécuté pendant le build, pas dans le .exe)
+      - name: "🏗️ cargo build --release (cross Linux → Windows AMD64)"
         working-directory: ${{ env.GROK_DIR }}
         run: |
-          Write-Host "PROTOC=$env:PROTOC"
-          cargo build `
-            -p xai-grok-pager-bin `
-            --release `
-            --target x86_64-pc-windows-msvc
-        env:
-          # Déclaration explicite pour que le build script Rust le voit
-          PROTOC: ${{ env.PROTOC }}
+          echo "Building for target: $CARGO_TARGET"
+          echo "PROTOC=$PROTOC"
 
-      - name: "✅ Verify produced binary"
-        shell: pwsh
+          cargo build \
+            -p xai-grok-pager-bin \
+            --release \
+            --target "$CARGO_TARGET"
+        env:
+          PROTOC: ${{ env.PROTOC }}
+          # Linker MinGW pour le target Windows GNU
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          # Compilateur C cross pour les crates avec du code C (prost, etc.)
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+          # AR cross
+          AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+
+      - name: "✅ Verify produced Windows binary"
         run: |
-          $releaseDir = "$env:GROK_DIR\target\x86_64-pc-windows-msvc\release"
-          # Le README dit que le binaire s'appelle "xai-grok-pager" (sans -bin)
-          $candidates = @(
-            "$releaseDir\xai-grok-pager.exe",
-            "$releaseDir\xai-grok-pager-bin.exe",
-            "$releaseDir\grok.exe"
-          )
-          $found = $false
-          foreach ($bin in $candidates) {
-            if (Test-Path $bin) {
-              $size = [math]::Round((Get-Item $bin).Length / 1MB, 2)
-              Write-Host "✅ Binary: $bin ($size MB)"
-              $found = $true
-            }
-          }
-          if (-not $found) {
-            Write-Host "⚠️ Listing all .exe in release dir:"
-            Get-ChildItem $releaseDir -Filter "*.exe" -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -notmatch "build-script" } |
-              ForEach-Object { Write-Host "  Found: $($_.FullName)" }
-          }
+          RELEASE_DIR="$GROK_DIR/target/$CARGO_TARGET/release"
+          echo "=== Contents of $RELEASE_DIR ==="
+          ls -lh "$RELEASE_DIR"/*.exe 2>/dev/null || echo "No .exe found at top level"
+
+          # Chercher le binaire principal (nommé xai-grok-pager selon le README)
+          for name in xai-grok-pager xai-grok-pager-bin grok; do
+            BIN="$RELEASE_DIR/${name}.exe"
+            if [ -f "$BIN" ]; then
+              SIZE=$(du -sh "$BIN" | cut -f1)
+              echo "✅ Binary found: $BIN ($SIZE)"
+              # Vérifier que c'est bien un PE (Windows executable)
+              file "$BIN"
+            fi
+          done
+
+          # Lister tous les .exe produits (hors build-scripts)
+          echo "=== All produced .exe ==="
+          find "$RELEASE_DIR" -maxdepth 1 -name "*.exe" \
+            ! -name "build-script*" \
+            -exec ls -lh {} \;
 
       - name: "📦 Upload Windows binary artifact"
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: grok-build-windows-amd64
-          path: ${{ env.GROK_DIR }}/target/x86_64-pc-windows-msvc/release/*.exe
+          # Les .exe sont dans target/x86_64-pc-windows-gnu/release/
+          path: |
+            ${{ env.GROK_DIR }}/target/${{ env.CARGO_TARGET }}/release/*.exe
           retention-days: 14
           if-no-files-found: warn
 
@@ -421,7 +427,6 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 7 : BEARER
-  # FIX : écrire le script Python dans un .py via Set-Content, pas de heredoc
   # ───────────────────────────────────────────────────────────────────────────
   bearer:
     name: "🛡️ Bearer – SAST & Secrets"
@@ -456,11 +461,8 @@ jobs:
             --quiet \
             || true
 
-      # FIX : écrire dans un fichier .py d'abord, puis l'exécuter
-      # (évite le bug "heredoc passé comme nom de fichier")
       - name: "🔧 Sanitize Bearer SARIF (null → [])"
         run: |
-          # Écrire le script dans un fichier temporaire
           cat > /tmp/fix_sarif.py << 'PYEOF'
           import json, os, sys
 
@@ -493,17 +495,15 @@ jobs:
             if not isinstance(run.get("results"),   list): run["results"]   = []
             if not isinstance(run.get("artifacts"), list): run["artifacts"] = []
             drv = run.get("tool", {}).get("driver", {})
-            if not isinstance(drv.get("rules"),     list): drv["rules"]     = []
+            if not isinstance(drv.get("rules"), list):     drv["rules"]     = []
 
           json.dump(data, open(out, "w"), indent=2)
 
           check = json.load(open(out))
           for i, r in enumerate(check.get("runs", [])):
-            assert isinstance(r["results"], list), \
-              f"run[{i}].results n'est pas une liste!"
+            assert isinstance(r["results"], list), f"run[{i}].results pas une liste!"
           print(f"OK: bearer.sarif valide — {len(check['runs'])} run(s)")
           PYEOF
-
           python3 /tmp/fix_sarif.py
 
       - name: "📤 Upload Bearer SARIF to GitHub Security"
@@ -556,6 +556,7 @@ jobs:
           | 🛡️ Bearer              | ${{ needs.bearer.result }} |
 
           > 🔍 Résultats dans **Security > Code scanning**.
-          > 📦 Binaire Windows dans les **Artifacts** de ce run.
+          > 📦 Binaire Windows (.exe) dans les **Artifacts** de ce run.
+          > 🐧 Build cross-compilé depuis Linux → target Windows AMD64 GNU.
           > ℹ️ CodeQL ignoré si aucun langage supporté détecté (repo Rust pur).
           EOF
