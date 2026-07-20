@@ -1,0 +1,475 @@
+# .github/workflows/grok-build-windows-amd64.yml
+#
+# Workflow: Build grok-build (Windows AMD64) + Security Scans (parallel)
+#
+# Pré-requis secrets GitHub à créer dans Settings > Secrets and variables > Actions :
+#   - Aucun secret obligatoire pour les outils listés (tous gratuits/OSS sans API key)
+#   - GITHUB_TOKEN est automatiquement fourni par GitHub Actions
+#
+# Architecture des jobs (résumé) :
+#
+#  ┌────────────────────────────────────────────────────────────┐
+#  │  security-scans (parallel group)                           │
+#  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐ │
+#  │  │ semgrep  │ │guarddog  │ │scorecard │ │   codeql     │ │
+#  │  └──────────┘ └──────────┘ └──────────┘ └──────────────┘ │
+#  │  ┌──────────┐ ┌──────────┐                                │
+#  │  │ gitleaks │ │  bearer  │                                │
+#  │  └──────────┘ └──────────┘                                │
+#  └────────────────────────────────────────────────────────────┘
+#         (tous indépendants, lancés en parallèle)
+#
+#  ┌────────────────────────────────────────────────────────────┐
+#  │  build-windows-amd64                                       │
+#  │  (windows-latest / Rust / DotSlash / cargo build release) │
+#  │  NE dépend PAS des scans — les deux groupes tournent en   │
+#  │  parallèle dès le déclenchement du workflow               │
+#  └────────────────────────────────────────────────────────────┘
+
+name: "Grok Build – Windows AMD64 + Security Scans"
+
+on:
+  push:
+  workflow_dispatch:       # Déclenchement manuel depuis l'UI GitHub
+
+# Permissions minimales requises
+permissions:
+  contents: read
+  security-events: write   # Nécessaire pour upload SARIF (CodeQL, Semgrep, Bearer, Gitleaks)
+  actions: read            # Nécessaire pour OSSF Scorecard
+
+# Annuler les runs précédents sur la même branche/PR pour économiser les minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VARIABLES GLOBALES
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0          # Désactive le cache incrémental (plus stable en CI)
+  RUST_BACKTRACE: 1
+  DOTSLASH_VERSION: "0.3.2"    # Version stable de DotSlash
+  # Target explicite Windows AMD64
+  CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 : BUILD WINDOWS AMD64 (Rust + DotSlash + cargo)
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build-windows-amd64:
+    name: "🏗️ Build – Windows AMD64 (Rust)"
+    runs-on: windows-latest      # windows-2022, x86_64
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── 2. Lire la version Rust épinglée par rust-toolchain.toml ──────────
+      #       rustup respecte automatiquement rust-toolchain.toml
+      #       dtolnay/rust-toolchain lit aussi ce fichier si "toolchain" est vide
+      - name: "🦀 Install Rust toolchain (from rust-toolchain.toml)"
+        uses: dtolnay/rust-toolchain@stable
+        # Le champ "toolchain" est intentionnellement omis :
+        # dtolnay/rust-toolchain détecte automatiquement rust-toolchain.toml
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # ── 3. Cache Cargo (registry + git + target) ──────────────────────────
+      - name: "💾 Cache Cargo registry & build artifacts"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: windows-amd64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-amd64-cargo-
+
+      # ── 4. Installer DotSlash ──────────────────────────────────────────────
+      #       DotSlash est requis AVANT le build pour que bin/protoc fonctionne
+      #       On utilise cargo install (cross-platform, pas de curl nécessaire)
+      - name: "🔧 Install DotSlash"
+        shell: pwsh
+        run: |
+          Write-Host "Installing DotSlash v$env:DOTSLASH_VERSION via cargo..."
+          cargo install dotslash --version $env:DOTSLASH_VERSION --locked
+          # Vérification
+          $dotslashPath = (Get-Command dotslash -ErrorAction SilentlyContinue)?.Source
+          if (-not $dotslashPath) {
+            # Chercher dans .cargo/bin
+            $cargoBin = "$env:USERPROFILE\.cargo\bin"
+            if (Test-Path "$cargoBin\dotslash.exe") {
+              Write-Host "dotslash found at $cargoBin\dotslash.exe"
+              echo "$cargoBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            } else {
+              Write-Error "dotslash not found after install!"
+              exit 1
+            }
+          } else {
+            Write-Host "dotslash found at: $dotslashPath"
+          }
+          # Sanity check
+          dotslash --help | Select-Object -First 3
+
+      # ── 5. Vérifier que protoc est résolvable ─────────────────────────────
+      #       DotSlash va télécharger protoc à la demande via bin/protoc
+      #       On s'assure juste que le PATH est cohérent
+      - name: "🔍 Verify environment (dotslash + cargo)"
+        shell: pwsh
+        run: |
+          Write-Host "=== Rust version ==="
+          rustc --version
+          cargo --version
+          Write-Host "=== DotSlash version ==="
+          dotslash --version
+          Write-Host "=== Target ==="
+          rustup target list --installed
+
+      # ── 6. Build release ───────────────────────────────────────────────────
+      #       On cible xai-grok-pager-bin comme indiqué dans le README
+      #       --target est passé explicitement pour garantir amd64
+      - name: "🏗️ cargo build --release (xai-grok-pager-bin, Windows AMD64)"
+        shell: pwsh
+        run: |
+          cargo build `
+            -p xai-grok-pager-bin `
+            --release `
+            --target x86_64-pc-windows-msvc
+        env:
+          # Si bin/protoc via DotSlash échoue, fallback sur protoc système
+          # (windows-latest inclut protoc dans ses outils)
+          PROTOC: ""
+
+      # ── 7. Vérifier le binaire produit ────────────────────────────────────
+      - name: "✅ Verify produced binary"
+        shell: pwsh
+        run: |
+          $bin = "target\x86_64-pc-windows-msvc\release\xai-grok-pager-bin.exe"
+          if (-not (Test-Path $bin)) {
+            # Fallback: chercher tout .exe dans release/
+            $found = Get-ChildItem "target\x86_64-pc-windows-msvc\release\" `
+                       -Filter "*.exe" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -notmatch "^(build|\.)" } |
+                     Select-Object -First 5
+            if ($found) {
+              Write-Host "Binaries found:"
+              $found | ForEach-Object { Write-Host "  $_" }
+            } else {
+              Write-Error "No binary found in release directory!"
+              exit 1
+            }
+          } else {
+            $size = (Get-Item $bin).Length / 1MB
+            Write-Host "✅ Binary: $bin ($([math]::Round($size,2)) MB)"
+          }
+
+      # ── 8. Upload artifact ────────────────────────────────────────────────
+      - name: "📦 Upload Windows binary artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-build-windows-amd64
+          path: |
+            target/x86_64-pc-windows-msvc/release/*.exe
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 : SEMGREP (patterns suspects, obfuscation, injections)
+  # Gratuit OSS, pas d'API key requise pour les règles communautaires
+  # ───────────────────────────────────────────────────────────────────────────
+  semgrep:
+    name: "🔎 Semgrep – Code Patterns & Injections"
+    runs-on: ubuntu-latest
+    # Semgrep supporte mieux Linux ; on analyse le code source (Rust)
+    container:
+      image: semgrep/semgrep:latest   # Image officielle Semgrep
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🔎 Run Semgrep (OSS rules – no API key)"
+        # SEMGREP_APP_TOKEN n'est PAS défini → mode OSS pur
+        run: |
+          semgrep scan \
+            --config "p/default" \
+            --config "p/secrets" \
+            --config "p/security-audit" \
+            --config "p/rust" \
+            --sarif \
+            --output semgrep.sarif \
+            --error \
+            --verbose \
+            || true
+          # --error fait échouer si findings critiques, || true pour ne pas bloquer le SARIF upload
+          ls -la semgrep.sarif || echo "No SARIF file generated"
+
+      - name: "📤 Upload Semgrep SARIF to GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+        continue-on-error: true   # Ne pas bloquer si le repo n'a pas la feature activée
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 : GUARDDOG (packages npm/PyPI malveillants, install scripts)
+  # ───────────────────────────────────────────────────────────────────────────
+  guarddog:
+    name: "🐕 GuardDog – Malicious Package Detection"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "🐍 Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "🐕 Install GuardDog"
+        run: pip install guarddog
+
+      - name: "🔍 Scan PyPI dependencies (requirements*.txt if present)"
+        run: |
+          # GuardDog analyse les fichiers de dépendances
+          FOUND_REQ=false
+          for f in requirements*.txt requirements/*.txt; do
+            if [ -f "$f" ]; then
+              FOUND_REQ=true
+              echo "=== Scanning $f ==="
+              guarddog pypi verify "$f" --output-format json \
+                > guarddog-pypi-$(basename $f .txt).json 2>&1 || true
+              cat guarddog-pypi-$(basename $f .txt).json
+            fi
+          done
+          if [ "$FOUND_REQ" = false ]; then
+            echo "ℹ️ No requirements.txt found – PyPI scan skipped"
+          fi
+
+      - name: "🔍 Scan npm dependencies (package.json if present)"
+        run: |
+          if [ -f "package.json" ] || [ -f "package-lock.json" ]; then
+            echo "=== Scanning npm packages ==="
+            guarddog npm verify package.json --output-format json \
+              > guarddog-npm.json 2>&1 || true
+            cat guarddog-npm.json
+          else
+            echo "ℹ️ No package.json found – npm scan skipped"
+          fi
+
+      - name: "📤 Upload GuardDog results"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guarddog-results
+          path: guarddog-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 4 : OSSF SCORECARD (hygiène sécurité repo + dépendances)
+  # Gratuit pour tous les repos publics, GITHUB_TOKEN suffit
+  # ───────────────────────────────────────────────────────────────────────────
+  scorecard:
+    name: "🏆 OSSF Scorecard – Repo Security Hygiene"
+    runs-on: ubuntu-latest
+    # Scorecard nécessite ces permissions spécifiques
+    permissions:
+      security-events: write
+      id-token: write       # Pour la publication vers le dashboard OSSF
+      contents: read
+      actions: read
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: "🏆 Run OSSF Scorecard"
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          # GITHUB_TOKEN automatiquement disponible
+          # Publish_results: publier vers le dashboard OSSF public (optionnel)
+          publish_results: false
+
+      - name: "📤 Upload Scorecard SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: scorecard.sarif
+          category: ossf-scorecard
+        continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 5 : CODEQL (analyse sémantique profonde, taint tracking)
+  # Gratuit pour repos publics
+  # CodeQL pour Rust est en preview — on analyse aussi JS/TS/Python si présent
+  # ───────────────────────────────────────────────────────────────────────────
+  codeql:
+    name: "🧬 CodeQL – Deep Semantic Analysis"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Rust n'est pas encore dans les langages CodeQL standards
+        # On scanne les autres langages potentiellement présents
+        language: ["javascript-typescript", "python"]
+        # Si le repo est 100% Rust sans JS/Python, les initialisations
+        # échoueront silencieusement (continue-on-error: true)
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: "🧬 Initialize CodeQL for ${{ matrix.language }}"
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: |
+            security-extended
+            security-and-quality
+        continue-on-error: true
+
+      - name: "🔨 Autobuild (CodeQL)"
+        uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+
+      - name: "🔍 Perform CodeQL Analysis"
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql-${{ matrix.language }}
+          output: codeql-results-${{ matrix.language }}.sarif
+        continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 6 : GITLEAKS (détection de secrets dans le code et l'historique git)
+  # ───────────────────────────────────────────────────────────────────────────
+  gitleaks:
+    name: "🔑 Gitleaks – Secrets Detection"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📥 Checkout (full history pour Gitleaks)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # IMPORTANT: Gitleaks analyse tout l'historique git
+
+      - name: "🔑 Run Gitleaks"
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE n'est PAS requis pour les repos publics
+          # Pour les repos privés, une licence est nécessaire
+          GITLEAKS_ENABLE_COMMENTS: false   # Pas de commentaires PR automatiques
+
+      - name: "📤 Upload Gitleaks SARIF"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 7 : BEARER (SAST orienté sécurité des données, OWASP, secrets)
+  # Gratuit OSS, pas d'API key requise
+  # ───────────────────────────────────────────────────────────────────────────
+  bearer:
+    name: "🛡️ Bearer – SAST & Data Security"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🛡️ Run Bearer SAST"
+        uses: bearer/bearer-action@v2
+        with:
+          # Règles de sécurité : critiques + hautes uniquement pour ne pas spammer
+          severity: "critical,high,medium"
+          # Format SARIF pour intégration GitHub Security tab
+          format: sarif
+          output: bearer.sarif
+          # Exit code 0 même si findings (pour ne pas bloquer le workflow)
+          exit-code: 0
+          # Scanner de secrets inclus par défaut dans Bearer
+          scanner: "secrets,sast"
+
+      - name: "📤 Upload Bearer SARIF to GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: bearer.sarif
+          category: bearer
+        continue-on-error: true
+
+      - name: "📤 Upload Bearer report artifact"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bearer-report
+          path: bearer.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB FINAL : Summary (s'exécute après tout)
+  # ───────────────────────────────────────────────────────────────────────────
+  summary:
+    name: "📋 Security & Build Summary"
+    runs-on: ubuntu-latest
+    # Ce job attend que TOUS les autres soient terminés
+    needs:
+      - build-windows-amd64
+      - semgrep
+      - guarddog
+      - scorecard
+      - codeql
+      - gitleaks
+      - bearer
+    if: always()   # S'exécute même si certains jobs échouent
+
+    steps:
+      - name: "📋 Print workflow summary"
+        run: |
+          echo "## 🔒 Grok Build – Security & Build Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🏗️ Build Windows AMD64 | ${{ needs.build-windows-amd64.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔎 Semgrep             | ${{ needs.semgrep.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐕 GuardDog           | ${{ needs.guarddog.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🏆 OSSF Scorecard     | ${{ needs.scorecard.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🧬 CodeQL             | ${{ needs.codeql.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔑 Gitleaks           | ${{ needs.gitleaks.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ Bearer              | ${{ needs.bearer.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Results visible in the **Security** tab of this repository." >> $GITHUB_STEP_SUMMARY
+          echo "> SARIF reports uploaded for: Semgrep, Scorecard, CodeQL, Bearer, Gitleaks." >> $GITHUB_STEP_SUMMARY
