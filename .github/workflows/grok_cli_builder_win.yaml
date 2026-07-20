@@ -19,55 +19,71 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
-  # Répertoire où grok-build sera cloné dans le job build
   GROK_DIR: "grok-build"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 1 : BUILD WINDOWS AMD64
-# FIX #1 : clone xai-org/grok-build avant de builder
-#           (ce workflow tourne dans my-cloner-builder, pas dans grok-build)
-# ─────────────────────────────────────────────────────────────────────────────
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1 : BUILD WINDOWS AMD64
+  # FIX PROTOC : arduino/setup-protoc installe protoc natif Windows
+  #              + PROTOC env var → bypasse totalement DotSlash pour protoc
+  # ─────────────────────────────────────────────────────────────────────────────
   build-windows-amd64:
     name: "🏗️ Build – Windows AMD64 (Rust)"
     runs-on: windows-latest
 
     steps:
-      # On checkout quand même le repo courant (pour les métadonnées GitHub)
       - name: "📥 Checkout current repo"
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # FIX #1 — Cloner grok-build dans un sous-dossier
       - name: "📥 Clone xai-org/grok-build"
         shell: pwsh
         run: |
           Write-Host "Cloning xai-org/grok-build..."
           git clone --depth 1 https://github.com/xai-org/grok-build.git $env:GROK_DIR
-          Write-Host "Contents of $env:GROK_DIR :"
-          Get-ChildItem $env:GROK_DIR | Select-Object Name
+          Write-Host "=== Contents ==="
+          Get-ChildItem $env:GROK_DIR | Select-Object -ExpandProperty Name
 
-      # dtolnay/rust-toolchain lit rust-toolchain.toml depuis le CWD
-      # On lui indique le chemin explicitement via working-directory n'est pas
-      # un input supporté → on se déplace avec shell avant
-      - name: "🦀 Install Rust toolchain (from grok-build/rust-toolchain.toml)"
+      # ── FIX PROTOC ────────────────────────────────────────────────────────
+      # arduino/setup-protoc installe protoc précompilé pour Windows x64
+      # et l'ajoute au PATH + expose $PROTOC automatiquement
+      # Le build script xai_proto_build lit $PROTOC en priorité absolue
+      # → plus besoin de DotSlash pour protoc
+      - name: "⚙️ Install protoc (bypass DotSlash on Windows)"
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"   # Dernière version stable protobuf
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          # include-pre-releases: false (défaut)
+
+      # Vérifier que protoc est bien dans PATH et accessible
+      - name: "🔍 Verify protoc installation"
         shell: pwsh
         run: |
-          # Lire la toolchain depuis le fichier du projet cloné
-          $toolchainFile = "$env:GROK_DIR\rust-toolchain.toml"
-          if (Test-Path $toolchainFile) {
-            Write-Host "Found rust-toolchain.toml:"
-            Get-Content $toolchainFile
-          }
-          # rustup lira automatiquement rust-toolchain.toml quand on sera dans le dossier
-          Set-Location $env:GROK_DIR
-          rustup show         # Installe la toolchain épinglée automatiquement
-          rustup target add x86_64-pc-windows-msvc
-          rustc --version
-          cargo --version
+          $protocPath = (Get-Command protoc -ErrorAction Stop).Source
+          Write-Host "✅ protoc found at: $protocPath"
+          protoc --version
+          # Exporter PROTOC explicitement pour les steps suivants
+          echo "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: "💾 Cache Cargo registry"
+      # DotSlash reste installé pour les AUTRES outils hermétiques sous bin/
+      # (pas pour bin/protoc qui est bypassé via PROTOC env var)
+      - name: "🔧 Install DotSlash (pour outils hermétiques bin/*)"
+        uses: facebook/install-dotslash@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "🦀 Install Rust toolchain (depuis grok-build/rust-toolchain.toml)"
+        shell: pwsh
+        run: |
+          Set-Location $env:GROK_DIR
+          # rustup lit automatiquement rust-toolchain.toml dans le CWD
+          rustup show
+          rustup target add x86_64-pc-windows-msvc
+          Write-Host "=== Rust ===" ; rustc --version ; cargo --version
+
+      - name: "💾 Cache Cargo registry & build artifacts"
         uses: actions/cache@v4
         with:
           path: |
@@ -79,22 +95,17 @@ jobs:
           restore-keys: |
             windows-amd64-cargo-
 
-      # FIX : action officielle — télécharge le binaire précompilé depuis Releases
-      - name: "🔧 Install DotSlash (official action)"
-        uses: facebook/install-dotslash@latest
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: "🔍 Verify environment"
+      - name: "🔍 Verify full environment"
         shell: pwsh
         run: |
-          Write-Host "=== Rust ===" ; rustc --version ; cargo --version
-          Write-Host "=== DotSlash ===" ; dotslash --version
-          Write-Host "=== Working dir ===" ; Get-Location
-          Write-Host "=== grok-build Cargo.toml present ==="
-          Test-Path "$env:GROK_DIR\Cargo.toml"
+          Write-Host "=== rustc ===" ; rustc --version
+          Write-Host "=== cargo ===" ; cargo --version
+          Write-Host "=== dotslash ===" ; dotslash --version
+          Write-Host "=== protoc ===" ; protoc --version
+          Write-Host "=== PROTOC env ===" ; Write-Host $env:PROTOC
+          Write-Host "=== Cargo.toml present ===" ; Test-Path "$env:GROK_DIR\Cargo.toml"
 
-      # FIX #1 — working-directory pointe vers le clone de grok-build
+      # PROTOC est dans l'env GitHub → le build script le trouvera directement
       - name: "🏗️ cargo build --release (xai-grok-pager-bin)"
         shell: pwsh
         working-directory: ${{ env.GROK_DIR }}
@@ -103,20 +114,34 @@ jobs:
             -p xai-grok-pager-bin `
             --release `
             --target x86_64-pc-windows-msvc
+        env:
+          # PROTOC est déjà dans GITHUB_ENV, on le redéclare explicitement
+          # pour être certain que le build script Rust le voit
+          PROTOC: ${{ env.PROTOC }}
 
       - name: "✅ Verify produced binary"
         shell: pwsh
         run: |
           $releaseDir = "$env:GROK_DIR\target\x86_64-pc-windows-msvc\release"
-          $bin = "$releaseDir\xai-grok-pager-bin.exe"
-          if (Test-Path $bin) {
-            $size = [math]::Round((Get-Item $bin).Length / 1MB, 2)
-            Write-Host "✅ Binary: $bin ($size MB)"
-          } else {
-            Write-Host "⚠️ xai-grok-pager-bin.exe not found – listing $releaseDir"
+          # Le binaire s'appelle xai-grok-pager (sans -bin) selon le README
+          $candidates = @(
+            "$releaseDir\xai-grok-pager.exe",
+            "$releaseDir\xai-grok-pager-bin.exe",
+            "$releaseDir\grok.exe"
+          )
+          $found = $false
+          foreach ($bin in $candidates) {
+            if (Test-Path $bin) {
+              $size = [math]::Round((Get-Item $bin).Length / 1MB, 2)
+              Write-Host "✅ Binary: $bin ($size MB)"
+              $found = $true
+            }
+          }
+          if (-not $found) {
+            Write-Host "⚠️ Binaires attendus non trouvés, listing du dossier release:"
             Get-ChildItem $releaseDir -Filter "*.exe" -ErrorAction SilentlyContinue |
               Where-Object { $_.Name -notmatch "build-script" } |
-              ForEach-Object { Write-Host "  Found: $_" }
+              ForEach-Object { Write-Host "  Found: $($_.FullName)" }
           }
 
       - name: "📦 Upload Windows binary artifact"
@@ -130,7 +155,6 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 2 : SEMGREP
-  # Scanne le repo courant (workflow files, scripts, etc.)
   # ───────────────────────────────────────────────────────────────────────────
   semgrep:
     name: "🔎 Semgrep – Code Patterns & Injections"
@@ -144,9 +168,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: "📥 Clone grok-build for Rust analysis"
-        run: |
-          git clone --depth 1 https://github.com/xai-org/grok-build.git grok-build
+      - name: "📥 Clone grok-build"
+        run: git clone --depth 1 https://github.com/xai-org/grok-build.git grok-build
 
       - name: "🔎 Run Semgrep OSS (no API key)"
         run: |
@@ -160,14 +183,13 @@ jobs:
             . grok-build \
             || true
 
-          # Garantir un SARIF valide même si scan vide
+          # Garantir un SARIF JSON valide
           if ! python3 -c "import json; json.load(open('semgrep.sarif'))" 2>/dev/null; then
-            echo "⚠️ SARIF invalide ou absent → génération fallback"
-            cat > semgrep.sarif << 'EOF'
-          {"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep","rules":[]}},"results":[]}]}
-          EOF
+            echo "⚠️ SARIF invalide → fallback"
+            printf '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep","rules":[]}},"results":[]}]}' \
+              > semgrep.sarif
           fi
-          echo "✅ semgrep.sarif OK ($(wc -c < semgrep.sarif) bytes)"
+          echo "✅ semgrep.sarif ($(wc -c < semgrep.sarif) bytes)"
 
       - name: "📤 Upload Semgrep SARIF"
         uses: github/codeql-action/upload-sarif@v4
@@ -204,7 +226,6 @@ jobs:
       - name: "🔍 Scan PyPI dependencies"
         run: |
           FOUND=false
-          # Chercher dans les deux repos
           for f in requirements*.txt requirements/*.txt \
                    grok-build/requirements*.txt grok-build/requirements/*.txt; do
             [ -f "$f" ] || continue
@@ -214,7 +235,7 @@ jobs:
               > "guarddog-pypi-$(basename "$f" .txt).json" 2>&1 || true
             cat "guarddog-pypi-$(basename "$f" .txt).json"
           done
-          [ "$FOUND" = true ] || echo "ℹ️ Aucun requirements.txt trouvé – scan PyPI ignoré"
+          [ "$FOUND" = true ] || echo "ℹ️ Aucun requirements.txt – scan PyPI ignoré"
 
       - name: "🔍 Scan npm dependencies"
         run: |
@@ -224,10 +245,10 @@ jobs:
             FOUND=true
             echo "=== Scanning $f ==="
             guarddog npm verify "$f" --output-format json \
-              > "guarddog-npm-$(dirname "$f" | tr '/' '-').json" 2>&1 || true
-            cat "guarddog-npm-$(dirname "$f" | tr '/' '-').json"
+              > "guarddog-npm-$(echo "$f" | tr '/' '-').json" 2>&1 || true
+            cat "guarddog-npm-$(echo "$f" | tr '/' '-').json"
           done
-          [ "$FOUND" = true ] || echo "ℹ️ Aucun package.json trouvé – scan npm ignoré"
+          [ "$FOUND" = true ] || echo "ℹ️ Aucun package.json – scan npm ignoré"
 
       - name: "📤 Upload GuardDog results"
         uses: actions/upload-artifact@v4
@@ -273,10 +294,7 @@ jobs:
         continue-on-error: true
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 5 : CODEQL
-  # FIX #2 : suppression de la matrix JS/Python (grok-build = 100% Rust)
-  #           CodeQL ne supporte pas Rust → on utilise l'auto-détection
-  #           Si aucun langage supporté n'est trouvé, le job se termine proprement
+  # JOB 5 : CODEQL – auto-détection des langages
   # ───────────────────────────────────────────────────────────────────────────
   codeql:
     name: "🧬 CodeQL – Auto-detect Languages"
@@ -295,37 +313,29 @@ jobs:
       - name: "📥 Clone grok-build"
         run: git clone --depth 1 https://github.com/xai-org/grok-build.git grok-build
 
-      # FIX #2 : Détecter les langages présents AVANT d'initialiser CodeQL
-      # CodeQL supporte : cpp, csharp, go, java, javascript, python, ruby, swift
-      # Rust N'EST PAS supporté → on détecte ce qui est réellement présent
       - name: "🔍 Detect CodeQL-supported languages"
         id: detect-langs
         run: |
           LANGS=""
-          # JavaScript/TypeScript
-          if find . grok-build -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \
-               2>/dev/null | grep -qv "node_modules"; then
+          if find . grok-build \
+               \( -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) \
+               -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
             LANGS="javascript-typescript"
           fi
-          # Python
           if find . grok-build -name "*.py" 2>/dev/null | grep -q .; then
-            LANGS="$LANGS,python"
+            LANGS="${LANGS:+$LANGS,}python"
           fi
-          # Go
           if find . grok-build -name "*.go" 2>/dev/null | grep -q .; then
-            LANGS="$LANGS,go"
+            LANGS="${LANGS:+$LANGS,}go"
           fi
-          # Nettoyage de la virgule de début si LANGS commence par ","
-          LANGS="${LANGS#,}"
-
           if [ -z "$LANGS" ]; then
-            echo "ℹ️ Aucun langage CodeQL-compatible détecté (repo 100% Rust)"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "langs=" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ Aucun langage CodeQL-compatible (repo Rust pur)"
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+            echo "langs="     >> "$GITHUB_OUTPUT"
           else
-            echo "✅ Langages détectés : $LANGS"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
+            echo "✅ Langages : $LANGS"
+            echo "skip=false"    >> "$GITHUB_OUTPUT"
+            echo "langs=$LANGS"  >> "$GITHUB_OUTPUT"
           fi
 
       - name: "🧬 Initialize CodeQL"
@@ -344,12 +354,12 @@ jobs:
           category: codeql-auto
         continue-on-error: true
 
-      - name: "ℹ️ CodeQL skipped (Rust-only repo)"
+      - name: "ℹ️ CodeQL skipped (Rust-only)"
         if: steps.detect-langs.outputs.skip == 'true'
         run: |
           echo "## 🧬 CodeQL" >> "$GITHUB_STEP_SUMMARY"
-          echo "ℹ️ Ignoré : grok-build est un projet Rust pur." >> "$GITHUB_STEP_SUMMARY"
-          echo "CodeQL ne supporte pas encore Rust officiellement." >> "$GITHUB_STEP_SUMMARY"
+          echo "ℹ️ Ignoré : projet 100% Rust — CodeQL ne supporte pas encore Rust." \
+            >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 6 : GITLEAKS
@@ -359,7 +369,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: "📥 Checkout (full history – obligatoire pour Gitleaks)"
+      - name: "📥 Checkout (full history)"
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -381,10 +391,7 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 7 : BEARER
-  # FIX #3 : appel CLI direct (curl install) au lieu de bearer/bearer-action@v2
-  #           → contrôle total du exit code via || true
-  #           → garantit la génération du SARIF même sur repo Rust
-  #           → Bearer scanne quand même les secrets (agnostique au langage)
+  # FIX SARIF : patcher runs[].results null → [] avec Python avant upload
   # ───────────────────────────────────────────────────────────────────────────
   bearer:
     name: "🛡️ Bearer – SAST & Secrets"
@@ -402,33 +409,34 @@ jobs:
       - name: "📥 Clone grok-build"
         run: git clone --depth 1 https://github.com/xai-org/grok-build.git grok-build
 
-      # FIX #3 : installation CLI directe depuis le script officiel
       - name: "🛡️ Install Bearer CLI"
         run: |
-          curl -sfL https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh \
+          curl -sfL \
+            https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh \
             | sh -s -- -b /usr/local/bin
           bearer version
 
-      # FIX #3 : || true garantit que le job ne fail pas si Bearer trouve des issues
-      # --scanner secrets  → fonctionne sur n'importe quel langage (Rust inclus)
-      # --scanner sast     → tenté, ignoré gracieusement si langage non supporté
+      # --scanner secrets fonctionne sur tout langage (agnostique)
+      # || true : ne jamais bloquer même si Bearer trouve des issues
       - name: "🛡️ Run Bearer scan"
         run: |
           bearer scan . grok-build \
             --format sarif \
-            --output bearer.sarif \
+            --output bearer-raw.sarif \
             --severity critical,high,medium \
             --scanner secrets \
             --quiet \
             || true
 
-          # Valider le JSON SARIF — fallback si invalide ou absent
-          if python3 -c "import json; json.load(open('bearer.sarif'))" 2>/dev/null; then
-            echo "✅ bearer.sarif valide ($(wc -c < bearer.sarif) bytes)"
-          else
-            echo "⚠️ bearer.sarif absent ou invalide → génération fallback SARIF"
-            cat > bearer.sarif << 'EOF'
-          {
+      # FIX SARIF : patch complet en Python
+      # Problème : Bearer génère parfois "results": null au lieu de "results": []
+      # GitHub SARIF validator rejette null → on normalise TOUS les champs critiques
+      - name: "🔧 Sanitize Bearer SARIF (null → [])"
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys
+
+          SARIF_SKELETON = {
             "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
             "version": "2.1.0",
             "runs": [{
@@ -436,8 +444,56 @@ jobs:
               "results": []
             }]
           }
-          EOF
-          fi
+
+          raw_path = "bearer-raw.sarif"
+          out_path = "bearer.sarif"
+
+          # Cas 1 : fichier absent
+          if not os.path.exists(raw_path):
+            print("⚠️  bearer-raw.sarif absent → écriture du squelette vide")
+            with open(out_path, "w") as f:
+              json.dump(SARIF_SKELETON, f, indent=2)
+            sys.exit(0)
+
+          # Cas 2 : fichier présent, tenter de parser
+          try:
+            with open(raw_path) as f:
+              data = json.load(f)
+          except json.JSONDecodeError as e:
+            print(f"⚠️  JSON invalide ({e}) → écriture du squelette vide")
+            with open(out_path, "w") as f:
+              json.dump(SARIF_SKELETON, f, indent=2)
+            sys.exit(0)
+
+          # Cas 3 : JSON valide — patch de chaque run
+          patched = 0
+          for run in data.get("runs", []):
+            # results null ou absent → []
+            if not isinstance(run.get("results"), list):
+              run["results"] = []
+              patched += 1
+            # artifacts null ou absent → []
+            if not isinstance(run.get("artifacts"), list):
+              run["artifacts"] = []
+            # tool.driver.rules null → []
+            driver = run.get("tool", {}).get("driver", {})
+            if not isinstance(driver.get("rules"), list):
+              driver["rules"] = []
+
+          print(f"✅ SARIF patché : {patched} run(s) corrigés, "
+                f"{len(data.get('runs', []))} run(s) total")
+
+          with open(out_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+          # Vérification finale
+          with open(out_path) as f:
+            check = json.load(f)
+          for i, r in enumerate(check.get("runs", [])):
+            assert isinstance(r["results"], list), \
+              f"run[{i}].results toujours pas une liste!"
+          print(f"✅ Validation finale OK — bearer.sarif prêt pour upload")
+          PYEOF
 
       - name: "📤 Upload Bearer SARIF to GitHub Security"
         uses: github/codeql-action/upload-sarif@v4
@@ -490,5 +546,5 @@ jobs:
 
           > 🔍 Résultats dans **Security > Code scanning** (SARIF uploadés).
           > 📦 Binaire Windows dans les **Artifacts** de ce run.
-          > ℹ️ CodeQL ignoré si 0 langage supporté détecté (repo Rust pur).
+          > ℹ️ CodeQL ignoré si aucun langage supporté détecté (repo Rust pur).
           EOF
