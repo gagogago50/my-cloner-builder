@@ -1,0 +1,476 @@
+name: Build Windows Binary & Security Scan (Probe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branche, tag ou SHA de probelabs/probe à builder'
+        type: string
+        default: 'main'
+      version:
+        description: 'Forcer une version (laisser vide pour auto-détection via git describe)'
+        type: string
+        default: ''
+      create_release:
+        description: 'Créer une release GitHub dans CE dépôt avec le binaire'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  security-events: write
+  actions: read
+
+env:
+  SOURCE_REPO: probelabs/probe
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 : BUILD WINDOWS
+  # ───────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: "🏗️ Build Windows x86_64"
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Checkout probe source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Setup Rust cache
+        uses: actions/cache@v4
+        timeout-minutes: 10
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.0.0-$(git rev-parse --short HEAD)")
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version résolue : $VERSION"
+
+      - name: Build Release (static CRT)
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          echo '[target.x86_64-pc-windows-msvc]' > .cargo/config.toml
+          echo 'rustflags = ["-C", "target-feature=+crt-static", "-C", "link-args=/DEBUG:NONE", "-C", "link-args=/NOLOGO"]' >> .cargo/config.toml
+          cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package Binary
+        shell: bash
+        run: |
+          BINARY_NAME="probe"
+          ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-x86_64-pc-windows-msvc"
+          mkdir -p "$ARCHIVE_NAME"
+
+          cp "target/x86_64-pc-windows-msvc/release/${BINARY_NAME}.exe" "$ARCHIVE_NAME/"
+          cp README.md "${ARCHIVE_NAME}/" || true
+          cp LICENSE "${ARCHIVE_NAME}/" || true
+          cp ABOUT.MD "${ARCHIVE_NAME}/" || true
+
+          powershell -Command "Compress-Archive -Path '${ARCHIVE_NAME}' -DestinationPath '${ARCHIVE_NAME}.zip'"
+          echo "ASSET=${ARCHIVE_NAME}.zip" >> "$GITHUB_ENV"
+
+          certutil -hashfile "${ARCHIVE_NAME}.zip" SHA256 | grep -v "^SHA256" | grep -v "^CertUtil" > "${ARCHIVE_NAME}.zip.sha256"
+          echo "CHECKSUM=${ARCHIVE_NAME}.zip.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-windows-x86_64
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.CHECKSUM }}
+          retention-days: 7
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.CHECKSUM }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 : SEMGREP
+  # ───────────────────────────────────────────────────────────────────────────
+  semgrep:
+    name: "🔎 Semgrep – Code Patterns & Injections"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: probelabs/probe
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Run Semgrep
+        run: |
+          set -euo pipefail
+          semgrep scan \
+            --config "p/default" \
+            --config "p/secrets" \
+            --config "p/security-audit" \
+            --config "p/rust" \
+            --sarif \
+            --output semgrep.sarif \
+            . \
+            || true
+
+          if ! python3 -c "import json; json.load(open('semgrep.sarif'))" 2>/dev/null; then
+            printf '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep","rules":[]}},"results":[]}]}' \
+              > semgrep.sarif
+          fi
+          echo "✅ semgrep.sarif ($(wc -c < semgrep.sarif) bytes)"
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+        continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 : GUARDDOG
+  # ───────────────────────────────────────────────────────────────────────────
+  guarddog:
+    name: "🐕 GuardDog – Malicious Package Detection"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: probelabs/probe
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install GuardDog
+        run: pip install guarddog
+
+      - name: Scan PyPI dependencies
+        run: |
+          set -euo pipefail
+          FOUND=false
+          for f in $(find . -name "requirements*.txt" -not -path "*/node_modules/*" 2>/dev/null); do
+            FOUND=true
+            echo "=== Scanning $f ==="
+            guarddog pypi verify "$f" --output-format json \
+              > "guarddog-pypi-$(echo "$f" | tr '/' '-').json" 2>&1 || true
+          done
+          [ "$FOUND" = true ] || echo "ℹ️ Aucun requirements.txt – scan PyPI ignoré"
+
+      - name: Scan npm dependencies
+        run: |
+          set -euo pipefail
+          FOUND=false
+          for f in $(find . -name "package.json" -not -path "*/node_modules/*" 2>/dev/null); do
+            FOUND=true
+            echo "=== Scanning $f ==="
+            guarddog npm verify "$f" --output-format json \
+              > "guarddog-npm-$(echo "$f" | tr '/' '-').json" 2>&1 || true
+          done
+          [ "$FOUND" = true ] || echo "ℹ️ Aucun package.json – scan npm ignoré"
+
+      - name: Upload GuardDog results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guarddog-results
+          path: guarddog-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 4 : OSSF SCORECARD
+  # ───────────────────────────────────────────────────────────────────────────
+  scorecard:
+    name: "🏆 OSSF Scorecard – Repo Security Hygiene"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: probelabs/probe
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run OSSF Scorecard
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false
+
+      - name: Upload Scorecard SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: scorecard.sarif
+          category: ossf-scorecard
+        continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 5 : CODEQL
+  # ───────────────────────────────────────────────────────────────────────────
+  codeql:
+    name: "🧬 CodeQL – Auto-detect Languages"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: probelabs/probe
+          ref: ${{ inputs.ref }}
+          fetch-depth: 2
+
+      - name: Detect CodeQL-supported languages
+        id: detect-langs
+        run: |
+          set -euo pipefail
+          LANGS=""
+          if find . \( -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) \
+               -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            LANGS="javascript-typescript"
+          fi
+          if find . -name "*.py" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            LANGS="${LANGS:+$LANGS,}python"
+          fi
+          if find . -name "*.go" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            LANGS="${LANGS:+$LANGS,}go"
+          fi
+          if [ -z "$LANGS" ]; then
+            echo "ℹ️ Probe est en Rust — CodeQL ne le supporte pas encore"
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+            echo "langs="     >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false"   >> "$GITHUB_OUTPUT"
+            echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Initialize CodeQL
+        if: steps.detect-langs.outputs.skip == 'false'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ steps.detect-langs.outputs.langs }}
+          build-mode: none
+          queries: security-extended,security-and-quality
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        if: steps.detect-langs.outputs.skip == 'false'
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: codeql-auto
+        continue-on-error: true
+
+      - name: CodeQL skipped (Rust-only)
+        if: steps.detect-langs.outputs.skip == 'true'
+        run: |
+          echo "## 🧬 CodeQL" >> "$GITHUB_STEP_SUMMARY"
+          echo "ℹ️ Ignoré : projet 100% Rust — CodeQL ne supporte pas encore Rust." >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 6 : GITLEAKS
+  # ───────────────────────────────────────────────────────────────────────────
+  gitleaks:
+    name: "🔑 Gitleaks – Secrets Detection"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: probelabs/probe
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: Upload Gitleaks report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 7 : BEARER
+  # ───────────────────────────────────────────────────────────────────────────
+  bearer:
+    name: "🛡️ Bearer – SAST & Secrets"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: probelabs/probe
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Bearer CLI
+        run: |
+          set -euo pipefail
+          curl -sfL \
+            https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          bearer version
+
+      - name: Run Bearer scan
+        run: |
+          bearer scan . \
+            --format sarif \
+            --output bearer-raw.sarif \
+            --severity critical,high,medium \
+            --scanner secrets \
+            --quiet \
+            || true
+
+      - name: Sanitize Bearer SARIF
+        run: |
+          cat > /tmp/fix_sarif.py << 'PYEOF'
+          import json, os, sys
+
+          SKELETON = {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+              "tool": {"driver": {"name": "Bearer", "version": "2.x", "rules": []}},
+              "results": [],
+              "artifacts": []
+            }]
+          }
+
+          raw = "bearer-raw.sarif"
+          out = "bearer.sarif"
+
+          if not os.path.exists(raw):
+            json.dump(SKELETON, open(out, "w"), indent=2)
+            sys.exit(0)
+
+          try:
+            data = json.load(open(raw))
+          except json.JSONDecodeError:
+            json.dump(SKELETON, open(out, "w"), indent=2)
+            sys.exit(0)
+
+          for run in data.get("runs", []):
+            if not isinstance(run.get("results"), list): run["results"] = []
+            if not isinstance(run.get("artifacts"), list): run["artifacts"] = []
+            drv = run.get("tool", {}).get("driver", {})
+            if not isinstance(drv.get("rules"), list): drv["rules"] = []
+
+          json.dump(data, open(out, "w"), indent=2)
+          print("OK: bearer.sarif valide")
+          PYEOF
+          python3 /tmp/fix_sarif.py
+
+      - name: Upload Bearer SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: bearer.sarif
+          category: bearer
+        continue-on-error: true
+
+      - name: Upload Bearer SARIF artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bearer-report
+          path: bearer.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB FINAL : SUMMARY
+  # ───────────────────────────────────────────────────────────────────────────
+  summary:
+    name: "📋 Security & Build Summary"
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows
+      - semgrep
+      - guarddog
+      - scorecard
+      - codeql
+      - gitleaks
+      - bearer
+    if: always()
+    steps:
+      - name: Write Job Summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          ## 🔒 Probe – Build & Security Report
+
+          | Job | Statut |
+          |-----|--------|
+          | 🏗️ Build Windows x86_64 | ${{ needs.build-windows.result }} |
+          | 🔎 Semgrep              | ${{ needs.semgrep.result }} |
+          | 🐕 GuardDog            | ${{ needs.guarddog.result }} |
+          | 🏆 OSSF Scorecard      | ${{ needs.scorecard.result }} |
+          | 🧬 CodeQL              | ${{ needs.codeql.result }} |
+          | 🔑 Gitleaks            | ${{ needs.gitleaks.result }} |
+          | 🛡️ Bearer               | ${{ needs.bearer.result }} |
+
+          > 📦 Binaire Windows (.zip) dans les **Artifacts** de ce run.
+          > 🔍 Résultats de scan dans **Security > Code scanning**.
+          EOF
