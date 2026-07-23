@@ -3,12 +3,20 @@ name: Build & Security Scan
 on:
   workflow_dispatch:
     inputs:
+      repository:
+        description: 'owner/repo du projet source à builder (ex: monorg/codebase-memory-mcp)'
+        type: string
+        required: true
+      ref:
+        description: 'Branche, tag ou SHA à builder'
+        type: string
+        default: 'main'
       version:
-        description: 'Version string (e.g. v0.8.0)'
+        description: 'Forcer une version (laisser vide pour auto-détection via git describe dans le clone)'
         type: string
         default: ''
       attest:
-        description: 'Generate build provenance attestations for release artifacts'
+        description: 'Générer les attestations de provenance des artefacts'
         type: boolean
         default: false
 
@@ -28,7 +36,20 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout project source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0   # nécessaire pour que git describe / build.sh détectent les tags
+
+      - name: Verify source layout
+        shell: bash
+        run: |
+          if [ ! -f scripts/build.sh ]; then
+            echo "::error::scripts/build.sh introuvable dans ${{ inputs.repository }}@${{ inputs.ref }}. Vérifie le nom du dépôt/ref."
+            exit 1
+          fi
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
@@ -118,6 +139,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -164,6 +187,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
           fetch-depth: 1
 
       - uses: actions/setup-python@v5
@@ -220,6 +245,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           fetch-depth: 1
 
@@ -251,6 +278,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
           fetch-depth: 2
 
       - name: Detect CodeQL-supported languages
@@ -307,6 +336,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
 
       - name: Run Gitleaks
@@ -336,6 +367,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
 
       - name: Install Bearer CLI
