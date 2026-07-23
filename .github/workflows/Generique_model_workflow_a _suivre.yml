@@ -1,0 +1,634 @@
+name: Build & Security Scan Template
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 'owner/repo du projet source à builder/scanner'
+        type: string
+        required: true
+      ref:
+        description: 'Branche, tag ou SHA à builder/scanner'
+        type: string
+        default: 'main'
+      project_type:
+        description: 'Type de build à exécuter'
+        type: choice
+        options:
+          - windows
+          - android
+          - none   # scans uniquement, pas de build
+        default: 'none'
+      version:
+        description: 'Forcer une version (laisser vide pour auto-détection)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  security-events: write
+  actions: read
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BUILD — WINDOWS (à adapter par projet : cargo, msys2, msvc, etc.)
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-windows:
+    name: "🏗️ Build Windows"
+    if: ${{ inputs.project_type == 'windows' }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout project source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0   # nécessaire pour git describe / détection de version
+
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.0.0-$(git rev-parse --short HEAD)")
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Version résolue : $VERSION"
+
+      # ─── EXEMPLE A : projet Rust (adapter target/toolchain) ─────────────────
+      # - uses: dtolnay/rust-toolchain@stable
+      #   with:
+      #     targets: x86_64-pc-windows-msvc
+      # - name: Build
+      #   run: cargo build --release --target x86_64-pc-windows-msvc
+
+      # ─── EXEMPLE B : projet C/C++ via MSYS2 (adapter script/Makefile) ───────
+      # - uses: msys2/setup-msys2@v2
+      #   with:
+      #     msystem: CLANG64
+      #     path-type: inherit
+      #     install: mingw-w64-clang-x86_64-clang make zip
+      # - name: Build
+      #   shell: msys2 {0}
+      #   run: |
+      #     scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
+
+      # ─── EXEMPLE C : projet Node/Electron ───────────────────────────────────
+      # - uses: actions/setup-node@v4
+      #   with:
+      #     node-version: "22"
+      # - run: npm ci && npm run build:win
+
+      - name: Verify build output exists
+        shell: bash
+        run: |
+          echo "::warning::Étape de build à personnaliser pour ce projet — voir commentaires dans le YAML"
+          # exit 1  # décommente une fois le vrai build en place
+
+      # - name: Package binary
+      #   shell: bash
+      #   run: |
+      #     zip -r "app-${VERSION}-windows.zip" dist/
+      #
+      # - uses: actions/upload-artifact@v4
+      #   with:
+      #     name: windows-build
+      #     path: "*.zip"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BUILD — ANDROID (Gradle, à adapter au module/flavor du projet)
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-android:
+    name: "🏗️ Build Android"
+    if: ${{ inputs.project_type == 'android' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout project source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: resolve
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.0.0-$(git rev-parse --short HEAD)")
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Version résolue : $VERSION"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # ─── Build debug APK (aucun secret requis) ──────────────────────────────
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
+
+      # ─── Build release APK signé (nécessite un keystore en secret) ─────────
+      # - name: Decode keystore
+      #   run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+      # - name: Build release APK
+      #   run: |
+      #     ./gradlew assembleRelease \
+      #       -Pandroid.injected.signing.store.file=../keystore.jks \
+      #       -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }} \
+      #       -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} \
+      #       -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
+
+      - name: Locate APK
+        run: find . -name "*.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-build-${{ env.VERSION }}
+          path: "**/build/outputs/apk/**/*.apk"
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB : SEMGREP
+  # ═══════════════════════════════════════════════════════════════════════════
+  semgrep:
+    name: "🔎 Semgrep – Code Patterns & Injections"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Run Semgrep
+        run: |
+          set -euo pipefail
+          semgrep scan \
+            --config "p/default" \
+            --config "p/secrets" \
+            --config "p/security-audit" \
+            --sarif \
+            --output semgrep.sarif \
+            . \
+            || true
+
+          if ! python3 -c "import json; json.load(open('semgrep.sarif'))" 2>/dev/null; then
+            printf '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep","rules":[]}},"results":[]}]}' \
+              > semgrep.sarif
+          fi
+          echo "✅ semgrep.sarif ($(wc -c < semgrep.sarif) bytes)"
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB : GUARDDOG (npm / PyPI — utile si projet Android avec deps Gradle/JS)
+  # ═══════════════════════════════════════════════════════════════════════════
+  guarddog:
+    name: "🐕 GuardDog – Malicious Package Detection"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install GuardDog
+        run: pip install guarddog
+
+      - name: Scan PyPI dependencies
+        run: |
+          set -euo pipefail
+          FOUND=false
+          for f in $(find . -name "requirements*.txt" -not -path "*/node_modules/*" 2>/dev/null); do
+            FOUND=true
+            echo "=== Scanning $f ==="
+            guarddog pypi verify "$f" --output-format json \
+              > "guarddog-pypi-$(echo "$f" | tr '/' '-').json" 2>&1 || true
+          done
+          [ "$FOUND" = true ] || echo "ℹ️ Aucun requirements.txt – scan PyPI ignoré"
+
+      - name: Scan npm dependencies
+        run: |
+          set -euo pipefail
+          FOUND=false
+          for f in $(find . -name "package.json" -not -path "*/node_modules/*" 2>/dev/null); do
+            FOUND=true
+            echo "=== Scanning $f ==="
+            guarddog npm verify "$f" --output-format json \
+              > "guarddog-npm-$(echo "$f" | tr '/' '-').json" 2>&1 || true
+          done
+          [ "$FOUND" = true ] || echo "ℹ️ Aucun package.json – scan npm ignoré"
+
+      - name: Upload GuardDog results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guarddog-results
+          path: guarddog-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB : OSSF SCORECARD (analyse toujours le dépôt hébergeant CE workflow,
+  # pas le dépôt source externe — c'est son fonctionnement voulu)
+  # ═══════════════════════════════════════════════════════════════════════════
+  scorecard:
+    name: "🏆 OSSF Scorecard – Repo Security Hygiene"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run OSSF Scorecard
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false
+
+      - name: Upload Scorecard SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: scorecard.sarif
+          category: ossf-scorecard
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB : CODEQL – langages interprétés (JS/TS/Python) — build-mode: none
+  # ═══════════════════════════════════════════════════════════════════════════
+  codeql-interpreted:
+    name: "🧬 CodeQL – JS/Python"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 2
+
+      - name: Detect JS/Python
+        id: detect
+        run: |
+          set -euo pipefail
+          LANGS=""
+          if find . \( -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) \
+               -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            LANGS="javascript-typescript"
+          fi
+          if find . -name "*.py" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            LANGS="${LANGS:+$LANGS,}python"
+          fi
+          if [ -z "$LANGS" ]; then
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false"   >> "$GITHUB_OUTPUT"
+            echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Initialize CodeQL
+        if: steps.detect.outputs.skip == 'false'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ steps.detect.outputs.langs }}
+          build-mode: none
+          queries: security-extended,security-and-quality
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        if: steps.detect.outputs.skip == 'false'
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: codeql-interpreted
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Skipped
+        if: steps.detect.outputs.skip == 'true'
+        run: echo "ℹ️ Aucun JS/Python détecté — étape ignorée" >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB : CODEQL – Go — build-mode: autobuild (obligatoire pour Go)
+  # ═══════════════════════════════════════════════════════════════════════════
+  codeql-go:
+    name: "🧬 CodeQL – Go"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 2
+
+      - name: Detect Go
+        id: detect
+        run: |
+          set -euo pipefail
+          if find . -name "*.go" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-go@v5
+        if: steps.detect.outputs.skip == 'false'
+        with:
+          go-version-file: go.mod
+          check-latest: true
+        continue-on-error: true
+
+      - name: Initialize CodeQL (Go)
+        if: steps.detect.outputs.skip == 'false'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: go
+          build-mode: autobuild
+          queries: security-extended,security-and-quality
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis (Go)
+        if: steps.detect.outputs.skip == 'false'
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: codeql-go
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Skipped
+        if: steps.detect.outputs.skip == 'true'
+        run: echo "ℹ️ Aucun code Go détecté — étape ignorée" >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB : CODEQL – Java/Kotlin (utile pour projets Android)
+  # ═══════════════════════════════════════════════════════════════════════════
+  codeql-java:
+    name: "🧬 CodeQL – Java/Kotlin"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 2
+
+      - name: Detect Java/Kotlin
+        id: detect
+        run: |
+          set -euo pipefail
+          if find . \( -name "*.java" -o -name "*.kt" \) -not -path "*/build/*" 2>/dev/null | grep -q .; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.detect.outputs.skip == 'false'
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Initialize CodeQL (Java/Kotlin)
+        if: steps.detect.outputs.skip == 'false'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          build-mode: autobuild
+          queries: security-extended,security-and-quality
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis (Java/Kotlin)
+        if: steps.detect.outputs.skip == 'false'
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: codeql-java
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Skipped
+        if: steps.detect.outputs.skip == 'true'
+        run: echo "ℹ️ Aucun Java/Kotlin détecté — étape ignorée" >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB : GITLEAKS
+  # ═══════════════════════════════════════════════════════════════════════════
+  gitleaks:
+    name: "🔑 Gitleaks – Secrets Detection"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: Upload Gitleaks report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB : BEARER
+  # ═══════════════════════════════════════════════════════════════════════════
+  bearer:
+    name: "🛡️ Bearer – SAST & Secrets"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Bearer CLI
+        run: |
+          set -euo pipefail
+          curl -sfL \
+            https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          bearer version
+
+      - name: Run Bearer scan
+        run: |
+          bearer scan . \
+            --format sarif \
+            --output bearer-raw.sarif \
+            --severity critical,high,medium \
+            --scanner secrets \
+            --quiet \
+            || true
+
+      - name: Sanitize Bearer SARIF
+        run: |
+          cat > /tmp/fix_sarif.py << 'PYEOF'
+          import json, os, sys
+
+          SKELETON = {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+              "tool": {"driver": {"name": "Bearer", "version": "2.x", "rules": []}},
+              "results": [],
+              "artifacts": []
+            }]
+          }
+
+          raw = "bearer-raw.sarif"
+          out = "bearer.sarif"
+
+          if not os.path.exists(raw):
+            json.dump(SKELETON, open(out, "w"), indent=2)
+            sys.exit(0)
+
+          try:
+            data = json.load(open(raw))
+          except json.JSONDecodeError:
+            json.dump(SKELETON, open(out, "w"), indent=2)
+            sys.exit(0)
+
+          for run in data.get("runs", []):
+            if not isinstance(run.get("results"), list): run["results"] = []
+            if not isinstance(run.get("artifacts"), list): run["artifacts"] = []
+            drv = run.get("tool", {}).get("driver", {})
+            if not isinstance(drv.get("rules"), list): drv["rules"] = []
+
+          json.dump(data, open(out, "w"), indent=2)
+          print("OK: bearer.sarif valide")
+          PYEOF
+          python3 /tmp/fix_sarif.py
+
+      - name: Upload Bearer SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: bearer.sarif
+          category: bearer
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Upload Bearer SARIF artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bearer-report
+          path: bearer.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB FINAL : SUMMARY
+  # ═══════════════════════════════════════════════════════════════════════════
+  summary:
+    name: "📋 Security & Build Summary"
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows
+      - build-android
+      - semgrep
+      - guarddog
+      - scorecard
+      - codeql-interpreted
+      - codeql-go
+      - codeql-java
+      - gitleaks
+      - bearer
+    if: always()
+    steps:
+      - name: Write Job Summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          ## 🔒 Build & Security Report — ${{ inputs.repository }}@${{ inputs.ref }}
+
+          | Job | Statut |
+          |-----|--------|
+          | 🏗️ Build Windows        | ${{ needs.build-windows.result }} |
+          | 🏗️ Build Android        | ${{ needs.build-android.result }} |
+          | 🔎 Semgrep              | ${{ needs.semgrep.result }} |
+          | 🐕 GuardDog            | ${{ needs.guarddog.result }} |
+          | 🏆 OSSF Scorecard      | ${{ needs.scorecard.result }} |
+          | 🧬 CodeQL (JS/Python)  | ${{ needs.codeql-interpreted.result }} |
+          | 🧬 CodeQL (Go)         | ${{ needs.codeql-go.result }} |
+          | 🧬 CodeQL (Java/Kotlin)| ${{ needs.codeql-java.result }} |
+          | 🔑 Gitleaks            | ${{ needs.gitleaks.result }} |
+          | 🛡️ Bearer               | ${{ needs.bearer.result }} |
+          EOF
