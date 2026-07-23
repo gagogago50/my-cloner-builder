@@ -1,0 +1,465 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version string (e.g. v0.8.0)'
+        type: string
+        default: ''
+      attest:
+        description: 'Generate build provenance attestations for release artifacts'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  security-events: write
+  actions: read
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 : BUILD WINDOWS AMD64
+  # ───────────────────────────────────────────────────────────────────────────
+  build-windows-amd64:
+    name: "🏗️ Build Windows AMD64"
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            make
+            zip
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
+          else
+            scripts/build.sh CC=clang CXX=clang++
+          fi
+
+      - name: Archive standard binary
+        shell: msys2 {0}
+        run: |
+          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
+          PAYLOAD=build/c/codebase-memory-mcp
+          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
+          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
+          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
+          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-windows-amd64.zip \
+            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+
+      - name: Attest standard binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-windows-amd64.zip
+
+      - name: Build UI binary
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
+          else
+            scripts/build.sh --with-ui CC=clang CXX=clang++
+          fi
+
+      - name: Archive UI binary
+        shell: msys2 {0}
+        run: |
+          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
+          PAYLOAD=build/c/codebase-memory-mcp
+          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
+          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
+          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
+          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-ui-windows-amd64.zip \
+            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+
+      - name: Attest UI binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-ui-windows-amd64.zip
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-windows-amd64
+          path: "*.zip"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 : SEMGREP
+  # ───────────────────────────────────────────────────────────────────────────
+  semgrep:
+    name: "🔎 Semgrep – Code Patterns & Injections"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🐍 Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "🔧 Install Semgrep"
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: "🔎 Run Semgrep OSS (no API key)"
+        run: |
+          set -euo pipefail
+          semgrep scan \
+            --config "p/default" \
+            --config "p/secrets" \
+            --config "p/security-audit" \
+            --sarif \
+            --output semgrep.sarif \
+            . \
+            || true
+
+          if ! python3 -c "import json; json.load(open('semgrep.sarif'))" 2>/dev/null; then
+            printf '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep","rules":[]}},"results":[]}]}' \
+              > semgrep.sarif
+          fi
+          echo "✅ semgrep.sarif ($(wc -c < semgrep.sarif) bytes)"
+
+      - name: "📤 Upload Semgrep SARIF"
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+        continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 : GUARDDOG
+  # ───────────────────────────────────────────────────────────────────────────
+  guarddog:
+    name: "🐕 GuardDog – Malicious Package Detection"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "🐍 Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "🐕 Install GuardDog"
+        run: pip install guarddog
+
+      - name: "🔍 Scan PyPI dependencies"
+        run: |
+          set -euo pipefail
+          FOUND=false
+          for f in $(find . -name "requirements*.txt" -not -path "*/node_modules/*" 2>/dev/null); do
+            FOUND=true
+            echo "=== Scanning $f ==="
+            guarddog pypi verify "$f" --output-format json \
+              > "guarddog-pypi-$(echo "$f" | tr '/' '-').json" 2>&1 || true
+          done
+          [ "$FOUND" = true ] || echo "ℹ️ Aucun requirements.txt – scan PyPI ignoré"
+
+      - name: "🔍 Scan npm dependencies"
+        run: |
+          set -euo pipefail
+          FOUND=false
+          for f in $(find . -name "package.json" -not -path "*/node_modules/*" 2>/dev/null); do
+            FOUND=true
+            echo "=== Scanning $f ==="
+            guarddog npm verify "$f" --output-format json \
+              > "guarddog-npm-$(echo "$f" | tr '/' '-').json" 2>&1 || true
+          done
+          [ "$FOUND" = true ] || echo "ℹ️ Aucun package.json – scan npm ignoré"
+
+      - name: "📤 Upload GuardDog results"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guarddog-results
+          path: guarddog-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 4 : OSSF SCORECARD
+  # ───────────────────────────────────────────────────────────────────────────
+  scorecard:
+    name: "🏆 OSSF Scorecard – Repo Security Hygiene"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: "🏆 Run OSSF Scorecard"
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false
+
+      - name: "📤 Upload Scorecard SARIF"
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: scorecard.sarif
+          category: ossf-scorecard
+        continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 5 : CODEQL – auto-détection des langages
+  # ───────────────────────────────────────────────────────────────────────────
+  codeql:
+    name: "🧬 CodeQL – Auto-detect Languages"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: "🔍 Detect CodeQL-supported languages"
+        id: detect-langs
+        run: |
+          set -euo pipefail
+          LANGS=""
+          if find . \( -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) \
+               -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            LANGS="javascript-typescript"
+          fi
+          if find . -name "*.py" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            LANGS="${LANGS:+$LANGS,}python"
+          fi
+          if find . -name "*.go" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            LANGS="${LANGS:+$LANGS,}go"
+          fi
+          if [ -z "$LANGS" ]; then
+            echo "ℹ️ Aucun langage CodeQL-compatible détecté (ex: repo C pur)"
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+            echo "langs="     >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ Langages : $LANGS"
+            echo "skip=false"   >> "$GITHUB_OUTPUT"
+            echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "🧬 Initialize CodeQL"
+        if: steps.detect-langs.outputs.skip == 'false'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ steps.detect-langs.outputs.langs }}
+          build-mode: none
+          queries: security-extended,security-and-quality
+        continue-on-error: true
+
+      - name: "🔍 Perform CodeQL Analysis"
+        if: steps.detect-langs.outputs.skip == 'false'
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: codeql-auto
+        continue-on-error: true
+
+      - name: "ℹ️ CodeQL skipped"
+        if: steps.detect-langs.outputs.skip == 'true'
+        run: |
+          echo "## 🧬 CodeQL" >> "$GITHUB_STEP_SUMMARY"
+          echo "ℹ️ Ignoré : aucun langage CodeQL-compatible détecté." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 6 : GITLEAKS
+  # ───────────────────────────────────────────────────────────────────────────
+  gitleaks:
+    name: "🔑 Gitleaks – Secrets Detection"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📥 Checkout (full history)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🔑 Run Gitleaks"
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: "📤 Upload Gitleaks report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 7 : BEARER
+  # ───────────────────────────────────────────────────────────────────────────
+  bearer:
+    name: "🛡️ Bearer – SAST & Secrets"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🛡️ Install Bearer CLI"
+        run: |
+          set -euo pipefail
+          curl -sfL \
+            https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          bearer version
+
+      - name: "🛡️ Run Bearer scan"
+        run: |
+          bearer scan . \
+            --format sarif \
+            --output bearer-raw.sarif \
+            --severity critical,high,medium \
+            --scanner secrets \
+            --quiet \
+            || true
+
+      - name: "🔧 Sanitize Bearer SARIF (null → [])"
+        run: |
+          cat > /tmp/fix_sarif.py << 'PYEOF'
+          import json, os, sys
+
+          SKELETON = {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+              "tool": {"driver": {"name": "Bearer", "version": "2.x", "rules": []}},
+              "results": [],
+              "artifacts": []
+            }]
+          }
+
+          raw = "bearer-raw.sarif"
+          out = "bearer.sarif"
+
+          if not os.path.exists(raw):
+            print("WARNING: bearer-raw.sarif absent -> squelette vide")
+            json.dump(SKELETON, open(out, "w"), indent=2)
+            sys.exit(0)
+
+          try:
+            data = json.load(open(raw))
+          except json.JSONDecodeError as e:
+            print(f"WARNING: JSON invalide ({e}) -> squelette vide")
+            json.dump(SKELETON, open(out, "w"), indent=2)
+            sys.exit(0)
+
+          for run in data.get("runs", []):
+            if not isinstance(run.get("results"),   list): run["results"]   = []
+            if not isinstance(run.get("artifacts"), list): run["artifacts"] = []
+            drv = run.get("tool", {}).get("driver", {})
+            if not isinstance(drv.get("rules"), list):     drv["rules"]     = []
+
+          json.dump(data, open(out, "w"), indent=2)
+
+          check = json.load(open(out))
+          for i, r in enumerate(check.get("runs", [])):
+            assert isinstance(r["results"], list), f"run[{i}].results pas une liste!"
+          print(f"OK: bearer.sarif valide — {len(check['runs'])} run(s)")
+          PYEOF
+          python3 /tmp/fix_sarif.py
+
+      - name: "📤 Upload Bearer SARIF to GitHub Security"
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: bearer.sarif
+          category: bearer
+        continue-on-error: true
+
+      - name: "📤 Upload Bearer SARIF artifact"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bearer-report
+          path: bearer.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB FINAL : SUMMARY
+  # ───────────────────────────────────────────────────────────────────────────
+  summary:
+    name: "📋 Security & Build Summary"
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows-amd64
+      - semgrep
+      - guarddog
+      - scorecard
+      - codeql
+      - gitleaks
+      - bearer
+    if: always()
+    steps:
+      - name: "📋 Write Job Summary"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          ## 🔒 Build & Security Report
+
+          | Job | Statut |
+          |-----|--------|
+          | 🏗️ Build Windows AMD64 | ${{ needs.build-windows-amd64.result }} |
+          | 🔎 Semgrep             | ${{ needs.semgrep.result }} |
+          | 🐕 GuardDog           | ${{ needs.guarddog.result }} |
+          | 🏆 OSSF Scorecard     | ${{ needs.scorecard.result }} |
+          | 🧬 CodeQL             | ${{ needs.codeql.result }} |
+          | 🔑 Gitleaks           | ${{ needs.gitleaks.result }} |
+          | 🛡️ Bearer              | ${{ needs.bearer.result }} |
+
+          > 🔍 Résultats détaillés dans **Security > Code scanning**.
+          > 📦 Binaires Windows AMD64 (.zip) dans les **Artifacts** de ce run.
+          EOF
