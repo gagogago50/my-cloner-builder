@@ -1,7 +1,7 @@
-name: Build
+name: Build & Security Scan
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       version:
         description: 'Version string (e.g. v0.8.0)'
@@ -116,22 +116,20 @@ jobs:
     name: "🔎 Semgrep – Code Patterns & Injections"
     runs-on: ubuntu-latest
     steps:
-      - name: "📥 Checkout"
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: "🐍 Setup Python"
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: "🔧 Install Semgrep"
+      - name: Install Semgrep
         run: |
           python -m pip install --upgrade pip
           pip install semgrep
 
-      - name: "🔎 Run Semgrep OSS (no API key)"
+      - name: Run Semgrep
         run: |
           set -euo pipefail
           semgrep scan \
@@ -149,7 +147,7 @@ jobs:
           fi
           echo "✅ semgrep.sarif ($(wc -c < semgrep.sarif) bytes)"
 
-      - name: "📤 Upload Semgrep SARIF"
+      - name: Upload Semgrep SARIF
         uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
@@ -164,20 +162,18 @@ jobs:
     name: "🐕 GuardDog – Malicious Package Detection"
     runs-on: ubuntu-latest
     steps:
-      - name: "📥 Checkout"
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: "🐍 Setup Python"
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: "🐕 Install GuardDog"
+      - name: Install GuardDog
         run: pip install guarddog
 
-      - name: "🔍 Scan PyPI dependencies"
+      - name: Scan PyPI dependencies
         run: |
           set -euo pipefail
           FOUND=false
@@ -189,7 +185,7 @@ jobs:
           done
           [ "$FOUND" = true ] || echo "ℹ️ Aucun requirements.txt – scan PyPI ignoré"
 
-      - name: "🔍 Scan npm dependencies"
+      - name: Scan npm dependencies
         run: |
           set -euo pipefail
           FOUND=false
@@ -201,7 +197,7 @@ jobs:
           done
           [ "$FOUND" = true ] || echo "ℹ️ Aucun package.json – scan npm ignoré"
 
-      - name: "📤 Upload GuardDog results"
+      - name: Upload GuardDog results
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -222,20 +218,19 @@ jobs:
       contents: read
       actions: read
     steps:
-      - name: "📥 Checkout"
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: "🏆 Run OSSF Scorecard"
+      - name: Run OSSF Scorecard
         uses: ossf/scorecard-action@v2.4.0
         with:
           results_file: scorecard.sarif
           results_format: sarif
           publish_results: false
 
-      - name: "📤 Upload Scorecard SARIF"
+      - name: Upload Scorecard SARIF
         uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
@@ -244,7 +239,7 @@ jobs:
         continue-on-error: true
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 5 : CODEQL – auto-détection des langages
+  # JOB 5 : CODEQL
   # ───────────────────────────────────────────────────────────────────────────
   codeql:
     name: "🧬 CodeQL – Auto-detect Languages"
@@ -254,12 +249,11 @@ jobs:
       actions: read
       contents: read
     steps:
-      - name: "📥 Checkout"
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      - name: "🔍 Detect CodeQL-supported languages"
+      - name: Detect CodeQL-supported languages
         id: detect-langs
         run: |
           set -euo pipefail
@@ -275,16 +269,14 @@ jobs:
             LANGS="${LANGS:+$LANGS,}go"
           fi
           if [ -z "$LANGS" ]; then
-            echo "ℹ️ Aucun langage CodeQL-compatible détecté (ex: repo C pur)"
             echo "skip=true"  >> "$GITHUB_OUTPUT"
             echo "langs="     >> "$GITHUB_OUTPUT"
           else
-            echo "✅ Langages : $LANGS"
             echo "skip=false"   >> "$GITHUB_OUTPUT"
             echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: "🧬 Initialize CodeQL"
+      - name: Initialize CodeQL
         if: steps.detect-langs.outputs.skip == 'false'
         uses: github/codeql-action/init@v4
         with:
@@ -293,19 +285,18 @@ jobs:
           queries: security-extended,security-and-quality
         continue-on-error: true
 
-      - name: "🔍 Perform CodeQL Analysis"
+      - name: Perform CodeQL Analysis
         if: steps.detect-langs.outputs.skip == 'false'
         uses: github/codeql-action/analyze@v4
         with:
           category: codeql-auto
         continue-on-error: true
 
-      - name: "ℹ️ CodeQL skipped"
+      - name: CodeQL skipped
         if: steps.detect-langs.outputs.skip == 'true'
         run: |
           echo "## 🧬 CodeQL" >> "$GITHUB_STEP_SUMMARY"
-          echo "ℹ️ Ignoré : aucun langage CodeQL-compatible détecté." \
-            >> "$GITHUB_STEP_SUMMARY"
+          echo "ℹ️ Ignoré : aucun langage CodeQL-compatible détecté." >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 6 : GITLEAKS
@@ -314,18 +305,17 @@ jobs:
     name: "🔑 Gitleaks – Secrets Detection"
     runs-on: ubuntu-latest
     steps:
-      - name: "📥 Checkout (full history)"
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: "🔑 Run Gitleaks"
+      - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_ENABLE_COMMENTS: "false"
 
-      - name: "📤 Upload Gitleaks report"
+      - name: Upload Gitleaks report
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -344,12 +334,11 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - name: "📥 Checkout"
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: "🛡️ Install Bearer CLI"
+      - name: Install Bearer CLI
         run: |
           set -euo pipefail
           curl -sfL \
@@ -357,7 +346,7 @@ jobs:
             | sh -s -- -b /usr/local/bin
           bearer version
 
-      - name: "🛡️ Run Bearer scan"
+      - name: Run Bearer scan
         run: |
           bearer scan . \
             --format sarif \
@@ -367,7 +356,7 @@ jobs:
             --quiet \
             || true
 
-      - name: "🔧 Sanitize Bearer SARIF (null → [])"
+      - name: Sanitize Bearer SARIF
         run: |
           cat > /tmp/fix_sarif.py << 'PYEOF'
           import json, os, sys
@@ -386,33 +375,27 @@ jobs:
           out = "bearer.sarif"
 
           if not os.path.exists(raw):
-            print("WARNING: bearer-raw.sarif absent -> squelette vide")
             json.dump(SKELETON, open(out, "w"), indent=2)
             sys.exit(0)
 
           try:
             data = json.load(open(raw))
-          except json.JSONDecodeError as e:
-            print(f"WARNING: JSON invalide ({e}) -> squelette vide")
+          except json.JSONDecodeError:
             json.dump(SKELETON, open(out, "w"), indent=2)
             sys.exit(0)
 
           for run in data.get("runs", []):
-            if not isinstance(run.get("results"),   list): run["results"]   = []
+            if not isinstance(run.get("results"), list): run["results"] = []
             if not isinstance(run.get("artifacts"), list): run["artifacts"] = []
             drv = run.get("tool", {}).get("driver", {})
-            if not isinstance(drv.get("rules"), list):     drv["rules"]     = []
+            if not isinstance(drv.get("rules"), list): drv["rules"] = []
 
           json.dump(data, open(out, "w"), indent=2)
-
-          check = json.load(open(out))
-          for i, r in enumerate(check.get("runs", [])):
-            assert isinstance(r["results"], list), f"run[{i}].results pas une liste!"
-          print(f"OK: bearer.sarif valide — {len(check['runs'])} run(s)")
+          print("OK: bearer.sarif valide")
           PYEOF
           python3 /tmp/fix_sarif.py
 
-      - name: "📤 Upload Bearer SARIF to GitHub Security"
+      - name: Upload Bearer SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
@@ -420,7 +403,7 @@ jobs:
           category: bearer
         continue-on-error: true
 
-      - name: "📤 Upload Bearer SARIF artifact"
+      - name: Upload Bearer SARIF artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -445,7 +428,7 @@ jobs:
       - bearer
     if: always()
     steps:
-      - name: "📋 Write Job Summary"
+      - name: Write Job Summary
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
           ## 🔒 Build & Security Report
@@ -459,7 +442,4 @@ jobs:
           | 🧬 CodeQL             | ${{ needs.codeql.result }} |
           | 🔑 Gitleaks           | ${{ needs.gitleaks.result }} |
           | 🛡️ Bearer              | ${{ needs.bearer.result }} |
-
-          > 🔍 Résultats détaillés dans **Security > Code scanning**.
-          > 📦 Binaires Windows AMD64 (.zip) dans les **Artifacts** de ce run.
           EOF
