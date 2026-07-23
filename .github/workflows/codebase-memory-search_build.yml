@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       repository:
-        description: 'owner/repo du projet source à builder (ex: monorg/codebase-memory-mcp)'
+        description: 'owner/repo du projet source à builder'
         type: string
-        required: true
+        default: 'DeusData/codebase-memory-mcp'
       ref:
         description: 'Branche, tag ou SHA à builder'
         type: string
@@ -41,13 +41,13 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          fetch-depth: 0   # nécessaire pour que git describe / build.sh détectent les tags
+          fetch-depth: 0
 
       - name: Verify source layout
         shell: bash
         run: |
           if [ ! -f scripts/build.sh ]; then
-            echo "::error::scripts/build.sh introuvable dans ${{ inputs.repository }}@${{ inputs.ref }}. Vérifie le nom du dépôt/ref."
+            echo "::error::scripts/build.sh introuvable dans ${{ inputs.repository }}@${{ inputs.ref }}."
             exit 1
           fi
 
@@ -176,6 +176,8 @@ jobs:
         with:
           sarif_file: semgrep.sarif
           category: semgrep
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -233,6 +235,8 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 4 : OSSF SCORECARD
+  # Évalue l'hygiène GitHub (branch protection, releases, alerts...) — s'applique
+  # uniquement au dépôt qui héberge CE workflow, pas au dépôt source externe.
   # ───────────────────────────────────────────────────────────────────────────
   scorecard:
     name: "🏆 OSSF Scorecard – Repo Security Hygiene"
@@ -245,8 +249,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repository }}
-          ref: ${{ inputs.ref }}
           persist-credentials: false
           fetch-depth: 1
 
@@ -263,13 +265,15 @@ jobs:
         with:
           sarif_file: scorecard.sarif
           category: ossf-scorecard
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 5 : CODEQL
+  # JOB 5a : CODEQL – langages interprétés (build-mode: none)
   # ───────────────────────────────────────────────────────────────────────────
-  codeql:
-    name: "🧬 CodeQL – Auto-detect Languages"
+  codeql-interpreted:
+    name: "🧬 CodeQL – JS/Python"
     runs-on: ubuntu-latest
     permissions:
       security-events: write
@@ -282,8 +286,8 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 2
 
-      - name: Detect CodeQL-supported languages
-        id: detect-langs
+      - name: Detect JS/Python
+        id: detect
         run: |
           set -euo pipefail
           LANGS=""
@@ -294,38 +298,94 @@ jobs:
           if find . -name "*.py" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
             LANGS="${LANGS:+$LANGS,}python"
           fi
-          if find . -name "*.go" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
-            LANGS="${LANGS:+$LANGS,}go"
-          fi
           if [ -z "$LANGS" ]; then
             echo "skip=true"  >> "$GITHUB_OUTPUT"
-            echo "langs="     >> "$GITHUB_OUTPUT"
           else
             echo "skip=false"   >> "$GITHUB_OUTPUT"
             echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Initialize CodeQL
-        if: steps.detect-langs.outputs.skip == 'false'
+        if: steps.detect.outputs.skip == 'false'
         uses: github/codeql-action/init@v4
         with:
-          languages: ${{ steps.detect-langs.outputs.langs }}
+          languages: ${{ steps.detect.outputs.langs }}
           build-mode: none
           queries: security-extended,security-and-quality
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
       - name: Perform CodeQL Analysis
-        if: steps.detect-langs.outputs.skip == 'false'
+        if: steps.detect.outputs.skip == 'false'
         uses: github/codeql-action/analyze@v4
         with:
-          category: codeql-auto
+          category: codeql-interpreted
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
-      - name: CodeQL skipped
-        if: steps.detect-langs.outputs.skip == 'true'
+      - name: Skipped
+        if: steps.detect.outputs.skip == 'true'
+        run: echo "ℹ️ Aucun JS/Python détecté — étape ignorée" >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 5b : CODEQL – Go (build-mode: autobuild)
+  # ───────────────────────────────────────────────────────────────────────────
+  codeql-go:
+    name: "🧬 CodeQL – Go"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 2
+
+      - name: Detect Go
+        id: detect
         run: |
-          echo "## 🧬 CodeQL" >> "$GITHUB_STEP_SUMMARY"
-          echo "ℹ️ Ignoré : aucun langage CodeQL-compatible détecté." >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          if find . -name "*.go" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-go@v5
+        if: steps.detect.outputs.skip == 'false'
+        with:
+          go-version-file: go.mod
+          check-latest: true
+        continue-on-error: true
+
+      - name: Initialize CodeQL (Go)
+        if: steps.detect.outputs.skip == 'false'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: go
+          build-mode: autobuild
+          queries: security-extended,security-and-quality
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis (Go)
+        if: steps.detect.outputs.skip == 'false'
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: codeql-go
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
+        continue-on-error: true
+
+      - name: Skipped
+        if: steps.detect.outputs.skip == 'true'
+        run: echo "ℹ️ Aucun code Go détecté — étape ignorée" >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 6 : GITLEAKS
@@ -434,6 +494,8 @@ jobs:
         with:
           sarif_file: bearer.sarif
           category: bearer
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
       - name: Upload Bearer SARIF artifact
@@ -456,7 +518,8 @@ jobs:
       - semgrep
       - guarddog
       - scorecard
-      - codeql
+      - codeql-interpreted
+      - codeql-go
       - gitleaks
       - bearer
     if: always()
@@ -468,11 +531,12 @@ jobs:
 
           | Job | Statut |
           |-----|--------|
-          | 🏗️ Build Windows AMD64 | ${{ needs.build-windows-amd64.result }} |
-          | 🔎 Semgrep             | ${{ needs.semgrep.result }} |
-          | 🐕 GuardDog           | ${{ needs.guarddog.result }} |
-          | 🏆 OSSF Scorecard     | ${{ needs.scorecard.result }} |
-          | 🧬 CodeQL             | ${{ needs.codeql.result }} |
-          | 🔑 Gitleaks           | ${{ needs.gitleaks.result }} |
-          | 🛡️ Bearer              | ${{ needs.bearer.result }} |
+          | 🏗️ Build Windows AMD64   | ${{ needs.build-windows-amd64.result }} |
+          | 🔎 Semgrep               | ${{ needs.semgrep.result }} |
+          | 🐕 GuardDog             | ${{ needs.guarddog.result }} |
+          | 🏆 OSSF Scorecard       | ${{ needs.scorecard.result }} |
+          | 🧬 CodeQL (JS/Python)   | ${{ needs.codeql-interpreted.result }} |
+          | 🧬 CodeQL (Go)          | ${{ needs.codeql-go.result }} |
+          | 🔑 Gitleaks             | ${{ needs.gitleaks.result }} |
+          | 🛡️ Bearer                | ${{ needs.bearer.result }} |
           EOF
