@@ -174,6 +174,8 @@ jobs:
         with:
           sarif_file: semgrep.sarif
           category: semgrep
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -230,7 +232,7 @@ jobs:
           retention-days: 7
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 4 : OSSF SCORECARD
+  # JOB 4 : OSSF SCORECARD (évalue le dépôt hébergeant CE workflow)
   # ───────────────────────────────────────────────────────────────────────────
   scorecard:
     name: "🏆 OSSF Scorecard – Repo Security Hygiene"
@@ -243,8 +245,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: probelabs/probe
-          ref: ${{ inputs.ref }}
           persist-credentials: false
           fetch-depth: 1
 
@@ -261,10 +261,12 @@ jobs:
         with:
           sarif_file: scorecard.sarif
           category: ossf-scorecard
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 5 : CODEQL
+  # JOB 5 : CODEQL (Probe est en Rust — non supporté, sera ignoré automatiquement)
   # ───────────────────────────────────────────────────────────────────────────
   codeql:
     name: "🧬 CodeQL – Auto-detect Languages"
@@ -292,13 +294,9 @@ jobs:
           if find . -name "*.py" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
             LANGS="${LANGS:+$LANGS,}python"
           fi
-          if find . -name "*.go" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
-            LANGS="${LANGS:+$LANGS,}go"
-          fi
           if [ -z "$LANGS" ]; then
             echo "ℹ️ Probe est en Rust — CodeQL ne le supporte pas encore"
             echo "skip=true"  >> "$GITHUB_OUTPUT"
-            echo "langs="     >> "$GITHUB_OUTPUT"
           else
             echo "skip=false"   >> "$GITHUB_OUTPUT"
             echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
@@ -311,6 +309,8 @@ jobs:
           languages: ${{ steps.detect-langs.outputs.langs }}
           build-mode: none
           queries: security-extended,security-and-quality
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
       - name: Perform CodeQL Analysis
@@ -318,6 +318,8 @@ jobs:
         uses: github/codeql-action/analyze@v4
         with:
           category: codeql-auto
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
       - name: CodeQL skipped (Rust-only)
@@ -433,6 +435,8 @@ jobs:
         with:
           sarif_file: bearer.sarif
           category: bearer
+          sha: ${{ github.sha }}
+          ref: ${{ github.ref }}
         continue-on-error: true
 
       - name: Upload Bearer SARIF artifact
@@ -476,5 +480,4 @@ jobs:
           | 🛡️ Bearer               | ${{ needs.bearer.result }} |
 
           > 📦 Binaire Windows (.zip) dans les **Artifacts** de ce run.
-          > 🔍 Résultats de scan dans **Security > Code scanning**.
           EOF
