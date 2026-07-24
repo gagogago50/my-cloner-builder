@@ -48,6 +48,14 @@ jobs:
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
+      # ───── AJOUT : Node.js pour le serveur MCP ─────
+      - name: Setup Node.js for MCP build
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+
       - name: Show Rust version
         shell: bash
         run: rustc --version && cargo --version
@@ -88,21 +96,64 @@ jobs:
           echo 'rustflags = ["-C", "target-feature=+crt-static", "-C", "link-args=/DEBUG:NONE", "-C", "link-args=/NOLOGO"]' >> .cargo/config.toml
           cargo build --release --target x86_64-pc-windows-msvc
 
+      # ───── AJOUT : Audit de la chaîne de dépendances MCP ─────
+      - name: Audit MCP dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mcp
+
+          # Installation déterministe sans scripts d’install
+          npm ci --ignore-scripts
+
+          # Audit sécurité – échoue si vulnérabilité high ou critique
+          npm audit --audit-level=high
+
+          cd ..
+
+      # ───── AJOUT : Build du serveur MCP ─────
+      - name: Build MCP server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mcp
+          npm run build
+          cd ..
+
+      # ───── AJOUT : Vérification de la sortie MCP avant packaging ─────
+      - name: Verify MCP output
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f mcp/build/index.js
+
       - name: Package Binary
         shell: bash
         run: |
+          set -euo pipefail
           BINARY_NAME="probe"
           ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-x86_64-pc-windows-msvc"
           mkdir -p "$ARCHIVE_NAME"
 
+          # Binaire Rust
           cp "target/x86_64-pc-windows-msvc/release/${BINARY_NAME}.exe" "$ARCHIVE_NAME/"
+
+          # MCP server (build + manifeste + lockfile)
+          mkdir -p "$ARCHIVE_NAME/mcp/build"
+          cp mcp/build/index.js "$ARCHIVE_NAME/mcp/build/"
+          cp mcp/package.json "$ARCHIVE_NAME/mcp/"
+          cp mcp/package-lock.json "$ARCHIVE_NAME/mcp/"
+
+          # Docs & licences
           cp README.md "${ARCHIVE_NAME}/" || true
           cp LICENSE "${ARCHIVE_NAME}/" || true
           cp ABOUT.MD "${ARCHIVE_NAME}/" || true
 
+          # ZIP Windows
           powershell -Command "Compress-Archive -Path '${ARCHIVE_NAME}' -DestinationPath '${ARCHIVE_NAME}.zip'"
           echo "ASSET=${ARCHIVE_NAME}.zip" >> "$GITHUB_ENV"
 
+          # Checksum
           certutil -hashfile "${ARCHIVE_NAME}.zip" SHA256 | grep -v "^SHA256" | grep -v "^CertUtil" > "${ARCHIVE_NAME}.zip.sha256"
           echo "CHECKSUM=${ARCHIVE_NAME}.zip.sha256" >> "$GITHUB_ENV"
 
@@ -294,7 +345,7 @@ jobs:
           if find . -name "*.py" -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
             LANGS="${LANGS:+$LANGS,}python"
           fi
-          if [ -z "$LANGS" ]; then
+          if [ -z "$LANGS" ] ; then
             echo "ℹ️ Probe est en Rust — CodeQL ne le supporte pas encore"
             echo "skip=true"  >> "$GITHUB_OUTPUT"
           else
