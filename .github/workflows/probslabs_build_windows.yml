@@ -48,17 +48,22 @@ jobs:
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
-      # ───── AJOUT : Node.js pour le serveur MCP ─────
+      # Node 22 pour builder le MCP (sous-projet npm/)
       - name: Setup Node.js for MCP build
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: mcp/package-lock.json
+          # Chemin réel existant pour la clé de cache
+          cache-dependency-path: npm/package.json
 
-      - name: Show Rust version
+      - name: Show toolchain versions
         shell: bash
-        run: rustc --version && cargo --version
+        run: |
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
 
       - name: Setup Rust cache
         uses: actions/cache@v4
@@ -88,7 +93,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version résolue : $VERSION"
 
-      - name: Build Release (static CRT)
+      - name: Build Rust Release (static CRT)
         shell: bash
         run: |
           mkdir -p .cargo
@@ -96,36 +101,38 @@ jobs:
           echo 'rustflags = ["-C", "target-feature=+crt-static", "-C", "link-args=/DEBUG:NONE", "-C", "link-args=/NOLOGO"]' >> .cargo/config.toml
           cargo build --release --target x86_64-pc-windows-msvc
 
-      # ───── AJOUT : Audit de la chaîne de dépendances MCP ─────
-      - name: Audit MCP dependencies
+      # ───── MCP : audit des dépendances dans npm/ AVANT exécution de scripts ─────
+      - name: Audit MCP dependencies (npm/)
         shell: bash
         run: |
           set -euo pipefail
-          cd mcp
+          cd npm
 
-          # Installation déterministe sans scripts d’install
-          npm ci --ignore-scripts
+          if [ -f package-lock.json ]; then
+            echo "🔐 Using npm ci with package-lock.json"
+            npm ci --ignore-scripts
+          else
+            echo "⚠️ No package-lock.json in npm/ – falling back to npm install --ignore-scripts"
+            npm install --ignore-scripts
+          fi
 
-          # Audit sécurité – échoue si vulnérabilité high ou critique
+          # Échoue si vulnérabilités >= high
           npm audit --audit-level=high
 
-          cd ..
-
-      # ───── AJOUT : Build du serveur MCP ─────
+      # ───── MCP : build du serveur via ton script existant ─────
       - name: Build MCP server
         shell: bash
         run: |
           set -euo pipefail
-          cd mcp
-          npm run build
-          cd ..
+          cd npm
+          npm run build:mcp
 
-      # ───── AJOUT : Vérification de la sortie MCP avant packaging ─────
+      # ───── MCP : vérification de la sortie ─────
       - name: Verify MCP output
         shell: bash
         run: |
           set -euo pipefail
-          test -f mcp/build/index.js
+          test -f npm/build/mcp/index.js
 
       - name: Package Binary
         shell: bash
@@ -138,11 +145,15 @@ jobs:
           # Binaire Rust
           cp "target/x86_64-pc-windows-msvc/release/${BINARY_NAME}.exe" "$ARCHIVE_NAME/"
 
-          # MCP server (build + manifeste + lockfile)
+          # MCP server pour Kilo :
+          #   - source : npm/build/mcp/index.js
+          #   - destination dans le zip : mcp/build/index.js
           mkdir -p "$ARCHIVE_NAME/mcp/build"
-          cp mcp/build/index.js "$ARCHIVE_NAME/mcp/build/"
-          cp mcp/package.json "$ARCHIVE_NAME/mcp/"
-          cp mcp/package-lock.json "$ARCHIVE_NAME/mcp/"
+          cp "npm/build/mcp/index.js" "$ARCHIVE_NAME/mcp/build/index.js"
+
+          # Manifeste et lockfile MCP (copiés depuis npm/)
+          cp npm/package.json "$ARCHIVE_NAME/mcp/package.json"
+          cp npm/package-lock.json "$ARCHIVE_NAME/mcp/package-lock.json" || true
 
           # Docs & licences
           cp README.md "${ARCHIVE_NAME}/" || true
@@ -153,7 +164,7 @@ jobs:
           powershell -Command "Compress-Archive -Path '${ARCHIVE_NAME}' -DestinationPath '${ARCHIVE_NAME}.zip'"
           echo "ASSET=${ARCHIVE_NAME}.zip" >> "$GITHUB_ENV"
 
-          # Checksum
+          # Checksum SHA256
           certutil -hashfile "${ARCHIVE_NAME}.zip" SHA256 | grep -v "^SHA256" | grep -v "^CertUtil" > "${ARCHIVE_NAME}.zip.sha256"
           echo "CHECKSUM=${ARCHIVE_NAME}.zip.sha256" >> "$GITHUB_ENV"
 
@@ -317,7 +328,7 @@ jobs:
         continue-on-error: true
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 5 : CODEQL (Probe est en Rust — non supporté, sera ignoré automatiquement)
+  # JOB 5 : CODEQL
   # ───────────────────────────────────────────────────────────────────────────
   codeql:
     name: "🧬 CodeQL – Auto-detect Languages"
