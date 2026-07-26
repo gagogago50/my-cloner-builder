@@ -1,4 +1,4 @@
-name: Build Probe MCP Agent
+name: Build Probe MCP Agent (Windows AMD64)
 
 on:
   push:
@@ -16,140 +16,116 @@ jobs:
     runs-on: windows-latest
     
     steps:
-      # Checkout du repository Probe
       - name: Checkout Probe repository
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: main
           
-      # Setup Node.js
+      # CORRECTION : Passage à Node 24 et retrait du cache qui faisait planter l'étape
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: npm/package-lock.json
+          # J'ai retiré cache: 'npm' et cache-dependency-path 
+          # car le fichier package-lock.json est introuvable au démarrage
           
-      # Setup Rust (CORRIGÉ)
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
           
-      # Build le binaire Rust probe
-      - name: Build Probe binary
+      - name: Build Probe binary (AMD64)
         shell: bash
         run: |
-          cargo build --release
+          cargo build --release --target x86_64-pc-windows-msvc
           mkdir -p npm/bin
-          cp target/release/probe.exe npm/bin/probe.exe
+          cp target/x86_64-pc-windows-msvc/release/probe.exe npm/bin/probe.exe
           echo "Probe binary built:"
           ls -la npm/bin/
           
-      # Installer les dépendances npm
       - name: Install npm dependencies
         working-directory: ./npm
         run: npm install
         
-      # Build le MCP agent
       - name: Build MCP Agent
         working-directory: ./npm
         run: npm run build
         
-      # Créer la structure complète pour distribution
       - name: Prepare distribution package
         working-directory: ./npm
         shell: bash
         run: |
-          # Créer le dossier de distribution
           mkdir -p dist-package/probe-mcp-agent
           
-          # Copier les fichiers buildés (dist ou build)
           if [ -d "dist" ]; then
-            cp -r dist/* dist-package/probe-mcp-agent/
-            echo "Copied dist/ files"
+            cp -r dist dist-package/probe-mcp-agent/
           elif [ -d "build" ]; then
-            cp -r build/* dist-package/probe-mcp-agent/
-            echo "Copied build/ files"
+            cp -r build dist-package/probe-mcp-agent/
           else
             echo "Warning: No dist or build folder found"
-            ls -la
           fi
           
-          # Copier le binaire probe
           if [ -d "bin" ]; then
             cp -r bin dist-package/probe-mcp-agent/
-            echo "Copied bin/ folder"
           fi
           
-          # Copier les fichiers essentiels
           cp package.json dist-package/probe-mcp-agent/
           [ -f "package-lock.json" ] && cp package-lock.json dist-package/probe-mcp-agent/
           [ -f "README.md" ] && cp README.md dist-package/probe-mcp-agent/
           [ -f "LICENSE" ] && cp LICENSE dist-package/probe-mcp-agent/
-          
-          # Copier les sources (optionnel)
           [ -d "src" ] && cp -r src dist-package/probe-mcp-agent/
-          
-          # Copier les fichiers de config
           [ -f ".env.example" ] && cp .env.example dist-package/probe-mcp-agent/
           [ -f "tsconfig.json" ] && cp tsconfig.json dist-package/probe-mcp-agent/
           
-          # Lister le contenu
           echo "=== Distribution package contents ==="
           find dist-package -type f | head -50
           
-      # Créer le zip
       - name: Create ZIP artifact
         working-directory: ./npm
-        shell: bash
+        shell: pwsh
         run: |
-          cd dist-package
-          zip -r ../probe-mcp-agent-windows.zip probe-mcp-agent/
-          cd ..
-          echo "=== ZIP created ==="
-          ls -la probe-mcp-agent-windows.zip
+          Compress-Archive -Path dist-package/probe-mcp-agent -DestinationPath probe-mcp-agent-windows-amd64.zip
+          Write-Host "=== ZIP created ==="
+          Get-Item probe-mcp-agent-windows-amd64.zip
           
-      # Upload artifact (fichiers individuels)
       - name: Upload MCP Agent artifact (files)
         uses: actions/upload-artifact@v4
         with:
           name: probe-mcp-agent-files
           path: |
-            npm/dist/**/*
-            npm/bin/**/*
+            npm/dist/
+            npm/bin/
             npm/package.json
             npm/README.md
           retention-days: 30
           if-no-files-found: warn
           
-      # Upload artifact (ZIP complet)
       - name: Upload MCP Agent artifact (ZIP)
         uses: actions/upload-artifact@v4
         with:
-          name: probe-mcp-agent-windows-complete
-          path: npm/probe-mcp-agent-windows.zip
+          name: probe-mcp-agent-windows-amd64-complete
+          path: npm/probe-mcp-agent-windows-amd64.zip
           retention-days: 30
           if-no-files-found: error
           
-      # Optionnel: Créer une release si c'est un tag
       - name: Upload to Release (if tagged)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: npm/probe-mcp-agent-windows.zip
-          name: Probe MCP Agent ${{ github.ref_name }} (Windows)
+          files: npm/probe-mcp-agent-windows-amd64.zip
+          name: Probe MCP Agent ${{ github.ref_name }} (Windows AMD64)
           body: |
-            Build complet du Probe MCP Agent pour Windows
+            Build complet du Probe MCP Agent pour Windows (Architecture AMD64 / x86_64) pour kilocode cli.
             
             Contenu:
-            - Binaire probe.exe (Rust)
+            - Binaire probe.exe (Rust compilé pour x86_64-pc-windows-msvc)
             - MCP Agent (Node.js build)
             - Fichiers de configuration
             
             Installation:
-            1. Dézipper probe-mcp-agent-windows.zip
+            1. Dézipper probe-mcp-agent-windows-amd64.zip
             2. cd probe-mcp-agent
             3. npm install --production
             4. node dist/index.js
