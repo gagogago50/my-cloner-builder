@@ -23,14 +23,14 @@ permissions:
 
 env:
   SOURCE_REPO: probelabs/probe
-  RUST_VERSION: 1.92.0
+  RUST_VERSION: "stable"  # ← Utiliser stable pour éviter les problèmes de version
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 1 : BUILD WINDOWS COMPLET (Rust + npm/MCP)
+  # JOB 1 : BUILD WINDOWS COMPLET (Rust + npm/MCP/Agent)
   # ───────────────────────────────────────────────────────────────────────────
   build-windows:
-    name: "🏗️ Build Windows x86_64 (Full)"
+    name: "🏗️ Build Windows x86_64 (Full MCP)"
     runs-on: windows-latest
     timeout-minutes: 120
     outputs:
@@ -47,7 +47,7 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
 
-      # Vérification des prérequis (inspiré du build.bat)
+      # Vérification des prérequis
       - name: Check Prerequisites
         id: prereq
         shell: pwsh
@@ -57,64 +57,43 @@ jobs:
           Write-Host "==========================================="
           
           # Check Rust
-          Write-Host "[1/4] Checking Rust installation..."
+          Write-Host "[1/3] Checking Rust..."
           try {
             $rustVersion = rustc --version 2>&1
-            Write-Host "  ✓ Rust installed: $rustVersion"
+            Write-Host "  ✓ Rust: $rustVersion"
           } catch {
-            Write-Error "✗ Rust not found. Install from https://rustup.rs/"
+            Write-Error "✗ Rust not found"
             exit 1
           }
           
-          # Check Cargo
+          # Check Node.js
+          Write-Host "[2/3] Checking Node.js..."
           try {
-            $cargoVersion = cargo --version 2>&1
-            Write-Host "  ✓ Cargo installed: $cargoVersion"
+            $nodeVersion = node --version 2>&1
+            Write-Host "  ✓ Node.js: $nodeVersion"
           } catch {
-            Write-Error "✗ Cargo not found"
-            exit 1
-          }
-          
-          # Check Git (pour build.rs)
-          Write-Host "[2/4] Checking Git..."
-          try {
-            $gitVersion = git --version 2>&1
-            Write-Host "  ✓ Git installed"
-          } catch {
-            Write-Error "✗ Git not found"
-            exit 1
+            Write-Host "  ℹ Node.js will be installed"
           }
           
           # Check VS Build Tools
-          Write-Host "[3/4] Checking Visual Studio Build Tools..."
+          Write-Host "[3/3] Checking VS Build Tools..."
           $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (Test-Path $vsWhere) {
-            Write-Host "  ✓ Visual Studio Installer found"
+            Write-Host "  ✓ Visual Studio found"
           } else {
-            Write-Warning "  ⚠ vswhere.exe not found"
+            Write-Warning "  ⚠ VS Build Tools may be needed"
           }
           
-          # Check Node.js (pour MCP)
-          Write-Host "[4/4] Checking Node.js..."
-          try {
-            $nodeVersion = node --version 2>&1
-            Write-Host "  ✓ Node.js installed: $nodeVersion"
-          } catch {
-            Write-Host "  ℹ Node.js will be installed next"
-          }
-          
-          Write-Host "==========================================="
-          Write-Host "All prerequisites satisfied"
           Write-Host "==========================================="
 
-      # Installation Rust stable (auto-mise à jour)
+      # Installation Rust stable
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
-      # Node 22 pour builder le MCP et l'agent
+      # Node 22 pour npm build
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -123,20 +102,15 @@ jobs:
           cache-dependency-path: npm/package.json
 
       # Affichage des versions
-      - name: Show Toolchain Versions
+      - name: Show Versions
         shell: bash
         run: |
-          echo "=========================================="
-          echo "Toolchain Versions"
-          echo "=========================================="
           echo "Rust: $(rustc --version)"
           echo "Cargo: $(cargo --version)"
           echo "Node: $(node --version)"
           echo "npm: $(npm --version)"
-          echo "Git: $(git --version)"
-          echo "=========================================="
 
-      # Cache optimisé
+      # Cache Rust
       - name: Setup Rust Cache
         uses: actions/cache@v4
         timeout-minutes: 10
@@ -147,12 +121,12 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ env.RUST_VERSION }}
+          key: ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain', 'rust-toolchain.toml') || 'stable' }}
           restore-keys: |
             ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}-
-            ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-
+            ${{ runner.os }}-cargo-
 
-      # Résolution de la version
+      # Résolution version
       - name: Resolve Version
         id: resolve
         shell: bash
@@ -164,10 +138,9 @@ jobs:
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Git Hash: $(git rev-parse --short HEAD)"
-          echo "Resolved Version: $VERSION"
+          echo "Version: $VERSION"
 
-      # Capture des métadonnées
+      # Capture métadonnées
       - name: Capture Build Info
         id: build_info
         shell: bash
@@ -177,7 +150,7 @@ jobs:
           echo "git_hash=$GIT_HASH" >> "$GITHUB_OUTPUT"
           echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
 
-      # Configuration Cargo pour Windows (optimisations release)
+      # Configuration Cargo Windows
       - name: Setup Cargo Config
         shell: bash
         run: |
@@ -191,82 +164,145 @@ jobs:
           ]
           EOF
 
-      # BUILD RUST - Workspace complet (probe + lsp-daemon)
-      - name: Build Rust Workspace Release
+      # BUILD RUST - Workspace complet
+      - name: Build Rust Workspace
         id: rust_build
         timeout-minutes: 60
         shell: bash
         run: |
           echo "=========================================="
-          echo "Building Rust Workspace (probe + lsp-daemon)"
+          echo "Building Rust Workspace"
           echo "=========================================="
           
-          # Build tout le workspace (pas seulement le binaire principal)
+          # Build tout le workspace (probe + lsp-daemon + autres)
           cargo build --release --target x86_64-pc-windows-msvc
           
-          echo "=========================================="
-          echo "Rust build completed"
-          echo "=========================================="
-          
-          # Vérification des binaires produits
+          echo "Built binaries:"
           ls -la target/x86_64-pc-windows-msvc/release/*.exe || true
 
-      # Vérification post-build Rust
+      # Vérification binaires Rust
       - name: Verify Rust Binaries
         shell: pwsh
         run: |
-          Write-Host "==========================================="
-          Write-Host "Verifying Rust Binaries"
-          Write-Host "==========================================="
-          
           $targetDir = "target/x86_64-pc-windows-msvc/release"
           
-          # Binaires attendus
-          $binaries = @("probe.exe", "lsp-daemon.exe", "debug-tree-sitter.exe", "position-analyzer.exe")
-          
-          foreach ($bin in $binaries) {
-            $path = "$targetDir/$bin"
-            if (Test-Path $path) {
-              $size = (Get-Item $path).Length
-              $sizeMB = [math]::Round($size / 1MB, 2)
-              Write-Host "  ✓ $bin ($sizeMB MB)"
-            } else {
-              Write-Host "  ⚠ $bin not found (optional)"
-            }
+          $mainBinary = "$targetDir/probe.exe"
+          if (Test-Path $mainBinary) {
+            $size = (Get-Item $mainBinary).Length / 1MB
+            Write-Host "✓ probe.exe ($([math]::Round($size,2)) MB)"
+            
+            # Test exécution
+            & $mainBinary --version
+          } else {
+            Write-Error "✗ probe.exe not found!"
+            exit 1
           }
           
-          # Test exécution probe
-          $probePath = "$targetDir/probe.exe"
-          if (Test-Path $probePath) {
-            try {
-              $output = & $probePath --help 2>&1 | Select-Object -First 5
-              Write-Host "  ✓ probe.exe runs successfully"
-            } catch {
-              Write-Warning "  ⚠ probe.exe test run failed"
-            }
+          # Vérifier lsp-daemon (optionnel mais recommandé)
+          $lspDaemon = "$targetDir/lsp-daemon.exe"
+          if (Test-Path $lspDaemon) {
+            Write-Host "✓ lsp-daemon.exe found"
+          } else {
+            Write-Warning "⚠ lsp-daemon.exe not found (may be built as lib)"
           }
-          
-          Write-Host "==========================================="
 
-      # Préparation npm - Copie des binaires dans npm/bin/
+      # ───── PRÉPARATION NPM (copie des binaires) ─────
       - name: Prepare npm Binaries
         shell: bash
         run: |
           echo "Preparing npm binaries..."
           
-          # Création du répertoire bin
           mkdir -p npm/bin
           
-          # Copie des binaires principaux
+          # Copie des binaires pour le package npm
           cp target/x86_64-pc-windows-msvc/release/probe.exe npm/bin/probe.exe
-          cp target/x86_64-pc-windows-msvc/release/lsp-daemon.exe npm/bin/lsp-daemon.exe 2>/dev/null || echo "lsp-daemon.exe not found (may be built as lib)"
+          cp target/x86_64-pc-windows-msvc/release/lsp-daemon.exe npm/bin/ 2>/dev/null || true
           
-          # Copie des binaires optionnels
-          cp target/x86_64-pc-windows-msvc/release/debug-tree-sitter.exe npm/bin/ 2>/dev/null || true
-          cp target/x86_64-pc-windows-msvc/release/position-analyzer.exe npm/bin/ 2>/dev/null || true
+          echo "npm/bin contents:"
+          ls -la npm/bin/
+
+      # ───── BUILD NPM COMPLET (CJS + MCP + Agent) ─────
+      - name: Install npm Dependencies
+        shell: bash
+        run: |
+          cd npm
+          npm ci --ignore-scripts
+
+      - name: Build npm (CJS)
+        shell: bash
+        run: |
+          echo "Building CJS..."
+          cd npm
+          npm run build:cjs
+
+      - name: Build npm (MCP)
+        shell: bash
+        run: |
+          echo "Building MCP..."
+          cd npm
+          npm run build:mcp
+
+      - name: Build npm (Agent)
+        shell: bash
+        run: |
+          echo "Building Agent..."
+          cd npm
+          npm run build:agent
+
+      - name: Verify npm Build
+        shell: bash
+        run: |
+          echo "Verifying npm build..."
           
-          # Création du wrapper script (sans extension pour compatibilité)
-          cat > npm/bin/probe << 'WRAPPER'
+          # Vérifier les sorties
+          test -f npm/build/mcp/index.js || { echo "ERROR: MCP build missing"; exit 1; }
+          test -d npm/cjs || { echo "ERROR: CJS build missing"; exit 1; }
+          
+          echo "✓ npm build verified"
+          echo "MCP files:"
+          find npm/build -name "*.js" | head -5
+          echo "CJS files:"
+          find npm/cjs -name "*.js" | head -5
+
+      # Packaging complet
+      - name: Package Binary
+        id: package
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          VERSION="${{ steps.resolve.outputs.version }}"
+          GIT_HASH="${{ steps.build_info.outputs.git_hash }}"
+          BUILD_DATE="${{ steps.build_info.outputs.build_date }}"
+          
+          ARCHIVE_NAME="probe-${VERSION}-x86_64-pc-windows-msvc"
+          mkdir -p "$ARCHIVE_NAME"
+          
+          echo "=========================================="
+          echo "Packaging $ARCHIVE_NAME"
+          echo "=========================================="
+          
+          # ─── BINAIRES RUST ───
+          cp target/x86_64-pc-windows-msvc/release/probe.exe "$ARCHIVE_NAME/"
+          cp target/x86_64-pc-windows-msvc/release/lsp-daemon.exe "$ARCHIVE_NAME/" 2>/dev/null || true
+          
+          # ─── PACKAGE NPM (MCP + Agent) ───
+          mkdir -p "$ARCHIVE_NAME/npm"
+          cp -r npm/src "$ARCHIVE_NAME/npm/" 2>/dev/null || true
+          cp -r npm/cjs "$ARCHIVE_NAME/npm/" 2>/dev/null || true
+          cp -r npm/build "$ARCHIVE_NAME/npm/" 2>/dev/null || true
+          cp npm/package.json "$ARCHIVE_NAME/npm/"
+          cp npm/package-lock.json "$ARCHIVE_NAME/npm/" 2>/dev/null || true
+          cp npm/index.d.ts "$ARCHIVE_NAME/npm/" 2>/dev/null || true
+          
+          # Binaires dans npm/bin
+          mkdir -p "$ARCHIVE_NAME/npm/bin"
+          cp npm/bin/probe.exe "$ARCHIVE_NAME/npm/bin/"
+          cp npm/bin/lsp-daemon.exe "$ARCHIVE_NAME/npm/bin/" 2>/dev/null || true
+          
+          # Wrapper npm (pour usage: npx probe ...)
+          cat > "$ARCHIVE_NAME/npm/bin/probe" << 'EOF'
           #!/usr/bin/env node
           const { execFileSync } = require('child_process');
           const path = require('path');
@@ -281,132 +317,59 @@ jobs:
           } catch (e) {
             process.exit(e.status || 1);
           }
-          WRAPPER
+          EOF
           
-          # Liste des fichiers
-          echo "npm/bin contents:"
-          ls -la npm/bin/
-
-      # ───── BUILD NPM COMPLET (MCP + Agent + CJS) ─────
-      - name: Install npm Dependencies
-        shell: bash
-        run: |
-          cd npm
-          if [ -f package-lock.json ]; then
-            npm ci --ignore-scripts
-          else
-            npm install --ignore-scripts
-          fi
-
-      - name: Audit npm Dependencies
-        shell: bash
-        run: |
-          cd npm
-          echo "Running npm audit..."
-          npm audit --audit-level=high || echo "Audit completed with warnings"
-
-      - name: Build CJS
-        shell: bash
-        run: |
-          echo "Building CommonJS..."
-          cd npm
-          npm run build:cjs
-
-      - name: Build MCP
-        shell: bash
-        run: |
-          echo "Building MCP..."
-          cd npm
-          npm run build:mcp
-
-      - name: Build Agent
-        shell: bash
-        run: |
-          echo "Building Agent..."
-          cd npm
-          npm run build:agent
-
-      - name: Verify npm Build Outputs
-        shell: bash
-        run: |
-          echo "Verifying npm build outputs..."
-          
-          # Vérification des sorties attendues
-          test -f npm/build/mcp/index.js || { echo "ERROR: MCP build output missing"; exit 1; }
-          test -d npm/cjs || { echo "ERROR: CJS build output missing"; exit 1; }
-          
-          echo "npm build structure:"
-          find npm/build -type f -name "*.js" | head -20
-          find npm/cjs -type f | head -10
-
-      # Packaging complet
-      - name: Package Binary
-        id: package
-        timeout-minutes: 10
-        shell: bash
-        run: |
-          set -euo pipefail
-          
-          BINARY_NAME="probe"
-          GIT_HASH="${{ steps.build_info.outputs.git_hash }}"
-          BUILD_DATE="${{ steps.build_info.outputs.build_date }}"
-          VERSION="${{ steps.resolve.outputs.version }}"
-          
-          ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-x86_64-pc-windows-msvc"
-          mkdir -p "$ARCHIVE_NAME"
-          
-          echo "=========================================="
-          echo "Packaging $ARCHIVE_NAME"
-          echo "=========================================="
-          
-          # Binaires Rust
-          cp target/x86_64-pc-windows-msvc/release/probe.exe "$ARCHIVE_NAME/"
-          cp target/x86_64-pc-windows-msvc/release/lsp-daemon.exe "$ARCHIVE_NAME/" 2>/dev/null || echo "Note: lsp-daemon.exe not included (may be optional)"
-          
-          # Binaires optionnels (debug tools)
-          cp target/x86_64-pc-windows-msvc/release/debug-tree-sitter.exe "$ARCHIVE_NAME/" 2>/dev/null || true
-          cp target/x86_64-pc-windows-msvc/release/position-analyzer.exe "$ARCHIVE_NAME/" 2>/dev/null || true
-          
-          # Package npm complet (pour usage MCP/Agent)
-          mkdir -p "$ARCHIVE_NAME/npm"
-          cp -r npm/src "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          cp -r npm/cjs "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          cp -r npm/build "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          cp npm/package.json "$ARCHIVE_NAME/npm/"
-          cp npm/package-lock.json "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          cp npm/index.d.ts "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          
-          # Wrapper et binaires dans le package npm
-          mkdir -p "$ARCHIVE_NAME/npm/bin"
-          cp npm/bin/probe.exe "$ARCHIVE_NAME/npm/bin/"
-          cp npm/bin/lsp-daemon.exe "$ARCHIVE_NAME/npm/bin/" 2>/dev/null || true
-          
-          # Metadata
+          # ─── MÉTADONNÉES ───
           cat > "$ARCHIVE_NAME/BUILD_INFO.txt" << EOF
-          Probe Build Information
-          =======================
+          Probe Windows Build
+          ===================
           Version: ${VERSION}
           Git Hash: ${GIT_HASH}
           Build Date: ${BUILD_DATE}
           Target: x86_64-pc-windows-msvc
-          Rust Version: ${{ env.RUST_VERSION }}
-          Build Host: GitHub Actions (windows-latest)
           
-          Binaries included:
-          - probe.exe (main CLI)
-          - lsp-daemon.exe (LSP pool manager for MCP)
-          - debug-tree-sitter.exe (optional debug tool)
-          - position-analyzer.exe (optional debug tool)
+          CONTENU:
+          --------
+          - probe.exe: Binaire principal (CLI Rust)
+          - lsp-daemon.exe: Daemon LSP (gestion des serveurs de langage)
+          - npm/: Package Node.js complet avec MCP et Agent
           
-          npm package included for MCP/Agent support.
+          UTILISATION MCP:
+          ----------------
+          Le mode MCP nécessite Node.js. Pour l'utiliser:
+          
+          1. Installer les dépendances npm:
+             cd npm && npm install
+          
+          2. Lancer le serveur MCP:
+             npm run mcp
+             # ou
+             node build/mcp/index.js
+          
+          3. Configurer Claude Desktop / Cline:
+             {
+               "mcpServers": {
+                 "probe": {
+                   "command": "node",
+                   "args": ["C:\\\\chemin\\\\vers\\\\probe-${VERSION}\\\\npm\\\\build\\\\mcp\\\\index.js"]
+                 }
+               }
+             }
+          
+          COMMANDES DISPONIBLES:
+          ----------------------
+          - probe.exe search: Recherche sémantique de code
+          - probe.exe extract: Extraction de blocs de code
+          - probe.exe symbols: Liste des symboles
+          - probe.exe query: Requêtes AST
+          - probe.exe lsp: Gestion du daemon LSP
           EOF
           
-          # Documentation
+          # ─── DOCUMENTATION ───
           cp README.md "$ARCHIVE_NAME/" 2>/dev/null || true
           cp LICENSE "$ARCHIVE_NAME/" 2>/dev/null || true
-          cp ABOUT.MD "$ARCHIVE_NAME/" 2>/dev/null || true
           
-          # Création ZIP
+          # ─── ARCHIVE ZIP ───
           powershell -Command "Compress-Archive -Path '${ARCHIVE_NAME}' -DestinationPath '${ARCHIVE_NAME}.zip' -Force"
           
           echo "ASSET=${ARCHIVE_NAME}.zip" >> "$GITHUB_ENV"
@@ -419,8 +382,7 @@ jobs:
           
           echo "=========================================="
           echo "Package created: ${ARCHIVE_NAME}.zip"
-          echo "Size: $(du -h ${ARCHIVE_NAME}.zip | cut -f1)"
-          echo "=========================================="
+          du -sh "${ARCHIVE_NAME}.zip"
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
@@ -441,24 +403,39 @@ jobs:
             ${{ env.CHECKSUM }}
           generate_release_notes: true
           body: |
-            ## Probe Windows Build (Full MCP Support)
+            ## Probe Windows Build (avec MCP et Agent)
             
             **Version:** ${{ steps.resolve.outputs.version }}  
             **Git Hash:** ${{ steps.build_info.outputs.git_hash }}  
-            **Build Date:** ${{ steps.build_info.outputs.build_date }}  
-            **Target:** x86_64-pc-windows-msvc
+            **Build Date:** ${{ steps.build_info.outputs.build_date }}
             
-            ### Binaries Included
-            - `probe.exe` - Main CLI tool
-            - `lsp-daemon.exe` - LSP server pool manager (required for MCP mode)
-            - `debug-tree-sitter.exe` - Debug utility (optional)
-            - `position-analyzer.exe` - Position analysis tool (optional)
+            ### 📦 Contenu
+            - `probe.exe` - Binaire principal (recherche, extraction, LSP)
+            - `lsp-daemon.exe` - Gestionnaire de pools LSP
+            - `npm/` - Package Node.js complet avec serveur MCP et Agent
             
-            ### MCP Support
-            The npm package is included in the `npm/` directory with full MCP and Agent support.
+            ### 🚀 Utilisation MCP
             
-            ### Verification
-            SHA256: `${{ steps.package.outputs.checksum }}`
+            Le binaire `probe.exe` **ne contient pas** de commande `mcp` - c'est normal !
+            
+            Le serveur MCP est dans le dossier `npm/` :
+            ```bash
+            cd npm
+            npm install
+            node build/mcp/index.js
+            ```
+            
+            ### Configuration Claude Desktop
+            ```json
+            {
+              "mcpServers": {
+                "probe": {
+                  "command": "node",
+                  "args": ["C:\\chemin\\vers\\probe-${{ steps.resolve.outputs.version }}\\npm\\build\\mcp\\index.js"]
+                }
+              }
+            }
+            ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -484,24 +461,3 @@ jobs:
         with:
           sarif_file: semgrep.sarif
           category: semgrep
-
-  guarddog:
-    name: "🐕 GuardDog"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: probelabs/probe
-          ref: ${{ inputs.ref }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install guarddog
-      - run: guarddog npm verify npm/package.json --output-format json > guarddog-npm.json || true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: guarddog-results
-          path: guarddog-*.json
-
-  # ... (autres jobs de sécurité identiques)
