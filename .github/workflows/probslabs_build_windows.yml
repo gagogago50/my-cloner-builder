@@ -1,44 +1,28 @@
-name: Build Windows Binary & Security Scan (Probe)
+name: Build Probe Windows with MCP Agent for KiloCode
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Branche, tag ou SHA de probelabs/probe à builder'
+        description: 'Branche/tag de probelabs/probe'
         type: string
         default: 'main'
       version:
-        description: 'Forcer une version (laisser vide pour auto-détection via git describe)'
+        description: 'Version (laisser vide pour auto-détection)'
         type: string
         default: ''
-      create_release:
-        description: 'Créer une release GitHub dans CE dépôt avec le binaire'
-        type: boolean
-        default: false
-
-permissions:
-  contents: write
-  security-events: write
-  actions: read
 
 env:
   SOURCE_REPO: probelabs/probe
-  RUST_VERSION: "stable"  # ← Utiliser stable pour éviter les problèmes de version
+  RUST_VERSION: "stable"
 
 jobs:
-  # ───────────────────────────────────────────────────────────────────────────
-  # JOB 1 : BUILD WINDOWS COMPLET (Rust + npm/MCP/Agent)
-  # ───────────────────────────────────────────────────────────────────────────
   build-windows:
-    name: "🏗️ Build Windows x86_64 (Full MCP)"
+    name: "🏗️ Build Windows + MCP Agent"
     runs-on: windows-latest
     timeout-minutes: 120
     outputs:
       version: ${{ steps.resolve.outputs.version }}
-      git_hash: ${{ steps.build_info.outputs.git_hash }}
-      build_date: ${{ steps.build_info.outputs.build_date }}
-      asset: ${{ steps.package.outputs.asset }}
-      checksum: ${{ steps.package.outputs.checksum }}
     steps:
       - name: Checkout probe source
         uses: actions/checkout@v4
@@ -47,86 +31,16 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
 
-      # Vérification des prérequis
-      - name: Check Prerequisites
-        id: prereq
-        shell: pwsh
-        run: |
-          Write-Host "==========================================="
-          Write-Host "Probe Windows Build - Prerequisites Check"
-          Write-Host "==========================================="
-          
-          # Check Rust
-          Write-Host "[1/3] Checking Rust..."
-          try {
-            $rustVersion = rustc --version 2>&1
-            Write-Host "  ✓ Rust: $rustVersion"
-          } catch {
-            Write-Error "✗ Rust not found"
-            exit 1
-          }
-          
-          # Check Node.js
-          Write-Host "[2/3] Checking Node.js..."
-          try {
-            $nodeVersion = node --version 2>&1
-            Write-Host "  ✓ Node.js: $nodeVersion"
-          } catch {
-            Write-Host "  ℹ Node.js will be installed"
-          }
-          
-          # Check VS Build Tools
-          Write-Host "[3/3] Checking VS Build Tools..."
-          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (Test-Path $vsWhere) {
-            Write-Host "  ✓ Visual Studio found"
-          } else {
-            Write-Warning "  ⚠ VS Build Tools may be needed"
-          }
-          
-          Write-Host "==========================================="
-
-      # Installation Rust stable
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-          components: rustfmt, clippy
 
-      # Node 22 pour npm build
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: npm/package.json
 
-      # Affichage des versions
-      - name: Show Versions
-        shell: bash
-        run: |
-          echo "Rust: $(rustc --version)"
-          echo "Cargo: $(cargo --version)"
-          echo "Node: $(node --version)"
-          echo "npm: $(npm --version)"
-
-      # Cache Rust
-      - name: Setup Rust Cache
-        uses: actions/cache@v4
-        timeout-minutes: 10
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain', 'rust-toolchain.toml') || 'stable' }}
-          restore-keys: |
-            ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}-
-            ${{ runner.os }}-cargo-
-
-      # Résolution version
       - name: Resolve Version
         id: resolve
         shell: bash
@@ -140,331 +54,192 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
-      # Capture métadonnées
-      - name: Capture Build Info
-        id: build_info
-        shell: bash
-        run: |
-          GIT_HASH=$(git rev-parse --short HEAD)
-          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          echo "git_hash=$GIT_HASH" >> "$GITHUB_OUTPUT"
-          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
-
-      # Configuration Cargo Windows
-      - name: Setup Cargo Config
+      # Build Rust (probe.exe + lsp-daemon.exe)
+      - name: Build Rust Workspace
+        timeout-minutes: 60
         shell: bash
         run: |
           mkdir -p .cargo
           cat > .cargo/config.toml << 'EOF'
           [target.x86_64-pc-windows-msvc]
-          rustflags = [
-            "-C", "target-feature=+crt-static",
-            "-C", "link-args=/DEBUG:NONE",
-            "-C", "link-args=/NOLOGO"
-          ]
+          rustflags = ["-C", "target-feature=+crt-static"]
           EOF
-
-      # BUILD RUST - Workspace complet
-      - name: Build Rust Workspace
-        id: rust_build
-        timeout-minutes: 60
-        shell: bash
-        run: |
-          echo "=========================================="
-          echo "Building Rust Workspace"
-          echo "=========================================="
           
-          # Build tout le workspace (probe + lsp-daemon + autres)
           cargo build --release --target x86_64-pc-windows-msvc
           
           echo "Built binaries:"
-          ls -la target/x86_64-pc-windows-msvc/release/*.exe || true
+          ls -la target/x86_64-pc-windows-msvc/release/*.exe
 
-      # Vérification binaires Rust
-      - name: Verify Rust Binaries
-        shell: pwsh
-        run: |
-          $targetDir = "target/x86_64-pc-windows-msvc/release"
-          
-          $mainBinary = "$targetDir/probe.exe"
-          if (Test-Path $mainBinary) {
-            $size = (Get-Item $mainBinary).Length / 1MB
-            Write-Host "✓ probe.exe ($([math]::Round($size,2)) MB)"
-            
-            # Test exécution
-            & $mainBinary --version
-          } else {
-            Write-Error "✗ probe.exe not found!"
-            exit 1
-          }
-          
-          # Vérifier lsp-daemon (optionnel mais recommandé)
-          $lspDaemon = "$targetDir/lsp-daemon.exe"
-          if (Test-Path $lspDaemon) {
-            Write-Host "✓ lsp-daemon.exe found"
-          } else {
-            Write-Warning "⚠ lsp-daemon.exe not found (may be built as lib)"
-          }
-
-      # ───── PRÉPARATION NPM (copie des binaires) ─────
-      - name: Prepare npm Binaries
+      # Build MCP Agent (dans mcp-agent/)
+      - name: Build MCP Agent
         shell: bash
         run: |
-          echo "Preparing npm binaries..."
+          cd mcp-agent
           
-          mkdir -p npm/bin
+          # Installer les dépendances
+          npm install
           
-          # Copie des binaires pour le package npm
-          cp target/x86_64-pc-windows-msvc/release/probe.exe npm/bin/probe.exe
-          cp target/x86_64-pc-windows-msvc/release/lsp-daemon.exe npm/bin/ 2>/dev/null || true
+          # Build le agent
+          npm run build
           
-          echo "npm/bin contents:"
-          ls -la npm/bin/
+          echo "MCP Agent built:"
+          ls -la build/
 
-      # ───── BUILD NPM COMPLET (CJS + MCP + Agent) ─────
-      - name: Install npm Dependencies
+      # Package complet pour KiloCode CLI
+      - name: Package for KiloCode CLI
         shell: bash
         run: |
-          cd npm
-          # Vérifier si package-lock.json existe
-          if [ -f package-lock.json ]; then
-            echo "Using npm ci (lockfile exists)"
-            npm ci --ignore-scripts
-          else
-            echo "Using npm install (no lockfile)"
-            npm install --ignore-scripts
-          fi
-
-      - name: Build npm (CJS)
-        shell: bash
-        run: |
-          echo "Building CJS..."
-          cd npm
-          npm run build:cjs
-
-      - name: Build npm (MCP)
-        shell: bash
-        run: |
-          echo "Building MCP..."
-          cd npm
-          npm run build:mcp
-
-      - name: Build npm (Agent)
-        shell: bash
-        run: |
-          echo "Building Agent..."
-          cd npm
-          npm run build:agent
-
-      - name: Verify npm Build
-        shell: bash
-        run: |
-          echo "Verifying npm build..."
-          
-          # Vérifier les sorties
-          test -f npm/build/mcp/index.js || { echo "ERROR: MCP build missing"; exit 1; }
-          test -d npm/cjs || { echo "ERROR: CJS build missing"; exit 1; }
-          
-          echo "✓ npm build verified"
-          echo "MCP files:"
-          find npm/build -name "*.js" | head -5
-          echo "CJS files:"
-          find npm/cjs -name "*.js" | head -5
-
-      # Packaging complet
-      - name: Package Binary
-        id: package
-        timeout-minutes: 10
-        shell: bash
-        run: |
-          set -euo pipefail
-          
           VERSION="${{ steps.resolve.outputs.version }}"
-          GIT_HASH="${{ steps.build_info.outputs.git_hash }}"
-          BUILD_DATE="${{ steps.build_info.outputs.build_date }}"
-          
-          ARCHIVE_NAME="probe-${VERSION}-x86_64-pc-windows-msvc"
-          mkdir -p "$ARCHIVE_NAME"
-          
-          echo "=========================================="
-          echo "Packaging $ARCHIVE_NAME"
-          echo "=========================================="
+          PKG_NAME="probe-${VERSION}-windows-kilocode"
+          mkdir -p "$PKG_NAME"
           
           # ─── BINAIRES RUST ───
-          cp target/x86_64-pc-windows-msvc/release/probe.exe "$ARCHIVE_NAME/"
-          cp target/x86_64-pc-windows-msvc/release/lsp-daemon.exe "$ARCHIVE_NAME/" 2>/dev/null || true
+          cp target/x86_64-pc-windows-msvc/release/probe.exe "$PKG_NAME/"
+          cp target/x86_64-pc-windows-msvc/release/lsp-daemon.exe "$PKG_NAME/" 2>/dev/null || true
           
-          # ─── PACKAGE NPM (MCP + Agent) ───
-          mkdir -p "$ARCHIVE_NAME/npm"
-          cp -r npm/src "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          cp -r npm/cjs "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          cp -r npm/build "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          cp npm/package.json "$ARCHIVE_NAME/npm/"
-          cp npm/package-lock.json "$ARCHIVE_NAME/npm/" 2>/dev/null || true
-          cp npm/index.d.ts "$ARCHIVE_NAME/npm/" 2>/dev/null || true
+          # ─── MCP AGENT ───
+          mkdir -p "$PKG_NAME/mcp-agent"
+          cp -r mcp-agent/build "$PKG_NAME/mcp-agent/"
+          cp mcp-agent/package.json "$PKG_NAME/mcp-agent/"
+          cp mcp-agent/.env.example "$PKG_NAME/mcp-agent/" 2>/dev/null || true
           
-          # Binaires dans npm/bin
-          mkdir -p "$ARCHIVE_NAME/npm/bin"
-          cp npm/bin/probe.exe "$ARCHIVE_NAME/npm/bin/"
-          cp npm/bin/lsp-daemon.exe "$ARCHIVE_NAME/npm/bin/" 2>/dev/null || true
-          
-          # Wrapper npm (pour usage: npx probe ...)
-          cat > "$ARCHIVE_NAME/npm/bin/probe" << 'EOF'
-          #!/usr/bin/env node
-          const { execFileSync } = require('child_process');
-          const path = require('path');
-          const os = require('os');
-          
-          const isWindows = os.platform() === 'win32';
-          const binaryName = isWindows ? 'probe.exe' : 'probe';
-          const binaryPath = path.join(__dirname, binaryName);
-          
-          try {
-            execFileSync(binaryPath, process.argv.slice(2), { stdio: 'inherit' });
-          } catch (e) {
-            process.exit(e.status || 1);
+          # ─── CONFIG KILOCODE ───
+          cat > "$PKG_NAME/kilo-config-example.jsonc" << 'EOF'
+          // Configuration pour KiloCode CLI
+          // Copier ce fichier dans ~/.config/kilo/kilo.jsonc ou ./kilo.jsonc
+          {
+            "mcp": {
+              "probe-agent": {
+                "type": "local",
+                "command": ["node", "C:\\\\Tools\\\\probe\\\\mcp-agent\\\\build\\\\index.js"],
+                "environment": {
+                  "ANTHROPIC_API_KEY": "sk-ant-xxxxx",
+                  "ALLOWED_FOLDERS": "C:\\\\Users\\\\${env:USERNAME}\\\\Projects",
+                  "FORCE_PROVIDER": "anthropic"
+                },
+                "enabled": true,
+                "timeout": 120000
+              }
+            },
+            "permission": {
+              "probe-agent_search_code": "allow"
+            }
           }
           EOF
           
-          # ─── MÉTADONNÉES ───
-          cat > "$ARCHIVE_NAME/BUILD_INFO.txt" << EOF
-          Probe Windows Build
-          ===================
-          Version: ${VERSION}
-          Git Hash: ${GIT_HASH}
-          Build Date: ${BUILD_DATE}
-          Target: x86_64-pc-windows-msvc
-          
-          CONTENU:
-          --------
-          - probe.exe: Binaire principal (CLI Rust)
-          - lsp-daemon.exe: Daemon LSP (gestion des serveurs de langage)
-          - npm/: Package Node.js complet avec MCP et Agent
-          
-          UTILISATION MCP:
-          ----------------
-          Le mode MCP nécessite Node.js. Pour l'utiliser:
-          
-          1. Installer les dépendances npm:
-             cd npm && npm install
-          
-          2. Lancer le serveur MCP:
-             npm run mcp
-             # ou
-             node build/mcp/index.js
-          
-          3. Configurer Claude Desktop / Cline:
-             {
-               "mcpServers": {
-                 "probe": {
-                   "command": "node",
-                   "args": ["C:\\\\chemin\\\\vers\\\\probe-${VERSION}\\\\npm\\\\build\\\\mcp\\\\index.js"]
-                 }
-               }
-             }
-          
-          COMMANDES DISPONIBLES:
-          ----------------------
-          - probe.exe search: Recherche sémantique de code
-          - probe.exe extract: Extraction de blocs de code
-          - probe.exe symbols: Liste des symboles
-          - probe.exe query: Requêtes AST
-          - probe.exe lsp: Gestion du daemon LSP
+          # ─── SCRIPT DE LANCEMENT WINDOWS ───
+          cat > "$PKG_NAME/start-mcp-agent.bat" << 'EOF'
+          @echo off
+          echo Starting Probe MCP Agent...
+          echo.
+          echo Configuration requise:
+          echo 1. Copier kilo-config-example.jsonc vers kilo.jsonc
+          echo 2. Editer et ajouter votre ANTHROPIC_API_KEY
+          echo 3. Lancer: node mcp-agent\build\index.js
+          echo.
+          cd /d "%~dp0"
+          node mcp-agent\build\index.js %*
           EOF
           
           # ─── DOCUMENTATION ───
-          cp README.md "$ARCHIVE_NAME/" 2>/dev/null || true
-          cp LICENSE "$ARCHIVE_NAME/" 2>/dev/null || true
+          cat > "$PKG_NAME/README-KILOCODE.md" << 'EOF'
+          # Probe pour KiloCode CLI (Windows)
           
-          # ─── ARCHIVE ZIP ───
-          powershell -Command "Compress-Archive -Path '${ARCHIVE_NAME}' -DestinationPath '${ARCHIVE_NAME}.zip' -Force"
+          ## 📦 Contenu
+          - `probe.exe` - CLI Rust (search, extract, symbols, query, lsp)
+          - `lsp-daemon.exe` - Daemon LSP
+          - `mcp-agent/` - Serveur MCP avec Agent IA
           
-          echo "ASSET=${ARCHIVE_NAME}.zip" >> "$GITHUB_ENV"
-          echo "asset=${ARCHIVE_NAME}.zip" >> "$GITHUB_OUTPUT"
+          ## 🚀 Installation KiloCode CLI
           
-          # Checksum
-          certutil -hashfile "${ARCHIVE_NAME}.zip" SHA256 | grep -v "^SHA256" | grep -v "^CertUtil" | tr -d ' ' > "${ARCHIVE_NAME}.zip.sha256"
-          echo "CHECKSUM=${ARCHIVE_NAME}.zip.sha256" >> "$GITHUB_ENV"
-          echo "checksum=${ARCHIVE_NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
+          ### 1. Configurer le serveur MCP
           
-          echo "=========================================="
-          echo "Package created: ${ARCHIVE_NAME}.zip"
-          du -sh "${ARCHIVE_NAME}.zip"
+          Editer `kilo-config-example.jsonc` et copier dans :
+          - Global : `%USERPROFILE%\.config\kilo\kilo.jsonc`
+          - Projet : `.kilo\kilo.jsonc` (dans votre projet)
+          
+          ### 2. Variables d'environnement requises
+          
+          ```powershell
+          # PowerShell
+          $env:ANTHROPIC_API_KEY = "sk-ant-xxxxx"
+          # ou OpenAI
+          $env:OPENAI_API_KEY = "sk-..."
+          ```
+          
+          ### 3. Lancer le serveur MCP
+          
+          ```batch
+          start-mcp-agent.bat
+          ```
+          
+          Ou directement :
+          ```batch
+          node mcp-agent\build\index.js
+          ```
+          
+          ## 🛠️ Utilisation dans KiloCode
+          
+          Une fois configuré, Kilo Code peut utiliser l'outil :
+          ```
+          search_code
+          ```
+          
+          Exemples de requêtes :
+          - "Comment fonctionne la recherche dans ce codebase ?"
+          - "Explique-moi l'architecture du projet"
+          - "Trouve les bugs potentiels dans src/"
+          
+          ## 🔧 Commandes probe.exe (standalone)
+          
+          ```batch
+          probe.exe search "pattern" ./src
+          probe.exe extract file.rs:10-20
+          probe.exe symbols ./src
+          probe.exe query "fn $name()" ./src
+          probe.exe lsp status
+          ```
+          
+          ## 📚 Documentation
+          - https://probelabs.com/probe/
+          - https://kilo.ai/docs/automate/mcp/using-in-kilo-code
+          EOF
+          
+          # ─── ARCHIVE ───
+          powershell -Command "Compress-Archive -Path '${PKG_NAME}' -DestinationPath '${PKG_NAME}.zip' -Force"
+          
+          echo "ASSET=${PKG_NAME}.zip" >> "$GITHUB_ENV"
+          echo "asset=${PKG_NAME}.zip" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Build Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: probe-windows-x86_64
-          path: |
-            ${{ env.ASSET }}
-            ${{ env.CHECKSUM }}
-          retention-days: 7
+          name: probe-windows-kilocode
+          path: ${{ env.ASSET }}
 
-      - name: Create GitHub Release
+      - name: Create Release
         if: ${{ inputs.create_release }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          files: |
-            ${{ env.ASSET }}
-            ${{ env.CHECKSUM }}
-          generate_release_notes: true
+          files: ${{ env.ASSET }}
           body: |
-            ## Probe Windows Build (avec MCP et Agent)
+            ## Probe Windows pour KiloCode CLI
             
-            **Version:** ${{ steps.resolve.outputs.version }}  
-            **Git Hash:** ${{ steps.build_info.outputs.git_hash }}  
-            **Build Date:** ${{ steps.build_info.outputs.build_date }}
+            **⚠️ Important :** Le binaire `probe.exe` n'a PAS de commande `mcp` ou `agent`.
             
-            ### 📦 Contenu
-            - `probe.exe` - Binaire principal (recherche, extraction, LSP)
-            - `lsp-daemon.exe` - Gestionnaire de pools LSP
-            - `npm/` - Package Node.js complet avec serveur MCP et Agent
+            Le **MCP Agent** est un serveur Node.js séparé dans le dossier `mcp-agent/`.
             
-            ### 🚀 Utilisation MCP
+            ### Installation rapide
             
-            Le binaire `probe.exe` **ne contient pas** de commande `mcp` - c'est normal !
+            1. Extraire le ZIP
+            2. Copier `kilo-config-example.jsonc` vers `kilo.jsonc`
+            3. Ajouter votre `ANTHROPIC_API_KEY`
+            4. Lancer : `node mcp-agent/build/index.js`
             
-            Le serveur MCP est dans le dossier `npm/` :
-            ```bash
-            cd npm
-            npm install
-            node build/mcp/index.js
+            ### Structure
             ```
-            
-            ### Configuration Claude Desktop
-            ```json
-            {
-              "mcpServers": {
-                "probe": {
-                  "command": "node",
-                  "args": ["C:\\chemin\\vers\\probe-${{ steps.resolve.outputs.version }}\\npm\\build\\mcp\\index.js"]
-                }
-              }
-            }
+            probe.exe          → CLI Rust (search, extract, lsp)
+            mcp-agent/         → Serveur MCP avec IA
+            └── build/index.js → Point d'entrée MCP
             ```
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # JOBS DE SÉCURITÉ (inchangés)
-  # ───────────────────────────────────────────────────────────────────────────
-  semgrep:
-    name: "🔎 Semgrep"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: probelabs/probe
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install semgrep
-      - run: semgrep scan --config "p/default" --config "p/secrets" --config "p/rust" --sarif --output semgrep.sarif . || true
-      - uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: semgrep.sarif
-          category: semgrep
