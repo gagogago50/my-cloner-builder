@@ -31,18 +31,21 @@ jobs:
           cache: 'npm'
           cache-dependency-path: npm/package-lock.json
           
-      # Setup Rust
+      # Setup Rust (CORRIGÉ)
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           
       # Build le binaire Rust probe
       - name: Build Probe binary
+        shell: bash
         run: |
           cargo build --release
           mkdir -p npm/bin
           cp target/release/probe.exe npm/bin/probe.exe
+          echo "Probe binary built:"
+          ls -la npm/bin/
           
       # Installer les dépendances npm
       - name: Install npm dependencies
@@ -62,24 +65,36 @@ jobs:
           # Créer le dossier de distribution
           mkdir -p dist-package/probe-mcp-agent
           
-          # Copier les fichiers buildés
-          cp -r dist/* dist-package/probe-mcp-agent/ 2>/dev/null || cp -r build/* dist-package/probe-mcp-agent/ 2>/dev/null || echo "No dist/build folder"
+          # Copier les fichiers buildés (dist ou build)
+          if [ -d "dist" ]; then
+            cp -r dist/* dist-package/probe-mcp-agent/
+            echo "Copied dist/ files"
+          elif [ -d "build" ]; then
+            cp -r build/* dist-package/probe-mcp-agent/
+            echo "Copied build/ files"
+          else
+            echo "Warning: No dist or build folder found"
+            ls -la
+          fi
           
           # Copier le binaire probe
-          cp -r bin dist-package/probe-mcp-agent/ 2>/dev/null || echo "No bin folder"
+          if [ -d "bin" ]; then
+            cp -r bin dist-package/probe-mcp-agent/
+            echo "Copied bin/ folder"
+          fi
           
           # Copier les fichiers essentiels
           cp package.json dist-package/probe-mcp-agent/
-          cp package-lock.json dist-package/probe-mcp-agent/ 2>/dev/null || echo "No package-lock.json"
-          cp README.md dist-package/probe-mcp-agent/ 2>/dev/null || echo "No README.md"
-          cp LICENSE dist-package/probe-mcp-agent/ 2>/dev/null || echo "No LICENSE"
+          [ -f "package-lock.json" ] && cp package-lock.json dist-package/probe-mcp-agent/
+          [ -f "README.md" ] && cp README.md dist-package/probe-mcp-agent/
+          [ -f "LICENSE" ] && cp LICENSE dist-package/probe-mcp-agent/
           
-          # Copier les sources si nécessaire pour debug/dev
-          cp -r src dist-package/probe-mcp-agent/ 2>/dev/null || echo "No src folder"
+          # Copier les sources (optionnel)
+          [ -d "src" ] && cp -r src dist-package/probe-mcp-agent/
           
-          # Copier les fichiers de configuration
-          cp .env.example dist-package/probe-mcp-agent/ 2>/dev/null || echo "No .env.example"
-          cp tsconfig.json dist-package/probe-mcp-agent/ 2>/dev/null || echo "No tsconfig.json"
+          # Copier les fichiers de config
+          [ -f ".env.example" ] && cp .env.example dist-package/probe-mcp-agent/
+          [ -f "tsconfig.json" ] && cp tsconfig.json dist-package/probe-mcp-agent/
           
           # Lister le contenu
           echo "=== Distribution package contents ==="
@@ -93,6 +108,7 @@ jobs:
           cd dist-package
           zip -r ../probe-mcp-agent-windows.zip probe-mcp-agent/
           cd ..
+          echo "=== ZIP created ==="
           ls -la probe-mcp-agent-windows.zip
           
       # Upload artifact (fichiers individuels)
@@ -117,7 +133,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
           
-      # Créer une release si c'est un tag
+      # Optionnel: Créer une release si c'est un tag
       - name: Upload to Release (if tagged)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
@@ -131,12 +147,11 @@ jobs:
             - Binaire probe.exe (Rust)
             - MCP Agent (Node.js build)
             - Fichiers de configuration
-            - Sources
             
             Installation:
             1. Dézipper probe-mcp-agent-windows.zip
             2. cd probe-mcp-agent
-            3. npm install --production (optionnel)
-            4. node dist/index.js ou npm start
+            3. npm install --production
+            4. node dist/index.js
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
