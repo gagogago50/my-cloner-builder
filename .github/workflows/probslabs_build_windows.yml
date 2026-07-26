@@ -1,245 +1,142 @@
-name: Build Probe Windows with MCP Agent for KiloCode
+name: Build Probe MCP Agent
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Branche/tag de probelabs/probe'
-        type: string
-        default: 'main'
-      version:
-        description: 'Version (laisser vide pour auto-détection)'
-        type: string
-        default: ''
 
 env:
   SOURCE_REPO: probelabs/probe
-  RUST_VERSION: "stable"
+  RUST_VERSION: stable
 
 jobs:
-  build-windows:
-    name: "🏗️ Build Windows + MCP Agent"
+  build-mcp-agent:
     runs-on: windows-latest
-    timeout-minutes: 120
-    outputs:
-      version: ${{ steps.resolve.outputs.version }}
+    
     steps:
-      - name: Checkout probe source
+      # Checkout du repository Probe
+      - name: Checkout Probe repository
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
+          ref: main
+          
+      # Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
-
-      - name: Resolve Version
-        id: resolve
-        shell: bash
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
-          else
-            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.0.0-$(git rev-parse --short HEAD)")
-          fi
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version: $VERSION"
-
-      # Build Rust (probe.exe + lsp-daemon.exe)
-      - name: Build Rust Workspace
-        timeout-minutes: 60
-        shell: bash
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml << 'EOF'
-          [target.x86_64-pc-windows-msvc]
-          rustflags = ["-C", "target-feature=+crt-static"]
-          EOF
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: npm/package-lock.json
           
-          cargo build --release --target x86_64-pc-windows-msvc
+      # Setup Rust
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
           
-          echo "Built binaries:"
-          ls -la target/x86_64-pc-windows-msvc/release/*.exe
-
-      # Build MCP Agent (dans mcp-agent/)
+      # Build le binaire Rust probe
+      - name: Build Probe binary
+        run: |
+          cargo build --release
+          mkdir -p npm/bin
+          cp target/release/probe.exe npm/bin/probe.exe
+          
+      # Installer les dépendances npm
+      - name: Install npm dependencies
+        working-directory: ./npm
+        run: npm install
+        
+      # Build le MCP agent
       - name: Build MCP Agent
+        working-directory: ./npm
+        run: npm run build
+        
+      # Créer la structure complète pour distribution
+      - name: Prepare distribution package
+        working-directory: ./npm
         shell: bash
         run: |
-          cd mcp-agent
+          # Créer le dossier de distribution
+          mkdir -p dist-package/probe-mcp-agent
           
-          # Installer les dépendances
-          npm install
+          # Copier les fichiers buildés
+          cp -r dist/* dist-package/probe-mcp-agent/ 2>/dev/null || cp -r build/* dist-package/probe-mcp-agent/ 2>/dev/null || echo "No dist/build folder"
           
-          # Build le agent
-          npm run build
+          # Copier le binaire probe
+          cp -r bin dist-package/probe-mcp-agent/ 2>/dev/null || echo "No bin folder"
           
-          echo "MCP Agent built:"
-          ls -la build/
-
-      # Package complet pour KiloCode CLI
-      - name: Package for KiloCode CLI
+          # Copier les fichiers essentiels
+          cp package.json dist-package/probe-mcp-agent/
+          cp package-lock.json dist-package/probe-mcp-agent/ 2>/dev/null || echo "No package-lock.json"
+          cp README.md dist-package/probe-mcp-agent/ 2>/dev/null || echo "No README.md"
+          cp LICENSE dist-package/probe-mcp-agent/ 2>/dev/null || echo "No LICENSE"
+          
+          # Copier les sources si nécessaire pour debug/dev
+          cp -r src dist-package/probe-mcp-agent/ 2>/dev/null || echo "No src folder"
+          
+          # Copier les fichiers de configuration
+          cp .env.example dist-package/probe-mcp-agent/ 2>/dev/null || echo "No .env.example"
+          cp tsconfig.json dist-package/probe-mcp-agent/ 2>/dev/null || echo "No tsconfig.json"
+          
+          # Lister le contenu
+          echo "=== Distribution package contents ==="
+          find dist-package -type f | head -50
+          
+      # Créer le zip
+      - name: Create ZIP artifact
+        working-directory: ./npm
         shell: bash
         run: |
-          VERSION="${{ steps.resolve.outputs.version }}"
-          PKG_NAME="probe-${VERSION}-windows-kilocode"
-          mkdir -p "$PKG_NAME"
+          cd dist-package
+          zip -r ../probe-mcp-agent-windows.zip probe-mcp-agent/
+          cd ..
+          ls -la probe-mcp-agent-windows.zip
           
-          # ─── BINAIRES RUST ───
-          cp target/x86_64-pc-windows-msvc/release/probe.exe "$PKG_NAME/"
-          cp target/x86_64-pc-windows-msvc/release/lsp-daemon.exe "$PKG_NAME/" 2>/dev/null || true
-          
-          # ─── MCP AGENT ───
-          mkdir -p "$PKG_NAME/mcp-agent"
-          cp -r mcp-agent/build "$PKG_NAME/mcp-agent/"
-          cp mcp-agent/package.json "$PKG_NAME/mcp-agent/"
-          cp mcp-agent/.env.example "$PKG_NAME/mcp-agent/" 2>/dev/null || true
-          
-          # ─── CONFIG KILOCODE ───
-          cat > "$PKG_NAME/kilo-config-example.jsonc" << 'EOF'
-          // Configuration pour KiloCode CLI
-          // Copier ce fichier dans ~/.config/kilo/kilo.jsonc ou ./kilo.jsonc
-          {
-            "mcp": {
-              "probe-agent": {
-                "type": "local",
-                "command": ["node", "C:\\\\Tools\\\\probe\\\\mcp-agent\\\\build\\\\index.js"],
-                "environment": {
-                  "ANTHROPIC_API_KEY": "sk-ant-xxxxx",
-                  "ALLOWED_FOLDERS": "C:\\\\Users\\\\${env:USERNAME}\\\\Projects",
-                  "FORCE_PROVIDER": "anthropic"
-                },
-                "enabled": true,
-                "timeout": 120000
-              }
-            },
-            "permission": {
-              "probe-agent_search_code": "allow"
-            }
-          }
-          EOF
-          
-          # ─── SCRIPT DE LANCEMENT WINDOWS ───
-          cat > "$PKG_NAME/start-mcp-agent.bat" << 'EOF'
-          @echo off
-          echo Starting Probe MCP Agent...
-          echo.
-          echo Configuration requise:
-          echo 1. Copier kilo-config-example.jsonc vers kilo.jsonc
-          echo 2. Editer et ajouter votre ANTHROPIC_API_KEY
-          echo 3. Lancer: node mcp-agent\build\index.js
-          echo.
-          cd /d "%~dp0"
-          node mcp-agent\build\index.js %*
-          EOF
-          
-          # ─── DOCUMENTATION ───
-          cat > "$PKG_NAME/README-KILOCODE.md" << 'EOF'
-          # Probe pour KiloCode CLI (Windows)
-          
-          ## 📦 Contenu
-          - `probe.exe` - CLI Rust (search, extract, symbols, query, lsp)
-          - `lsp-daemon.exe` - Daemon LSP
-          - `mcp-agent/` - Serveur MCP avec Agent IA
-          
-          ## 🚀 Installation KiloCode CLI
-          
-          ### 1. Configurer le serveur MCP
-          
-          Editer `kilo-config-example.jsonc` et copier dans :
-          - Global : `%USERPROFILE%\.config\kilo\kilo.jsonc`
-          - Projet : `.kilo\kilo.jsonc` (dans votre projet)
-          
-          ### 2. Variables d'environnement requises
-          
-          ```powershell
-          # PowerShell
-          $env:ANTHROPIC_API_KEY = "sk-ant-xxxxx"
-          # ou OpenAI
-          $env:OPENAI_API_KEY = "sk-..."
-          ```
-          
-          ### 3. Lancer le serveur MCP
-          
-          ```batch
-          start-mcp-agent.bat
-          ```
-          
-          Ou directement :
-          ```batch
-          node mcp-agent\build\index.js
-          ```
-          
-          ## 🛠️ Utilisation dans KiloCode
-          
-          Une fois configuré, Kilo Code peut utiliser l'outil :
-          ```
-          search_code
-          ```
-          
-          Exemples de requêtes :
-          - "Comment fonctionne la recherche dans ce codebase ?"
-          - "Explique-moi l'architecture du projet"
-          - "Trouve les bugs potentiels dans src/"
-          
-          ## 🔧 Commandes probe.exe (standalone)
-          
-          ```batch
-          probe.exe search "pattern" ./src
-          probe.exe extract file.rs:10-20
-          probe.exe symbols ./src
-          probe.exe query "fn $name()" ./src
-          probe.exe lsp status
-          ```
-          
-          ## 📚 Documentation
-          - https://probelabs.com/probe/
-          - https://kilo.ai/docs/automate/mcp/using-in-kilo-code
-          EOF
-          
-          # ─── ARCHIVE ───
-          powershell -Command "Compress-Archive -Path '${PKG_NAME}' -DestinationPath '${PKG_NAME}.zip' -Force"
-          
-          echo "ASSET=${PKG_NAME}.zip" >> "$GITHUB_ENV"
-          echo "asset=${PKG_NAME}.zip" >> "$GITHUB_OUTPUT"
-
-      - name: Upload Artifact
+      # Upload artifact (fichiers individuels)
+      - name: Upload MCP Agent artifact (files)
         uses: actions/upload-artifact@v4
         with:
-          name: probe-windows-kilocode
-          path: ${{ env.ASSET }}
-
-      - name: Create Release
-        if: ${{ inputs.create_release }}
-        uses: softprops/action-gh-release@v2
+          name: probe-mcp-agent-files
+          path: |
+            npm/dist/**/*
+            npm/bin/**/*
+            npm/package.json
+            npm/README.md
+          retention-days: 30
+          if-no-files-found: warn
+          
+      # Upload artifact (ZIP complet)
+      - name: Upload MCP Agent artifact (ZIP)
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ env.VERSION }}
-          files: ${{ env.ASSET }}
+          name: probe-mcp-agent-windows-complete
+          path: npm/probe-mcp-agent-windows.zip
+          retention-days: 30
+          if-no-files-found: error
+          
+      # Créer une release si c'est un tag
+      - name: Upload to Release (if tagged)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: npm/probe-mcp-agent-windows.zip
+          name: Probe MCP Agent ${{ github.ref_name }} (Windows)
           body: |
-            ## Probe Windows pour KiloCode CLI
+            Build complet du Probe MCP Agent pour Windows
             
-            **⚠️ Important :** Le binaire `probe.exe` n'a PAS de commande `mcp` ou `agent`.
+            Contenu:
+            - Binaire probe.exe (Rust)
+            - MCP Agent (Node.js build)
+            - Fichiers de configuration
+            - Sources
             
-            Le **MCP Agent** est un serveur Node.js séparé dans le dossier `mcp-agent/`.
-            
-            ### Installation rapide
-            
-            1. Extraire le ZIP
-            2. Copier `kilo-config-example.jsonc` vers `kilo.jsonc`
-            3. Ajouter votre `ANTHROPIC_API_KEY`
-            4. Lancer : `node mcp-agent/build/index.js`
-            
-            ### Structure
-            ```
-            probe.exe          → CLI Rust (search, extract, lsp)
-            mcp-agent/         → Serveur MCP avec IA
-            └── build/index.js → Point d'entrée MCP
-            ```
+            Installation:
+            1. Dézipper probe-mcp-agent-windows.zip
+            2. cd probe-mcp-agent
+            3. npm install --production (optionnel)
+            4. node dist/index.js ou npm start
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
