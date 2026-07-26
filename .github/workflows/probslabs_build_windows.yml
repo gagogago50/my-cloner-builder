@@ -226,7 +226,14 @@ jobs:
         shell: bash
         run: |
           cd npm
-          npm ci --ignore-scripts
+          # Vérifier si package-lock.json existe
+          if [ -f package-lock.json ]; then
+            echo "Using npm ci (lockfile exists)"
+            npm ci --ignore-scripts
+          else
+            echo "Using npm install (no lockfile)"
+            npm install --ignore-scripts
+          fi
 
       - name: Build npm (CJS)
         shell: bash
