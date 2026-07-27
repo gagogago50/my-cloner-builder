@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       target_ref:
-        description: "Branche, Tag ou Commit à builder (ex: v0.6.0-rc327, main)"
+        description: "Branche, Tag ou Commit à builder et scanner (ex: main, v0.6.0-rc327)"
         required: true
-        default: "v0.6.0-rc327"
+        default: "main"
 
 env:
   SOURCE_REPO: probelabs/probe
@@ -15,7 +15,7 @@ env:
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 1 : BUILD WINDOWS AMD64 (AGENT MCP + LSP)
+  # JOB 1 : BUILD WINDOWS AMD64 (AGENT MCP)
   # ───────────────────────────────────────────────────────────────────────────
   build-mcp-agent:
     name: "🏗️ Build Windows AMD64"
@@ -28,7 +28,7 @@ jobs:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
           
-      - name: Setup Node.js 24 (No Cache)
+      - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -39,45 +39,49 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
           
-      - name: Install npm dependencies
+      - name: Install npm dependencies (without download scripts)
         working-directory: ./npm
-        env:
-          PROBE_SKIP_DOWNLOAD: "true"
-          SKIP_DOWNLOAD: "true"
         run: npm install --ignore-scripts
         
-      - name: Build Node CLI, Agent & MCP
+      # --- ÉTAPE CORRIGÉE ---
+      # On ajoute explicitement node_modules/.bin au PATH avant de lancer le build.
+      # Cela garantit que les sous-processus trouveront 'tsc'.
+      - name: Build Node CLI (with tsc in PATH)
         working-directory: ./npm
+        shell: bash # Forcer bash pour une syntaxe de PATH cohérente
+        run: |
+          # Ajoute le dossier des binaires locaux au PATH pour cette étape
+          export PATH=$(npm bin):$PATH
+          # Lance le script de build, qui peut maintenant trouver 'tsc'
+          npm run build
+          
+      - name: Build Main Probe binary (Rust AMD64)
         shell: bash
         run: |
-          # 1. Build standard
-          npm run build || true
+          cargo build --release --all-features --target x86_64-pc-windows-msvc
+          echo "Main Rust binary (probe.exe) built from source."
           
-          # 2. Exécution des scripts spécifiques que tu as identifiés
-          echo "Building Agent..."
-          [ -f "scripts/build-agent.cjs" ] && node scripts/build-agent.cjs
-          
-          echo "Building MCP..."
-          [ -f "scripts/build-mcp.cjs" ] && node scripts/build-mcp.cjs
-          
-      - name: Build Probe binaries (Rust Workspace)
+      - name: Build LSP Daemon binary (Rust AMD64)
+        working-directory: ./lsp-daemon
         shell: bash
         run: |
-          # --workspace force la compilation de TOUS les projets Rust (incluant le lsp-daemon)
-          cargo build --release --workspace --all-features --target x86_64-pc-windows-msvc
-          echo "Rust binaries built from source."
-          
+          cargo build --release --target x86_64-pc-windows-msvc
+          echo "LSP Daemon binary (lsp-daemon.exe) built from source."
+
       - name: Inject Custom Rust Binaries
         shell: bash
         run: |
           mkdir -p npm/bin
-          # On copie TOUS les exécutables générés (probe.exe, lsp-daemon.exe, etc.)
-          find target/x86_64-pc-windows-msvc/release -maxdepth 1 -name "*.exe" -exec cp {} npm/bin/ \;
+          echo "Copying probe.exe..."
+          cp -f target/x86_64-pc-windows-msvc/release/probe.exe npm/bin/probe.exe
+          echo "Copying lsp-daemon.exe..."
+          cp -f lsp-daemon/target/x86_64-pc-windows-msvc/release/lsp-daemon.exe npm/bin/lsp-daemon.exe
           
-          echo "=== Verified Binaries injected ==="
+          echo "=== Verified Binaries Injected ==="
           ls -la npm/bin/
-          # On affiche l'aide pour vérifier que les commandes sont bien là
-          npm/bin/probe.exe --help || true
+          
+          echo "--- Verifying probe.exe subcommands ---"
+          npm/bin/probe.exe --help
         
       - name: Prepare distribution package
         working-directory: ./npm
@@ -85,17 +89,14 @@ jobs:
         run: |
           mkdir -p dist-package/probe-mcp-agent
           if [ -d "build" ]; then cp -r build dist-package/probe-mcp-agent/; fi
-          if [ -d "dist" ]; then cp -r dist dist-package/probe-mcp-agent/; fi
           if [ -d "bin" ]; then cp -r bin dist-package/probe-mcp-agent/; fi
-          if [ -d "scripts" ]; then cp -r scripts dist-package/probe-mcp-agent/; fi
-          
           cp package.json dist-package/probe-mcp-agent/
           [ -f "package-lock.json" ] && cp package-lock.json dist-package/probe-mcp-agent/
           [ -f "README.md" ] && cp README.md dist-package/probe-mcp-agent/
           [ -f "LICENSE" ] && cp LICENSE dist-package/probe-mcp-agent/
           [ -f ".env.example" ] && cp .env.example dist-package/probe-mcp-agent/
           
-          # Nettoyage pour empêcher tout téléchargement futur par l'utilisateur
+          echo "Removing postinstall script from packaged package.json..."
           cd dist-package/probe-mcp-agent
           npm pkg delete scripts.postinstall
           cd ../..
