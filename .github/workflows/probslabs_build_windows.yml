@@ -6,7 +6,7 @@ on:
       target_ref:
         description: "Branche, Tag ou Commit à builder et scanner (ex: main, v0.6.0-rc327)"
         required: true
-        default: "main"
+        default: "v0.6.0-rc327"
 
 env:
   SOURCE_REPO: probelabs/probe
@@ -14,110 +14,150 @@ env:
   RUST_VERSION: stable
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 : BUILD WINDOWS AMD64 (100% from source)
+  # ───────────────────────────────────────────────────────────────────────────
   build-mcp-agent:
     name: "🏗️ Build Windows AMD64"
     runs-on: windows-latest
-    
+
     steps:
-      # --- NOUVELLE STRATÉGIE DE CHECKOUT ---
-      # Étape 1: Cloner le dépôt avec l'historique complet, en restant sur la branche par défaut.
-      - name: Step 1 - Clone Repository with Full History
+      # actions/checkout gère directement branches, tags ET commits via "ref:".
+      # Pas besoin de checkout manuel en 2 étapes.
+      - name: Checkout du ref cible (tag/branche/commit)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          fetch-depth: 0 # Crucial pour avoir tous les tags
+          ref: ${{ env.PROBE_REF }}
+          fetch-depth: 0
 
-      # Étape 2: Exécuter manuellement 'git checkout' pour basculer sur le bon tag.
-      - name: Step 2 - Manually Checkout Target Ref
-        shell: bash
-        run: |
-          echo "Manually switching to ref: ${{ env.PROBE_REF }}"
-          git checkout ${{ env.PROBE_REF }}
-          echo "Manual checkout complete."
-
-      # L'étape de vérification reste notre juge de paix.
       - name: Verify Final Checkout State
         shell: bash
         run: |
-          echo "✅ Verifying state after manual checkout..."
-          echo "--- Git Describe (verifies tag) ---"
-          git describe --tags --exact-match
+          echo "✅ Verifying state after checkout..."
+          echo "--- Git Describe (tag ou commit) ---"
+          git describe --tags --exact-match 2>/dev/null || git describe --tags 2>/dev/null || git rev-parse --short HEAD
           echo "--- Version in root Cargo.toml ---"
-          grep '^version =' Cargo.toml
-          echo "--- Verifying 'agent' feature exists ---"
-          grep '\[features\]' -A 5 Cargo.toml | grep 'agent'
+          grep -m1 '^version' Cargo.toml
 
-      # ... Le reste du workflow est inchangé ...
+          # ⚠️ IMPORTANT : il n'existe PAS de feature Cargo "agent" dans ce projet
+          # (ni sur v0.6.0-rc327, ni sur main). Les seules features Rust sont :
+          #   default = []  et  bert-reranker = [...]   (reranker BERT optionnel)
+          # Le "mode agent" + le serveur MCP vivent dans le package npm (Node.js) :
+          #   npm/src/agent/*  ->  probe agent   (build/agent/index.js)
+          #   npm/src/mcp/*    ->  probe mcp     (build/mcp/index.js)
+          echo "--- Verifying REAL Cargo features ---"
+          grep -A 8 '^\[features\]' Cargo.toml
+
+          echo "--- Verifying npm Agent & MCP sources exist ---"
+          test -f npm/src/agent/index.js && echo "✅ npm agent source OK (sera bundlé vers build/agent/index.js)"
+          test -f npm/src/mcp/index.ts   && echo "✅ npm MCP source OK (sera compilé vers build/mcp/index.js)"
+          test -f npm/bin/probe          && echo "✅ launcher npm/bin/probe OK (route 'mcp' et 'agent' vers Node, sinon probe.exe)"
+
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
-          
-      - name: Install npm dependencies (without download scripts)
-        working-directory: ./npm
-        run: npm install --ignore-scripts
-        
-      - name: Build Node CLI (with tsc in PATH)
-        working-directory: ./npm
-        shell: bash
-        run: |
-          export PATH=$(npm bin):$PATH
-          npm run build
-          
-      - name: Build Main Probe binary (Rust AMD64)
-        shell: bash
-        run: |
-          cargo build --release --all-features --target x86_64-pc-windows-msvc
-          echo "Main Rust binary (probe.exe) built from source."
-          
-      - name: Build LSP Daemon binary (Rust AMD64)
-        working-directory: ./lsp-daemon
-        shell: bash
-        run: |
-          cargo build --release --all-features --target x86_64-pc-windows-msvc
-          echo "LSP Daemon binary (lsp-daemon.exe) built from source."
 
-      - name: Inject Custom Rust Binaries and Verify
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # PAS de --all-features : cela activerait "bert-reranker" (candle-core/nn/
+      # transformers + tokenizers + hf-hub) = +20/40 min de compilation Windows
+      # pour une fonctionnalité optionnelle inutile avec Kilo Code.
+      # PAS de binaire lsp-daemon non plus : sur ce tag, [[bin]] lsp-daemon est
+      # COMMENTÉ dans lsp-daemon/Cargo.toml ("LSP functionality is now integrated
+      # directly into the main probe binary" -> probe lsp start).
+      - name: Build probe.exe (Rust, from source)
+        shell: bash
+        run: |
+          cargo build --release --bin probe
+          echo "=== Rust binary built from source ==="
+          ls -la target/release/probe.exe
+
+      # Build du package npm :
+      #   npm install --ignore-scripts  -> installe deps SANS lancer le
+      #     postinstall (scripts/postinstall.js) qui télécharge les binaires
+      #     prébuildés (ce que tu ne veux pas).
+      #   npm run build = build:types + build:cjs (esbuild) + build:mcp (tsc)
+      #     + build:agent (esbuild). "npm run" met déjà node_modules/.bin dans
+      #     le PATH -> tsc/esbuild sont trouvés. PAS besoin de "npm bin"
+      #     (supprimé dans npm 11 / Node 24).
+      - name: Install npm dependencies (skip binary downloader)
+        working-directory: ./npm
+        shell: bash
+        run: npm install --ignore-scripts
+
+      - name: Build Node CLI (CJS + MCP + Agent)
+        working-directory: ./npm
+        shell: bash
+        run: |
+          npm run build
+          echo "=== Node build outputs ==="
+          ls -la build/mcp/index.js build/agent/index.js
+          ls -la cjs/
+
+      # Le launcher npm/bin/probe cherche "bin/probe.exe" sur Windows :
+      # on injecte NOTRE binaire compilé from source à cet endroit exact.
+      - name: Inject Custom Rust Binary and Verify
         shell: bash
         run: |
           mkdir -p npm/bin
-          cp -f target/x86_64-pc-windows-msvc/release/probe.exe npm/bin/probe.exe
-          cp -f lsp-daemon/target/x86_64-pc-windows-msvc/release/lsp-daemon.exe npm/bin/lsp-daemon.exe
+          cp -f target/release/probe.exe npm/bin/probe.exe
           echo "=== Binaries Injected ==="
           ls -la npm/bin/
-          
           echo "--- Verifying final binary version ---"
           npm/bin/probe.exe --version
           echo "--- Verifying final binary commands ---"
           npm/bin/probe.exe --help
+
+      # build/mcp/index.js est compilé par tsc (NON bundlé) : il importe à
+      # l'exécution @modelcontextprotocol/sdk, zod, etc. depuis node_modules.
+      # Le bundle agent garde aussi en "external": @modelcontextprotocol/sdk,
+      # @ai-sdk/*, ai, fs-extra, tar, axios, dotenv.
+      # -> le ZIP DOIT contenir node_modules (prod) sinon "probe mcp" / "probe agent"
+      # planteront sur Windows avec "Cannot find package ...".
+      # On prune les devDependencies (esbuild, typescript, jest...) avant packaging.
+      - name: Prune dev dependencies
+        working-directory: ./npm
+        shell: bash
+        run: npm prune --omit=dev
 
       - name: Prepare distribution package
         working-directory: ./npm
         shell: bash
         run: |
           mkdir -p dist-package/probe-mcp-agent
-          if [ -d "build" ]; then cp -r build dist-package/probe-mcp-agent/; fi
-          if [ -d "bin" ]; then cp -r bin dist-package/probe-mcp-agent/; fi
+          cp -r build dist-package/probe-mcp-agent/
+          cp -r bin dist-package/probe-mcp-agent/
+          cp -r src dist-package/probe-mcp-agent/
+          [ -d "cjs" ] && cp -r cjs dist-package/probe-mcp-agent/
+          cp -r node_modules dist-package/probe-mcp-agent/
           cp package.json dist-package/probe-mcp-agent/
           [ -f "package-lock.json" ] && cp package-lock.json dist-package/probe-mcp-agent/
           [ -f "README.md" ] && cp README.md dist-package/probe-mcp-agent/
           [ -f "LICENSE" ] && cp LICENSE dist-package/probe-mcp-agent/
           [ -f ".env.example" ] && cp .env.example dist-package/probe-mcp-agent/
           cd dist-package/probe-mcp-agent
-          npm pkg delete scripts.postinstall
+          # postinstall = téléchargeur de binaires ; prepare/prepack relancent des builds
+          npm pkg delete scripts.postinstall scripts.prepare scripts.prepack
           cd ../..
-          
+
+      # tar (bsdtar, inclus dans Windows) est BEAUCOUP plus rapide que
+      # Compress-Archive quand il y a un node_modules (milliers de fichiers).
       - name: Create ZIP artifact
         working-directory: ./npm
-        shell: pwsh
-        run: Compress-Archive -Path dist-package/probe-mcp-agent -DestinationPath probe-mcp-agent-windows-amd64.zip -Force
-          
+        shell: bash
+        run: tar -a -c -f probe-mcp-agent-windows-amd64.zip -C dist-package probe-mcp-agent
+
       - name: Upload MCP Agent artifact (ZIP)
         uses: actions/upload-artifact@v4
         with:
@@ -126,7 +166,6 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ... (Les jobs de sécurité restent inchangés) ...
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 2 : CLAMAV (Malware Scan)
   # ───────────────────────────────────────────────────────────────────────────
@@ -202,6 +241,8 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 5 : CODEQL
+  # NB: CodeQL ne supporte PAS Rust. Le repo est Rust + JS/TS (pas de Go/Python
+  # significatif) -> matrice réduite à javascript-typescript.
   # ───────────────────────────────────────────────────────────────────────────
   codeql:
     name: "🧬 CodeQL – Analysis"
@@ -209,17 +250,13 @@ jobs:
     continue-on-error: true
     strategy:
       matrix:
-        language: [ 'javascript-typescript', 'python', 'go' ]
+        language: [ 'javascript-typescript' ]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
-      - uses: actions/setup-go@v5
-        if: matrix.language == 'go'
-        with:
-          go-version: '>=1.21'
       - name: Init & Analyze CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -287,9 +324,15 @@ jobs:
           | 🏗️ Build Windows AMD64   | ${{ needs.build-mcp-agent.result }} |
           | 🦠 ClamAV (Malware)      | ${{ needs.clamav.result }} |
           | 🔎 Semgrep               | ${{ needs.semgrep.result }} |
-          | 🐕 GuardDog             | ${{ needs.guarddog.result }} |
-          | 🧬 CodeQL               | ${{ needs.codeql.result }} |
-          | 🛡️ Gitleaks & Bearer     | ${{ needs.gitleaks-bearer.result }} |
-          
+          | 🐕 GuardDog              | ${{ needs.guarddog.result }} |
+          | 🧬 CodeQL                | ${{ needs.codeql.result }} |
+          | 🛡️ Gitleaks & Bearer     | ${{ needs['gitleaks-bearer'].result }} |
+
           ℹ️ **Note:** Les rapports (.sarif, .json, .txt) et le ZIP du build sont téléchargeables dans la section "Artifacts" en bas de cette page.
+
+          ### Utilisation du ZIP sur Windows (Kilo Code)
+          1. Dézipper `probe-mcp-agent-windows-amd64.zip` (ex: `C:\Tools\probe-mcp-agent`)
+          2. Node.js >= 18 requis (22/24 LTS recommandé)
+          3. MCP stdio : `node C:\Tools\probe-mcp-agent\probe-mcp-agent\bin\probe mcp`
+          4. Agent mode : `node C:\Tools\probe-mcp-agent\probe-mcp-agent\bin\probe agent`
           EOF
