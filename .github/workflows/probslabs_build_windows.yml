@@ -19,27 +19,35 @@ jobs:
     runs-on: windows-latest
     
     steps:
-      # --- ÉTAPE CORRIGÉE ---
-      # On ajoute fetch-depth: 0 pour télécharger tout l'historique et tous les tags.
-      - name: Checkout Probe repository (Full History)
+      # --- NOUVELLE STRATÉGIE DE CHECKOUT ---
+      # Étape 1: Cloner le dépôt avec l'historique complet, en restant sur la branche par défaut.
+      - name: Step 1 - Clone Repository with Full History
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.PROBE_REF }}
-          fetch-depth: 0 # C'EST LA CORRECTION CLÉ
+          fetch-depth: 0 # Crucial pour avoir tous les tags
 
-      - name: Verify Checkout Reference
+      # Étape 2: Exécuter manuellement 'git checkout' pour basculer sur le bon tag.
+      - name: Step 2 - Manually Checkout Target Ref
         shell: bash
         run: |
-          echo "✅ Workflow should build ref: ${{ env.PROBE_REF }}"
+          echo "Manually switching to ref: ${{ env.PROBE_REF }}"
+          git checkout ${{ env.PROBE_REF }}
+          echo "Manual checkout complete."
+
+      # L'étape de vérification reste notre juge de paix.
+      - name: Verify Final Checkout State
+        shell: bash
+        run: |
+          echo "✅ Verifying state after manual checkout..."
           echo "--- Git Describe (verifies tag) ---"
-          # Cette commande doit maintenant réussir et afficher le tag
           git describe --tags --exact-match
           echo "--- Version in root Cargo.toml ---"
           grep '^version =' Cargo.toml
           echo "--- Verifying 'agent' feature exists ---"
           grep '\[features\]' -A 5 Cargo.toml | grep 'agent'
 
+      # ... Le reste du workflow est inchangé ...
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
@@ -89,7 +97,6 @@ jobs:
           echo "--- Verifying final binary commands ---"
           npm/bin/probe.exe --help
 
-      # ... Le reste du workflow est inchangé ...
       - name: Prepare distribution package
         working-directory: ./npm
         shell: bash
@@ -118,8 +125,6 @@ jobs:
           path: npm/probe-mcp-agent-windows-amd64.zip
           retention-days: 30
           if-no-files-found: error
-
-  # ... (Les jobs de sécurité restent inchangés) ...
 
   # ... (Les jobs de sécurité restent inchangés) ...
   # ───────────────────────────────────────────────────────────────────────────
