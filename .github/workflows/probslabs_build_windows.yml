@@ -19,27 +19,25 @@ jobs:
     runs-on: windows-latest
     
     steps:
-      - name: Checkout Probe repository
+      # --- ÉTAPE CORRIGÉE ---
+      # On ajoute fetch-depth: 0 pour télécharger tout l'historique et tous les tags.
+      - name: Checkout Probe repository (Full History)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
-          
-      # --- NOUVELLE ÉTAPE DE VÉRIFICATION CRUCIALE ---
+          fetch-depth: 0 # C'EST LA CORRECTION CLÉ
+
       - name: Verify Checkout Reference
         shell: bash
         run: |
           echo "✅ Workflow should build ref: ${{ env.PROBE_REF }}"
-          echo "--- Git Log (latest commit) ---"
-          git log -1
           echo "--- Git Describe (verifies tag) ---"
-          # Cette commande échouera si le tag n'est pas présent sur le commit actuel
-          git describe --tags --exact-match || git rev-parse HEAD
+          # Cette commande doit maintenant réussir et afficher le tag
+          git describe --tags --exact-match
           echo "--- Version in root Cargo.toml ---"
-          # Vérifie que la version dans le fichier correspond à ce qu'on attend
           grep '^version =' Cargo.toml
           echo "--- Verifying 'agent' feature exists ---"
-          # Vérifie que la feature 'agent' est bien définie dans le Cargo.toml
           grep '\[features\]' -A 5 Cargo.toml | grep 'agent'
 
       - name: Setup Node.js 24
@@ -67,7 +65,6 @@ jobs:
       - name: Build Main Probe binary (Rust AMD64)
         shell: bash
         run: |
-          # On s'assure de compiler avec --all-features
           cargo build --release --all-features --target x86_64-pc-windows-msvc
           echo "Main Rust binary (probe.exe) built from source."
           
@@ -75,11 +72,10 @@ jobs:
         working-directory: ./lsp-daemon
         shell: bash
         run: |
-          # On ajoute --all-features ici aussi par sécurité
           cargo build --release --all-features --target x86_64-pc-windows-msvc
           echo "LSP Daemon binary (lsp-daemon.exe) built from source."
 
-      - name: Inject Custom Rust Binaries
+      - name: Inject Custom Rust Binaries and Verify
         shell: bash
         run: |
           mkdir -p npm/bin
@@ -88,13 +84,12 @@ jobs:
           echo "=== Binaries Injected ==="
           ls -la npm/bin/
           
-          # Vérification finale : le binaire doit maintenant avoir la bonne version et les bonnes commandes
           echo "--- Verifying final binary version ---"
           npm/bin/probe.exe --version
           echo "--- Verifying final binary commands ---"
           npm/bin/probe.exe --help
 
-      # ... Le reste du packaging et de l'upload reste identique ...
+      # ... Le reste du workflow est inchangé ...
       - name: Prepare distribution package
         working-directory: ./npm
         shell: bash
@@ -123,6 +118,8 @@ jobs:
           path: npm/probe-mcp-agent-windows-amd64.zip
           retention-days: 30
           if-no-files-found: error
+
+  # ... (Les jobs de sécurité restent inchangés) ...
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 2 : CLAMAV (Malware Scan)
   # ───────────────────────────────────────────────────────────────────────────
