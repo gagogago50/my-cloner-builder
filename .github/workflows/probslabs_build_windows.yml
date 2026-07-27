@@ -120,6 +120,8 @@ jobs:
           if-no-files-found: error
 
   # ... (Les jobs de sécurité restent inchangés) ...
+
+  # ... (Les jobs de sécurité restent inchangés) ...
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 2 : CLAMAV (Malware Scan)
   # ───────────────────────────────────────────────────────────────────────────
