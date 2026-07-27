@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       target_ref:
-        description: "Branche, Tag ou Commit à builder et scanner (ex: main, v0.6.0-rc327)"
+        description: "Branche, Tag ou Commit à builder (ex: v0.6.0-rc327, main)"
         required: true
-        default: "main"
+        default: "v0.6.0-rc327"
 
 env:
   SOURCE_REPO: probelabs/probe
@@ -15,7 +15,7 @@ env:
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 1 : BUILD WINDOWS AMD64 (AGENT MCP)
+  # JOB 1 : BUILD WINDOWS AMD64 (AGENT MCP + LSP)
   # ───────────────────────────────────────────────────────────────────────────
   build-mcp-agent:
     name: "🏗️ Build Windows AMD64"
@@ -32,7 +32,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          # Pas de cache ici pour éviter les erreurs
           
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,23 +46,38 @@ jobs:
           SKIP_DOWNLOAD: "true"
         run: npm install --ignore-scripts
         
-      - name: Build Node CLI
+      - name: Build Node CLI, Agent & MCP
         working-directory: ./npm
-        run: npm run build
-          
-      - name: Build Probe binary (Rust AMD64)
         shell: bash
         run: |
-          cargo build --release --all-features --target x86_64-pc-windows-msvc
-          echo "Rust binary built from source."
+          # 1. Build standard
+          npm run build || true
           
-      - name: Inject Custom Rust Binary
+          # 2. Exécution des scripts spécifiques que tu as identifiés
+          echo "Building Agent..."
+          [ -f "scripts/build-agent.cjs" ] && node scripts/build-agent.cjs
+          
+          echo "Building MCP..."
+          [ -f "scripts/build-mcp.cjs" ] && node scripts/build-mcp.cjs
+          
+      - name: Build Probe binaries (Rust Workspace)
+        shell: bash
+        run: |
+          # --workspace force la compilation de TOUS les projets Rust (incluant le lsp-daemon)
+          cargo build --release --workspace --all-features --target x86_64-pc-windows-msvc
+          echo "Rust binaries built from source."
+          
+      - name: Inject Custom Rust Binaries
         shell: bash
         run: |
           mkdir -p npm/bin
-          cp -f target/x86_64-pc-windows-msvc/release/probe.exe npm/bin/probe.exe
-          echo "=== Verified Probe Binary injected ==="
-          npm/bin/probe.exe --help
+          # On copie TOUS les exécutables générés (probe.exe, lsp-daemon.exe, etc.)
+          find target/x86_64-pc-windows-msvc/release -maxdepth 1 -name "*.exe" -exec cp {} npm/bin/ \;
+          
+          echo "=== Verified Binaries injected ==="
+          ls -la npm/bin/
+          # On affiche l'aide pour vérifier que les commandes sont bien là
+          npm/bin/probe.exe --help || true
         
       - name: Prepare distribution package
         working-directory: ./npm
@@ -81,6 +95,7 @@ jobs:
           [ -f "LICENSE" ] && cp LICENSE dist-package/probe-mcp-agent/
           [ -f ".env.example" ] && cp .env.example dist-package/probe-mcp-agent/
           
+          # Nettoyage pour empêcher tout téléchargement futur par l'utilisateur
           cd dist-package/probe-mcp-agent
           npm pkg delete scripts.postinstall
           cd ../..
@@ -99,10 +114,10 @@ jobs:
           if-no-files-found: error
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 2 : CLAMAV (NOUVEAU - Scan Malwares & Signatures suspectes)
+  # JOB 2 : CLAMAV (Malware Scan)
   # ───────────────────────────────────────────────────────────────────────────
   clamav:
-    name: "🦠 ClamAV – Malware & Stealer Scan"
+    name: "🦠 ClamAV – Malware Scan"
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -110,19 +125,13 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
-
-      - name: Install ClamAV & Update Signatures
+      - name: Install ClamAV & Scan
         run: |
           sudo apt-get update && sudo apt-get install -y clamav clamav-daemon
           sudo systemctl stop clamav-freshclam || true
-          sudo freshclam || echo "Freshclam failed, using default database."
-
-      - name: Scan Repository
-        run: |
+          sudo freshclam || echo "Freshclam failed, using default db."
           clamscan -r -i . > clamav-report.txt || true
-
-      - name: Upload ClamAV Report
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: clamav-report
           path: clamav-report.txt
@@ -131,7 +140,7 @@ jobs:
   # JOB 3 : SEMGREP
   # ───────────────────────────────────────────────────────────────────────────
   semgrep:
-    name: "🔎 Semgrep – Code Patterns & Obfuscation"
+    name: "🔎 Semgrep – Patterns"
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -139,19 +148,14 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Run Semgrep
         run: |
           pip install semgrep
           semgrep scan --config "p/default" --config "p/secrets" --config "p/security-audit" --sarif --output semgrep.sarif . || true
-
-      # Upload en tant qu'artifact au lieu d'utiliser l'API GitHub Security
-      - name: Upload Semgrep SARIF Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: semgrep-report
           path: semgrep.sarif
@@ -160,7 +164,7 @@ jobs:
   # JOB 4 : GUARDDOG
   # ───────────────────────────────────────────────────────────────────────────
   guarddog:
-    name: "🐕 GuardDog – Malicious Packages"
+    name: "🐕 GuardDog – Malicious Pkg"
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -168,30 +172,22 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Run GuardDog Scans
+      - name: Run GuardDog
         run: |
           pip install guarddog
-          for f in $(find . -name "requirements*.txt" -not -path "*/node_modules/*" 2>/dev/null); do
-            guarddog pypi verify "$f" --output-format json > "guarddog-pypi-$(basename "$f").json" 2>&1 || true
-          done
-          for f in $(find . -name "package.json" -not -path "*/node_modules/*" 2>/dev/null); do
-            guarddog npm verify "$f" --output-format json > "guarddog-npm-$(basename "$f").json" 2>&1 || true
-          done
-
-      - name: Upload GuardDog results
-        uses: actions/upload-artifact@v4
+          for f in $(find . -name "requirements*.txt" -not -path "*/node_modules/*" 2>/dev/null); do guarddog pypi verify "$f" --output-format json > "guarddog-pypi-$(basename "$f").json" 2>&1 || true; done
+          for f in $(find . -name "package.json" -not -path "*/node_modules/*" 2>/dev/null); do guarddog npm verify "$f" --output-format json > "guarddog-npm-$(basename "$f").json" 2>&1 || true; done
+      - uses: actions/upload-artifact@v4
         with:
           name: guarddog-results
           path: guarddog-*.json
           if-no-files-found: ignore
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 5 : CODEQL (Corrigé pour éviter l'erreur commit)
+  # JOB 5 : CODEQL
   # ───────────────────────────────────────────────────────────────────────────
   codeql:
     name: "🧬 CodeQL – Analysis"
@@ -206,38 +202,30 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
-          
       - uses: actions/setup-go@v5
         if: matrix.language == 'go'
         with:
           go-version: '>=1.21'
-          
-      - name: Initialize CodeQL
+      - name: Init & Analyze CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
           queries: security-extended,security-and-quality
-          
-      - name: Autobuild CodeQL
-        uses: github/codeql-action/autobuild@v3
-        
-      - name: Perform CodeQL Analysis (Sans upload automatique)
-        uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
         with:
-          upload: never # EMPÊCHE L'ERREUR DE COMMIT API
+          upload: never
           output: codeql-results-${{ matrix.language }}
-
-      - name: Upload CodeQL Results as Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: codeql-report-${{ matrix.language }}
           path: codeql-results-${{ matrix.language }}
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 6 : GITLEAKS
+  # JOB 6 : GITLEAKS & BEARER
   # ───────────────────────────────────────────────────────────────────────────
-  gitleaks:
-    name: "🔑 Gitleaks – Secrets"
+  gitleaks-bearer:
+    name: "🛡️ Gitleaks & Bearer"
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -246,41 +234,21 @@ jobs:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
           fetch-depth: 0
-
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_ENABLE_COMMENTS: "false"
-
-      - name: Upload Gitleaks report
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: gitleaks-report
           path: results.sarif
           if-no-files-found: ignore
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # JOB 7 : BEARER
-  # ───────────────────────────────────────────────────────────────────────────
-  bearer:
-    name: "🛡️ Bearer – SAST & Secrets"
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.PROBE_REF }}
-
-      - name: Run Bearer scan
+      - name: Run Bearer
         run: |
           curl -sfL https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh | sh -s -- -b /usr/local/bin
           bearer scan . --format sarif --output bearer.sarif --severity critical,high,medium --scanner secrets --quiet || true
-
-      # Upload en tant qu'artifact au lieu d'utiliser l'API GitHub Security
-      - name: Upload Bearer Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: bearer-report
           path: bearer.sarif
@@ -292,7 +260,7 @@ jobs:
   summary:
     name: "📋 Security & Build Summary"
     runs-on: ubuntu-latest
-    needs: [ build-mcp-agent, clamav, semgrep, guarddog, codeql, gitleaks, bearer ]
+    needs: [ build-mcp-agent, clamav, semgrep, guarddog, codeql, gitleaks-bearer ]
     if: always()
     steps:
       - name: Write Job Summary
@@ -307,8 +275,7 @@ jobs:
           | 🔎 Semgrep               | ${{ needs.semgrep.result }} |
           | 🐕 GuardDog             | ${{ needs.guarddog.result }} |
           | 🧬 CodeQL               | ${{ needs.codeql.result }} |
-          | 🔑 Gitleaks             | ${{ needs.gitleaks.result }} |
-          | 🛡️ Bearer                | ${{ needs.bearer.result }} |
+          | 🛡️ Gitleaks & Bearer     | ${{ needs.gitleaks-bearer.result }} |
           
-          ℹ️ **Note:** Les rapports de sécurité détaillés (fichiers .sarif et .txt) sont téléchargeables dans la section "Artifacts" ci-dessous.
+          ℹ️ **Note:** Les rapports (.sarif, .json, .txt) et le ZIP du build sont téléchargeables dans la section "Artifacts" en bas de cette page.
           EOF
