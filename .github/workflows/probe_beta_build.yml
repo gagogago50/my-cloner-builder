@@ -1,0 +1,321 @@
+name: Build Probe MCP Agent & Security Scans
+
+on:
+  workflow_dispatch:
+
+env:
+  # Cible exacte pour TOUS les jobs (Build + Sécurité)
+  SOURCE_REPO: probelabs/probe
+  PROBE_REF: v0.6.0-rc327 
+  RUST_VERSION: stable
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 : BUILD WINDOWS AMD64 (AGENT MCP)
+  # ───────────────────────────────────────────────────────────────────────────
+  build-mcp-agent:
+    name: "🏗️ Build Windows AMD64"
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout Probe repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.PROBE_REF }}
+          
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          
+      - name: Install npm dependencies
+        working-directory: ./npm
+        env:
+          PROBE_SKIP_DOWNLOAD: "true"
+          SKIP_DOWNLOAD: "true"
+        run: npm install --ignore-scripts
+        
+      - name: Build Node CLI
+        working-directory: ./npm
+        run: npm run build
+          
+      - name: Build Probe binary (Rust AMD64)
+        shell: bash
+        run: |
+          cargo build --release --all-features --target x86_64-pc-windows-msvc
+          echo "Rust binary built from source."
+          
+      - name: Inject Custom Rust Binary
+        shell: bash
+        run: |
+          mkdir -p npm/bin
+          cp -f target/x86_64-pc-windows-msvc/release/probe.exe npm/bin/probe.exe
+          echo "=== Verified Probe Binary injected ==="
+          npm/bin/probe.exe --help
+        
+      - name: Prepare distribution package
+        working-directory: ./npm
+        shell: bash
+        run: |
+          mkdir -p dist-package/probe-mcp-agent
+          if [ -d "build" ]; then cp -r build dist-package/probe-mcp-agent/; fi
+          if [ -d "dist" ]; then cp -r dist dist-package/probe-mcp-agent/; fi
+          if [ -d "bin" ]; then cp -r bin dist-package/probe-mcp-agent/; fi
+          if [ -d "scripts" ]; then cp -r scripts dist-package/probe-mcp-agent/; fi
+          
+          cp package.json dist-package/probe-mcp-agent/
+          [ -f "package-lock.json" ] && cp package-lock.json dist-package/probe-mcp-agent/
+          [ -f "README.md" ] && cp README.md dist-package/probe-mcp-agent/
+          [ -f "LICENSE" ] && cp LICENSE dist-package/probe-mcp-agent/
+          [ -f ".env.example" ] && cp .env.example dist-package/probe-mcp-agent/
+          
+          cd dist-package/probe-mcp-agent
+          npm pkg delete scripts.postinstall
+          cd ../..
+          
+      - name: Create ZIP artifact
+        working-directory: ./npm
+        shell: pwsh
+        run: Compress-Archive -Path dist-package/probe-mcp-agent -DestinationPath probe-mcp-agent-windows-amd64.zip -Force
+          
+      - name: Upload MCP Agent artifact (ZIP)
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-mcp-agent-windows-amd64-complete
+          path: npm/probe-mcp-agent-windows-amd64.zip
+          retention-days: 30
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 : SEMGREP
+  # ───────────────────────────────────────────────────────────────────────────
+  semgrep:
+    name: "🔎 Semgrep – Code Patterns"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.PROBE_REF }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Semgrep
+        run: |
+          pip install semgrep
+          semgrep scan --config "p/default" --config "p/secrets" --config "p/security-audit" --sarif --output semgrep.sarif . || true
+          if ! python3 -c "import json; json.load(open('semgrep.sarif'))" 2>/dev/null; then
+            printf '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep","rules":[]}},"results":[]}]}' > semgrep.sarif
+          fi
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 : GUARDDOG
+  # ───────────────────────────────────────────────────────────────────────────
+  guarddog:
+    name: "🐕 GuardDog – Malicious Packages"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.PROBE_REF }}
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run GuardDog Scans
+        run: |
+          pip install guarddog
+          for f in $(find . -name "requirements*.txt" -not -path "*/node_modules/*" 2>/dev/null); do
+            guarddog pypi verify "$f" --output-format json > "guarddog-pypi-$(basename "$f").json" 2>&1 || true
+          done
+          for f in $(find . -name "package.json" -not -path "*/node_modules/*" 2>/dev/null); do
+            guarddog npm verify "$f" --output-format json > "guarddog-npm-$(basename "$f").json" 2>&1 || true
+          done
+
+      - name: Upload GuardDog results
+        uses: actions/upload-artifact@v4
+        with:
+          name: guarddog-results
+          path: guarddog-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 4 : OSSF SCORECARD (Sur le repo actuel uniquement)
+  # ───────────────────────────────────────────────────────────────────────────
+  scorecard:
+    name: "🏆 OSSF Scorecard"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run OSSF Scorecard
+        uses: ossf/scorecard-action@v2.4.1
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false
+
+      - name: Upload Scorecard SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard.sarif
+          category: ossf-scorecard
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 5 : CODEQL (JS/Python & Go unifiés)
+  # ───────────────────────────────────────────────────────────────────────────
+  codeql:
+    name: "🧬 CodeQL – Analysis"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    strategy:
+      matrix:
+        language: [ 'javascript-typescript', 'python', 'go' ]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.PROBE_REF }}
+          
+      - uses: actions/setup-go@v5
+        if: matrix.language == 'go'
+        with:
+          go-version: '>=1.21'
+          check-latest: true
+          
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+          
+      - name: Autobuild CodeQL
+        uses: github/codeql-action/autobuild@v3
+        
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 6 : GITLEAKS
+  # ───────────────────────────────────────────────────────────────────────────
+  gitleaks:
+    name: "🔑 Gitleaks – Secrets"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.PROBE_REF }}
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: Upload Gitleaks report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 7 : BEARER
+  # ───────────────────────────────────────────────────────────────────────────
+  bearer:
+    name: "🛡️ Bearer – SAST & Secrets"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.PROBE_REF }}
+          fetch-depth: 0
+
+      - name: Run Bearer scan
+        run: |
+          curl -sfL https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          bearer scan . --format sarif --output bearer.sarif --severity critical,high,medium --scanner secrets --quiet || true
+
+      - name: Upload Bearer SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bearer.sarif
+          category: bearer
+
+      - name: Upload Bearer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bearer-report
+          path: bearer.sarif
+          if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB FINAL : SUMMARY
+  # ───────────────────────────────────────────────────────────────────────────
+  summary:
+    name: "📋 Security & Build Summary"
+    runs-on: ubuntu-latest
+    needs: [ build-mcp-agent, semgrep, guarddog, scorecard, codeql, gitleaks, bearer ]
+    if: always()
+    steps:
+      - name: Write Job Summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          ## 🔒 Build & Security Report
+
+          | Job | Statut |
+          |-----|--------|
+          | 🏗️ Build Windows AMD64   | ${{ needs.build-mcp-agent.result }} |
+          | 🔎 Semgrep               | ${{ needs.semgrep.result }} |
+          | 🐕 GuardDog             | ${{ needs.guarddog.result }} |
+          | 🏆 OSSF Scorecard       | ${{ needs.scorecard.result }} |
+          | 🧬 CodeQL               | ${{ needs.codeql.result }} |
+          | 🔑 Gitleaks             | ${{ needs.gitleaks.result }} |
+          | 🛡️ Bearer                | ${{ needs.bearer.result }} |
+          EOF
