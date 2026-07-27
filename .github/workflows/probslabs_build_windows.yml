@@ -105,6 +105,36 @@ jobs:
           ls -la build/mcp/index.js build/agent/index.js
           ls -la cjs/
 
+      # ── CORRECTIF OBLIGATOIRE (bug du build upstream) ──────────────────────
+      # scripts/build-agent.cjs injecte un banner esbuild :
+      #     import { createRequire } from "node:module";
+      #     const require = createRequire(import.meta.url);
+      # mais le code source de l'agent importe AUSSI createRequire depuis
+      # "module". Dans le bundle ESM final, deux import lient le même nom ->
+      #   SyntaxError: Identifier 'createRequire' has already been declared
+      # au chargement sous Node (testé : Node 24).
+      # On supprime l'import du CORPS (from "module", SANS préfixe node:) ;
+      # le banner fournit déjà createRequire + require à tout le module.
+      - name: Patch agent bundle (duplicate createRequire)
+        working-directory: ./npm
+        shell: bash
+        run: |
+          node -e "
+          const fs = require('fs');
+          const p = 'build/agent/index.js';
+          let s = fs.readFileSync(p, 'utf8');
+          const re = /^\s*import\s*\{\s*createRequire\s*\}\s*from\s*[\x22\x27]module[\x22\x27];?\s*$/gm;
+          const n = (s.match(re) || []).length;
+          s = s.replace(re, '/* createRequire fourni par le banner esbuild */');
+          fs.writeFileSync(p, s);
+          console.log('Imports createRequire dupliques supprimes : ' + n);
+          "
+          if grep -q 'import { createRequire } from "module";' build/agent/index.js; then
+            echo "::error::Le doublon createRequire est toujours present dans le bundle"
+            exit 1
+          fi
+          echo "✅ Bundle agent OK (plus de doublon createRequire)"
+
       # Le launcher npm/bin/probe cherche "bin/probe.exe" sur Windows :
       # on injecte NOTRE binaire compilé from source à cet endroit exact.
       - name: Inject Custom Rust Binary and Verify
