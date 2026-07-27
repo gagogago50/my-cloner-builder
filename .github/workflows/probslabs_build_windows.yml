@@ -1,10 +1,6 @@
 name: Build Probe MCP Agent (Windows AMD64)
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 env:
@@ -33,14 +29,11 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
           
-      # 1. On installe d'abord les dépendances Node.js
-      # On passe des variables d'environnement courantes pour tenter de bloquer le téléchargement
-      - name: Install npm dependencies
+      # 1. On installe les dépendances Node.js SANS exécuter les scripts (notamment postinstall)
+      # L'option '--ignore-scripts' est la clé pour empêcher le téléchargement du binaire pré-compilé.
+      - name: Install npm dependencies (without scripts)
         working-directory: ./npm
-        env:
-          PROBE_SKIP_DOWNLOAD: "true"
-          SKIP_DOWNLOAD: "true"
-        run: npm install
+        run: npm install --ignore-scripts
         
       # 2. On build le code TypeScript/Node.js (qui va créer le dossier build/cli.js)
       - name: Build Node CLI
@@ -48,23 +41,26 @@ jobs:
         run: npm run build
           
       # 3. ENSUITE, on build le binaire Rust avec TOUTES les features (--all-features)
-      # Cela garantit que les sous-commandes 'agent', 'mcp', etc., sont bien incluses.
+      # C'est cette étape qui crée le binaire que nous voulons, avec les sous-commandes 'agent', 'mcp', etc.
       - name: Build Probe binary (Rust AMD64)
         shell: bash
         run: |
           cargo build --release --all-features --target x86_64-pc-windows-msvc
-          echo "Rust binary built."
+          echo "Rust binary with all features built."
           
-      # 4. On FORCE la copie du binaire Rust fraîchement compilé dans le dossier npm
-      # En le faisant à la fin, on écrase l'éventuel vieux binaire téléchargé par 'npm install'
+      # 4. On injecte notre binaire Rust fraîchement compilé dans le dossier npm/bin
+      # Comme '--ignore-scripts' a été utilisé, le dossier 'npm/bin' est soit vide, soit n'existe pas.
+      # Cette étape est donc cruciale pour placer notre binaire au bon endroit.
       - name: Inject Custom Rust Binary
         shell: bash
         run: |
           mkdir -p npm/bin
           cp -f target/x86_64-pc-windows-msvc/release/probe.exe npm/bin/probe.exe
-          echo "=== Verified Probe Binary injected ==="
+          echo "=== Custom-built Probe Binary Injected ==="
           ls -la npm/bin/
-          # Optionnel : vérifier que la sous-commande agent existe
+          
+          # Vérification cruciale : on s'assure que notre binaire reconnaît bien la sous-commande 'agent'
+          echo "Verifying subcommands in the new binary:"
           npm/bin/probe.exe --help
         
       # 5. On prépare le dossier final avec TOUT ce qui est nécessaire
@@ -74,32 +70,19 @@ jobs:
         run: |
           mkdir -p dist-package/probe-mcp-agent
           
-          # On copie le dossier build (qui contient cli.js d'après ta config kilocode)
-          if [ -d "build" ]; then
-            cp -r build dist-package/probe-mcp-agent/
-            echo "Copied build/ folder"
-          fi
+          # Copie des assets Node.js (le wrapper)
+          cp -r build dist-package/probe-mcp-agent/
           
-          # On copie dist si existant
-          if [ -d "dist" ]; then
-            cp -r dist dist-package/probe-mcp-agent/
-            echo "Copied dist/ folder"
-          fi
+          # Copie du binaire que NOUS avons compilé
+          cp -r bin dist-package/probe-mcp-agent/
           
-          # On copie le dossier bin avec NOTRE probe.exe
-          if [ -d "bin" ]; then
-            cp -r bin dist-package/probe-mcp-agent/
-            echo "Copied bin/ folder"
-          fi
-          
-          # Fichiers essentiels
+          # Fichiers essentiels pour l'exécution et l'information
           cp package.json dist-package/probe-mcp-agent/
           [ -f "package-lock.json" ] && cp package-lock.json dist-package/probe-mcp-agent/
           [ -f "README.md" ] && cp README.md dist-package/probe-mcp-agent/
           [ -f "LICENSE" ] && cp LICENSE dist-package/probe-mcp-agent/
-          [ -f ".env.example" ] && cp .env.example dist-package/probe-mcp-agent/
           
-          echo "=== Distribution package contents ==="
+          echo "=== Distribution package contents preview ==="
           find dist-package/probe-mcp-agent -type f | head -50
           
       # 6. Création de l'archive finale
