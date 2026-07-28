@@ -11,6 +11,10 @@ name: Build & Security Scan
 #     jobs de sécu échouaient au checkout).
 #   * Entités HTML (&gt; &amp; &lt;) et liens markdown cassés nettoyés.
 #   * ref par défaut = main  =>  inclut le fix IPC named-pipe Windows.
+#   * BINAIRE NON-DEV : resolution automatique d'une version propre X.Y.Z
+#     (depuis le dernier tag) passee a `build.sh --version`. Sans ca, le
+#     binaire est tague "dev" et la logique d'admission/auto-drain le traite
+#     specifiquement (et l'upgrade ne marche pas proprement).
 # ============================================================================
 
 on:
@@ -83,16 +87,25 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Resolve version (non-dev, clean X.Y.Z)
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            # Latest tag reachable (ex: v0.9.1-rc.1) -> on ne garde que MAJOR.MINOR.PATCH
+            V="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.9.0)"
+          fi
+          V="${V#v}"        # retire le 'v' prefixe
+          V="${V%%-*}"      # retire prerelease/commit -> triple propre
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version non-dev resolue : $V"
+
       - name: Build headless stdio binary (no UI / no HTTP server)
         shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh CC=clang CXX=clang++
-          fi
+          scripts/build.sh --version "${{ steps.ver.outputs.version }}" CC=clang CXX=clang++
 
       - name: Archive stdio binary
         shell: msys2 {0}
