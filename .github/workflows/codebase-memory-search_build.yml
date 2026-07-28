@@ -1,5 +1,18 @@
 name: Build & Security Scan
 
+# ============================================================================
+# CORRECTIONS APPORTÉES (vs ancien workflow) :
+#   * Build du BINAIRE UNIQUE headless (stdio, PAS d'UI / PAS de serveur HTTP).
+#     L'ancien couple launcher.exe + payload.exe a été supprimé de `main`
+#     (commit "fix(windows): ship one binary"). `make ... -launcher.exe` échouait.
+#   * Job UI (--with-ui) supprimé : tu veux du stdio sans HTTP.
+#   * `needs: build-mcp-agent` -> `needs: build-windows-amd64` (le vrai nom).
+#   * `env.SOURCE_REPO` / `env.PROBE_REF` définis au niveau workflow (sinon les
+#     jobs de sécu échouaient au checkout).
+#   * Entités HTML (&gt; &amp; &lt;) et liens markdown cassés nettoyés.
+#   * ref par défaut = main  =>  inclut le fix IPC named-pipe Windows.
+# ============================================================================
+
 on:
   workflow_dispatch:
     inputs:
@@ -20,6 +33,11 @@ on:
         type: boolean
         default: false
 
+# Partagé par tous les jobs de sécurité (sinon checkout échoue : repo/ref vides)
+env:
+  SOURCE_REPO: ${{ inputs.repository }}
+  PROBE_REF: ${{ inputs.ref }}
+
 permissions:
   contents: read
   id-token: write
@@ -29,10 +47,10 @@ permissions:
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 1 : BUILD WINDOWS AMD64
+  # JOB 1 : BUILD WINDOWS AMD64  (binaire unique, stdio, headless)
   # ───────────────────────────────────────────────────────────────────────────
   build-windows-amd64:
-    name: "🏗️ Build Windows AMD64"
+    name: "🏗️ Build Windows AMD64 (stdio, headless)"
     runs-on: windows-latest
     timeout-minutes: 240
     steps:
@@ -65,7 +83,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build standard binary
+      - name: Build headless stdio binary (no UI / no HTTP server)
         shell: msys2 {0}
         env:
           VERSION: ${{ inputs.version }}
@@ -76,62 +94,30 @@ jobs:
             scripts/build.sh CC=clang CXX=clang++
           fi
 
-      - name: Archive standard binary
+      - name: Archive stdio binary
         shell: msys2 {0}
         run: |
-          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
           PAYLOAD=build/c/codebase-memory-mcp
           [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
-          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
-          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
+          cp "$PAYLOAD" codebase-memory-mcp.exe
           scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
           zip codebase-memory-mcp-windows-amd64.zip \
-            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            codebase-memory-mcp.exe \
             LICENSE install.ps1 THIRD_PARTY_NOTICES.md
 
-      - name: Attest standard binary provenance
+      - name: Attest binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: codebase-memory-mcp-windows-amd64.zip
-
-      - name: Build UI binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh --with-ui CC=clang CXX=clang++
-          fi
-
-      - name: Archive UI binary
-        shell: msys2 {0}
-        run: |
-          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
-          PAYLOAD=build/c/codebase-memory-mcp
-          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
-          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
-          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-amd64.zip \
-            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
-            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-
-      - name: Attest UI binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-ui-windows-amd64.zip
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-windows-amd64
           path: "*.zip"
 
-───────────────────────────────────────────────────────────────────────────
-  # JOB 2 : CLAMAV (NOUVEAU - Scan Malwares & Signatures suspectes)
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 : CLAMAV (Malware & signatures suspectes)
   # ───────────────────────────────────────────────────────────────────────────
   clamav:
     name: "🦠 ClamAV – Malware & Stealer Scan"
@@ -181,7 +167,6 @@ jobs:
           pip install semgrep
           semgrep scan --config "p/default" --config "p/secrets" --config "p/security-audit" --sarif --output semgrep.sarif . || true
 
-      # Upload en tant qu'artifact au lieu d'utiliser l'API GitHub Security
       - name: Upload Semgrep SARIF Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -223,7 +208,7 @@ jobs:
           if-no-files-found: ignore
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 5 : CODEQL (Corrigé pour éviter l'erreur commit)
+  # JOB 5 : CODEQL  (langage C du repo)
   # ───────────────────────────────────────────────────────────────────────────
   codeql:
     name: "🧬 CodeQL – Analysis"
@@ -231,28 +216,23 @@ jobs:
     continue-on-error: true
     strategy:
       matrix:
-        language: [ 'javascript-typescript', 'python', 'go' ]
+        language: [ 'c-cpp' ]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.PROBE_REF }}
-          
-      - uses: actions/setup-go@v5
-        if: matrix.language == 'go'
-        with:
-          go-version: '>=1.21'
-          
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
           queries: security-extended,security-and-quality
-          
+
       - name: Autobuild CodeQL
         uses: github/codeql-action/autobuild@v3
-        
+
       - name: Perform CodeQL Analysis (Sans upload automatique)
         uses: github/codeql-action/analyze@v3
         with:
@@ -310,7 +290,6 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh | sh -s -- -b /usr/local/bin
           bearer scan . --format sarif --output bearer.sarif --severity critical,high,medium --scanner secrets --quiet || true
 
-      # Upload en tant qu'artifact au lieu d'utiliser l'API GitHub Security
       - name: Upload Bearer Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -324,7 +303,7 @@ jobs:
   summary:
     name: "📋 Security & Build Summary"
     runs-on: ubuntu-latest
-    needs: [ build-mcp-agent, clamav, semgrep, guarddog, codeql, gitleaks, bearer ]
+    needs: [ build-windows-amd64, clamav, semgrep, guarddog, codeql, gitleaks, bearer ]
     if: always()
     steps:
       - name: Write Job Summary
@@ -334,13 +313,13 @@ jobs:
 
           | Job | Statut |
           |-----|--------|
-          | 🏗️ Build Windows AMD64   | ${{ needs.build-mcp-agent.result }} |
+          | 🏗️ Build Windows AMD64 (stdio) | ${{ needs.build-windows-amd64.result }} |
           | 🦠 ClamAV (Malware)      | ${{ needs.clamav.result }} |
           | 🔎 Semgrep               | ${{ needs.semgrep.result }} |
           | 🐕 GuardDog             | ${{ needs.guarddog.result }} |
           | 🧬 CodeQL               | ${{ needs.codeql.result }} |
           | 🔑 Gitleaks             | ${{ needs.gitleaks.result }} |
           | 🛡️ Bearer                | ${{ needs.bearer.result }} |
-          
+
           ℹ️ **Note:** Les rapports de sécurité détaillés (fichiers .sarif et .txt) sont téléchargeables dans la section "Artifacts" ci-dessous.
           EOF
