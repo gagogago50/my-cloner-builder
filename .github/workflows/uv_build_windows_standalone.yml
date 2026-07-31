@@ -1,0 +1,376 @@
+name: Build uv Windows &amp; Security Scan
+
+# ── Déclencheur : UNIQUEMENT manuel (workflow_dispatch).
+#    Aucun trigger sur push / pull_request / release — pas de build automatique.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag, branche ou SHA à builder (ex: 0.6.5, main, 0.5.0, ...)'
+        type: string
+        required: true
+        default: 'latest'
+        # "latest" = dernier tag stable publié au moment du run
+      include_wheels:
+        description: 'Inclure les wheels PyPI dans les artifacts ?'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  security-events: write
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE_NAME: uv
+  MODULE_NAME: uv
+  PYTHON_VERSION: "3.11"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  RUSTUP_MAX_RETRIES: "10"
+  TARGET: x86_64-pc-windows-msvc
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Architecture du workflow (adaptée à la limite GitHub Free tier = 2 jobs
+# concurrents max) :
+#
+#   [build-windows]  ┐
+#                   ├→  [summary]
+#   [security]      ┘
+#
+# - build-windows : un seul job Windows (coûteux ~45 min) qui compile uv.exe.
+# - security      : un SEUL job Ubuntu qui exécute TOUS les scanners SÉQUENTIEL-
+#                   LEMENT (ClamAV → Semgrep → GuardDog → CodeQL → Gitleaks →
+#                   Bearer). Ça consomme 1 runner au lieu de 6 en //.
+# - summary       : attend les deux ci-dessus, puis affiche le tableau final.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 — BUILD uv x86_64-pc-windows-msvc (release, stable Rust)
+  # Basé sur astral-sh/uv/.github/workflows/build-release-binaries.yml
+  # ╶ lignes 244-321 de build-release-binaries.yml (section "windows").
+  # ───────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: "🏗️ Build uv — x86_64-pc-windows-msvc"
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+
+      # ── Récupérer les tags pour pouvoir résoudre "latest" ──────────────────
+      - name: Resolve ref (latest → dernier tag)
+        id: resolve-ref
+        shell: bash
+        run: |
+          # Pas besoin de checkout pour lister les tags distants
+          git ls-remote --tags https://github.com/astral-sh/uv.git 'refs/tags/*' \
+            | awk '{print $2}' \
+            | sed 's|refs/tags/||' \
+            | grep -v '\^{}' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -1 &gt; /tmp/latest_tag.txt
+          LATEST=$(cat /tmp/latest_tag.txt)
+          echo "latest tag detected: $LATEST"
+
+          if [ "${{ github.event.inputs.ref }}" = "latest" ]; then
+            echo "resolved_ref=$LATEST" &gt;&gt; "$GITHUB_OUTPUT"
+            echo "VERSION=$LATEST" &gt;&gt; "$GITHUB_ENV"
+          else
+            echo "resolved_ref=${{ github.event.inputs.ref }}" &gt;&gt; "$GITHUB_OUTPUT"
+            echo "VERSION=${{ github.event.inputs.ref }}" &gt;&gt; "$GITHUB_ENV"
+          fi
+
+      - name: Checkout astral-sh/uv (pas de fork requis)
+        uses: actions/checkout@v4
+        with:
+          repository: astral-sh/uv
+          ref: ${{ steps.resolve-ref.outputs.resolved_ref }}
+          fetch-depth: 0      # pour git describe
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+
+      - name: Install NASM (requis par aws-lc-sys sur x86/x86_64 Windows)
+        run: |
+          winget install NASM.NASM --accept-source-agreements --accept-package-agreements
+          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install cargo-auditable (utilisé par scripts/cargo.cmd)
+        shell: bash
+        run: |
+          # cargo.cmd appelle "cargo auditable" ; on installe l'extension pour
+          # que le wrapper fonctionne exactement comme dans le build upstream.
+          cargo install cargo-auditable --locked
+
+      - name: Prep README.md
+        shell: bash
+        run: python scripts/transform_readme.py --target pypi
+
+      # ── Build release identique à celui d'upstream ─────────────────────────
+      - name: Build uv (release)
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.14.1
+          target: x86_64-pc-windows-msvc
+          args: --release --locked --out dist --features self-update,windows-gui-bin --compatibility pypi
+        env:
+          # Utilise le wrapper cargo.cmd du repo (cargo auditable),
+          # identique au build officiel d'astral-sh.
+          CARGO: ${{ github.workspace }}/scripts/cargo.cmd
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+
+      - name: Verify binaries
+        shell: bash
+        run: |
+          for bin in uv.exe uvx.exe uvw.exe; do
+            if [ -f "target/${TARGET}/release/$bin" ]; then
+              echo "✅ $bin  —  $(ls -lh "target/${TARGET}/release/$bin" | awk '{print $5}')"
+            else
+              echo "::error::$bin introuvable dans target/${TARGET}/release/"
+              exit 1
+            fi
+          done
+          # Affiche la version
+          "./target/${TARGET}/release/uv.exe" --version
+
+      - name: Quick smoke test
+        shell: bash
+        run: |
+          "./target/${TARGET}/release/uv.exe" pip compile --help &gt;/dev/null
+          "./target/${TARGET}/release/uvx.exe" --help &gt;/dev/null
+          echo "✅ smoke tests OK"
+
+      - name: Create standalone zip archive
+        shell: bash
+        run: |
+          ARCHIVE_FILE="uv-${{ env.VERSION }}-${TARGET}.zip"
+          echo "ARCHIVE_FILE=$ARCHIVE_FILE" &gt;&gt; "$GITHUB_ENV"
+          mkdir -p "${ARCHIVE_FILE%.zip}"
+          cp "target/${TARGET}/release/uv.exe"  "${ARCHIVE_FILE%.zip}/uv.exe"
+          cp "target/${TARGET}/release/uvx.exe" "${ARCHIVE_FILE%.zip}/uvx.exe"
+          cp "target/${TARGET}/release/uvw.exe" "${ARCHIVE_FILE%.zip}/uvw.exe"
+          # Ajouter un petit README dans l'archive
+          cat &gt; "${ARCHIVE_FILE%.zip}/README.txt" &lt;&lt;EOF
+          uv ${{ env.VERSION }} — standalone build for Windows x86_64 (MSVC)
+          Source: https://github.com/astral-sh/uv (tag ${{ steps.resolve-ref.outputs.resolved_ref }})
+          Built: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          Usage: mettre uv.exe dans le PATH (uvx.exe et uvw.exe sont optionnels).
+          EOF
+          7z a "$ARCHIVE_FILE" "./${ARCHIVE_FILE%.zip}/*"
+          sha256sum "$ARCHIVE_FILE" &gt; "$ARCHIVE_FILE.sha256"
+          echo ""
+          echo "── Archive ──"
+          ls -lh "$ARCHIVE_FILE"*
+
+      - name: Upload standalone binary archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: uv-windows-standalone-${{ env.VERSION }}
+          path: |
+            *.zip
+            *.sha256
+
+      - name: Upload PyPI wheels (optionnel)
+        if: ${{ github.event.inputs.include_wheels == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: uv-wheel-windows-x86_64-${{ env.VERSION }}
+          path: dist
+          if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 — TOUS LES SCANS DE SÉCURITÉ, SÉQUENTIELLEMENT, sur UN SEUL runner
+  # (ClamAV → Semgrep → GuardDog → CodeQL → Gitleaks → Bearer)
+  # Ce job tourne en parallèle du build Windows (2 jobs simultanés = limite
+  # du free tier).
+  # ───────────────────────────────────────────────────────────────────────────
+  security:
+    name: "🛡️ Security scans (sequentiel)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+
+      - name: Resolve ref (latest → dernier tag)
+        id: resolve-ref
+        run: |
+          LATEST=$(git ls-remote --tags https://github.com/astral-sh/uv.git 'refs/tags/*' \
+            | awk '{print $2}' | sed 's|refs/tags/||' | grep -v '\^{}' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          echo "latest tag: $LATEST"
+          if [ "${{ github.event.inputs.ref }}" = "latest" ]; then
+            echo "resolved_ref=$LATEST" &gt;&gt; "$GITHUB_OUTPUT"
+          else
+            echo "resolved_ref=${{ github.event.inputs.ref }}" &gt;&gt; "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout astral-sh/uv
+        uses: actions/checkout@v4
+        with:
+          repository: astral-sh/uv
+          ref: ${{ steps.resolve-ref.outputs.resolved_ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "&gt;=1.21"
+
+      # ── 1. ClamAV ──────────────────────────────────────────────────────────
+      - name: "🦠 1/6 ClamAV — Antivirus scan"
+        continue-on-error: true
+        run: |
+          echo "--- Installing ClamAV ---"
+          sudo apt-get update -qq &amp;&amp; sudo apt-get install -y -qq clamav clamav-daemon
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam || echo "freshclam warning, using default db"
+          echo "--- Scanning ---"
+          clamscan -r -i --max-filesize=100M --max-scansize=500M . &gt; clamav-report.txt || true
+          echo "--- ClamAV done ---"
+          tail -20 clamav-report.txt
+
+      # ── 2. Semgrep ─────────────────────────────────────────────────────────
+      - name: "🔎 2/6 Semgrep — SAST &amp; secrets"
+        continue-on-error: true
+        run: |
+          pip install -q semgrep
+          semgrep scan \
+            --config "p/default" \
+            --config "p/secrets" \
+            --config "p/security-audit" \
+            --sarif --output semgrep.sarif . || true
+          echo "--- Semgrep done ---"
+
+      # ── 3. GuardDog ────────────────────────────────────────────────────────
+      - name: "🐕 3/6 GuardDog — Malicious packages"
+        continue-on-error: true
+        run: |
+          pip install -q guarddog
+          shopt -s nullglob
+          for f in $(find . -maxdepth 3 -name "requirements*.txt" -not -path "*/node_modules/*" -not -path "*/target/*" 2&gt;/dev/null); do
+            echo "Scanning $f ..."
+            guarddog pypi verify "$f" --output-format json &gt; "guarddog-pypi-$(basename "$f").json" 2&gt;&amp;1 || true
+          done
+          for f in $(find . -maxdepth 3 -name "package.json" -not -path "*/node_modules/*" -not -path "*/target/*" 2&gt;/dev/null); do
+            echo "Scanning $f ..."
+            guarddog npm verify "$f" --output-format json &gt; "guarddog-npm-$(basename "$f").json" 2&gt;&amp;1 || true
+          done
+          echo "--- GuardDog done ---"
+
+      # ── 4. CodeQL (Rust + Python) ──────────────────────────────────────────
+      - name: "🧬 4/6 CodeQL — Rust &amp; Python"
+        continue-on-error: true
+        env:
+          CODEQL_LANGUAGES: "python,rust"
+        run: |
+          echo "CodeQL is run via the official actions"
+        # CodeQL a besoin des actions dédiées, on les enchaîne ici
+      - name: Initialize CodeQL
+        if: always()
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python,rust
+          queries: security-extended,security-and-quality
+      - name: Autobuild CodeQL
+        if: always()
+        uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+      - name: Analyze CodeQL
+        if: always()
+        uses: github/codeql-action/analyze@v3
+        with:
+          upload: never
+          output: codeql-results
+        continue-on-error: true
+
+      # ── 5. Gitleaks ────────────────────────────────────────────────────────
+      - name: "🔑 5/6 Gitleaks — Secrets dans git history"
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_ENABLE_SUMMARY: "true"
+
+      # ── 6. Bearer ──────────────────────────────────────────────────────────
+      - name: "🛡️ 6/6 Bearer — SAST &amp; secrets"
+        continue-on-error: true
+        run: |
+          curl -sfL https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          bearer scan . --format sarif --output bearer.sarif \
+            --severity critical,high,medium --scanner secrets --quiet || true
+          echo "--- Bearer done ---"
+
+      # ── Upload de TOUS les rapports en un seul artifact ────────────────────
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            clamav-report.txt
+            semgrep.sarif
+            guarddog-*.json
+            codeql-results/
+            bearer.sarif
+            results.sarif
+          if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 — SUMMARY
+  # ───────────────────────────────────────────────────────────────────────────
+  summary:
+    name: "📋 Summary"
+    runs-on: ubuntu-latest
+    needs: [build-windows, security]
+    if: always()
+    steps:
+      - name: Write Job Summary
+        run: |
+          BUILD="${{ needs.build-windows.result }}"
+          SEC="${{ needs.security.result }}"
+
+          icon() { case "$1" in success) echo "✅";; failure) echo "❌";; skipped) echo "⏭️";; cancelled) echo "🚫";; *) echo "⚠️";; esac; }
+
+          cat &gt;&gt; "$GITHUB_STEP_SUMMARY" &lt;&lt;EOF
+          # 🔒 Build &amp; Security Report — uv ${{ github.event.inputs.ref }}
+
+          | Job                           | Statut |
+          |-------------------------------|--------|
+          | 🏗️ Build Windows x86_64 (uv)  | $(icon "$BUILD") $BUILD |
+          | 🛡️ Scans sécurité (6 outils)  | $(icon "$SEC") $SEC |
+
+          ### 📦 Artifacts
+          - **\`uv-windows-standalone-&lt;version&gt;.zip\`** : binaires standalone uv.exe / uvx.exe / uvw.exe + SHA-256
+          - **\`security-reports\`** : rapports ClamAV, Semgrep, GuardDog, CodeQL, Gitleaks, Bearer
+
+          ### 🛠️ Outils de scan exécutés séquentiellement
+          \`ClamAV → Semgrep → GuardDog → CodeQL (Python+Rust) → Gitleaks → Bearer\`
+
+          ---
+          *Build lancé manuellement sur astral-sh/uv @ \`${{ github.event.inputs.ref }}\`.*
+          EOF
+
+          echo ""
+          echo "Build result : $BUILD"
+          echo "Security result: $SEC"
