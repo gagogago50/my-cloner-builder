@@ -204,7 +204,9 @@ jobs:
             throw "Unexpected OpenSSL commit: $actual"
           }
           Push-Location openssl-source
-          perl Configure VC-WIN64A no-shared no-tests `
+          # no-asm avoids downloading a precompiled NASM tool. OpenSSL remains
+          # fully functional; only hand-written assembly optimizations are disabled.
+          perl Configure VC-WIN64A no-shared no-tests no-asm `
             --prefix="$env:RUNNER_TEMP\openssl-local" `
             --openssldir="$env:RUNNER_TEMP\openssl-local\ssl"
           if ($LASTEXITCODE -ne 0) { throw "OpenSSL configure failed" }
