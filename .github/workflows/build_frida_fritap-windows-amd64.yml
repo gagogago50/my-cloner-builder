@@ -63,12 +63,9 @@ jobs:
             --without-prebuilds=sdk `
             --disable-gadget `
             --disable-server `
-            --disable-portal `
             --disable-inject `
             --disable-frida-tools `
-            --disable-frida-node `
-            --disable-frida-qml `
-            --disable-frida-clr `
+            --disable-graft-tool `
             --enable-frida-python `
             -- `
             "-Dfrida-core:compiler_backend=disabled"
