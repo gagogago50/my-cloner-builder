@@ -68,7 +68,8 @@ jobs:
             --disable-graft-tool `
             --enable-frida-python `
             -- `
-            "-Dfrida-core:compiler_backend=disabled"
+            "-Dfrida-core:compiler_backend=disabled" `
+            "-Dfrida-core:fruity_backend=disabled"
           if ($LASTEXITCODE -ne 0) { throw "Frida configure failed" }
 
       - name: Compile Frida
