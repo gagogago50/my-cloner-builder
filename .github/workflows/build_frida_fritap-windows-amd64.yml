@@ -69,17 +69,39 @@ jobs:
             --enable-frida-python `
             -- `
             "-Dfrida-core:compiler_backend=disabled" `
-            "-Dfrida-core:fruity_backend=disabled"
+            "-Dfrida-core:local_backend=enabled" `
+            "-Dfrida-core:fruity_backend=disabled" `
+            "-Dfrida-core:droidy_backend=disabled" `
+            "-Dfrida-core:socket_backend=disabled" `
+            "-Dfrida-core:barebone_backend=disabled" `
+            "-Dfrida-core:simmy_backend=disabled" `
+            "-Dfrida-core:connectivity=disabled"
           if ($LASTEXITCODE -ne 0) { throw "Frida configure failed" }
 
       - name: Compile Frida
         shell: pwsh
         working-directory: frida-source
         run: |
-          .\make.bat
-          if ($LASTEXITCODE -ne 0) { throw "Frida compilation failed" }
-          .\make.bat install
-          if ($LASTEXITCODE -ne 0) { throw "Frida installation failed" }
+          $env:V = "1"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\diagnostics" | Out-Null
+          .\make.bat 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\diagnostics\frida-build.log"
+          $buildExit = $LASTEXITCODE
+          if (Test-Path "build\meson-logs") {
+            Copy-Item -Recurse -Force "build\meson-logs" "$env:GITHUB_WORKSPACE\diagnostics\meson-logs"
+          }
+          if ($buildExit -ne 0) { throw "Frida compilation failed; download the diagnostics artifact" }
+
+          .\make.bat install 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\diagnostics\frida-install.log"
+          if ($LASTEXITCODE -ne 0) { throw "Frida installation failed; download the diagnostics artifact" }
+
+      - name: Upload Frida diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: frida-build-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Package and test the source-built Frida wheel
         shell: pwsh
