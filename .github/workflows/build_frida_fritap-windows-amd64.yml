@@ -263,6 +263,7 @@ jobs:
             --mode=standalone `
             --msvc=latest `
             --disable-ccache `
+            --assume-yes-for-downloads `
             --windows-console-mode=force `
             --output-dir=dist `
             --output-filename=fritap.exe `
