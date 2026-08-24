@@ -1,4 +1,4 @@
-name: Build FlaUI-MCP Windows x64
+name: Build and Security Scan
 
 on:
   workflow_dispatch:
@@ -6,49 +6,73 @@ on:
 permissions:
   contents: read
 
+env:
+  UPSTREAM_REPO: shanselman/FlaUI-MCP
+  PROJECT_FILE: src/FlaUI.Mcp/FlaUI.Mcp.csproj
+  DOTNET_VERSION: "8.0.x"
+
 jobs:
-  build:
-    name: Build win-x64
+  # =========================================================================
+  # JOB 1 — BUILD WINDOWS AMD64
+  # =========================================================================
+  build-win-x64:
+    name: "📦 Build Windows x64"
     runs-on: windows-latest
 
+    # Aucun needs: ce job s'exécute en parallèle des scans.
+    # Les scans ne peuvent donc pas bloquer le build.
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
+          # Pour un fork, utiliser le dépôt courant.
+          # Pour builder explicitement l'upstream, garder cette ligne.
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
 
-      - name: Setup .NET 8
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 8.0.x
-
-      - name: Display tool versions
+      - name: Verify repository layout
         shell: pwsh
         run: |
-          dotnet --info
-          git --version
+          Write-Host "Current directory:"
+          Get-Location
 
-      - name: Restore dependencies
+          Write-Host "Repository files:"
+          Get-ChildItem -Force
+
+          if (!(Test-Path "${{ env.PROJECT_FILE }}")) {
+            Write-Error "Project file not found: ${{ env.PROJECT_FILE }}"
+            Write-Host "Available csproj files:"
+            Get-ChildItem -Recurse -Filter *.csproj | Select-Object FullName
+            exit 1
+          }
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
         run: >
           dotnet restore
-          src/FlaUI.Mcp/FlaUI.Mcp.csproj
+          "${{ env.PROJECT_FILE }}"
           --runtime win-x64
 
       - name: Build
         run: >
           dotnet build
-          src/FlaUI.Mcp/FlaUI.Mcp.csproj
+          "${{ env.PROJECT_FILE }}"
           --configuration Release
           --runtime win-x64
           --no-restore
 
-      - name: Publish self-contained single-file executable
+      - name: Publish self-contained single-file
         shell: pwsh
         run: |
           $output = "artifacts/FlaUI-MCP-win-x64"
 
           dotnet publish `
-            src/FlaUI.Mcp/FlaUI.Mcp.csproj `
+            "${{ env.PROJECT_FILE }}" `
             --configuration Release `
             --runtime win-x64 `
             --self-contained true `
@@ -60,32 +84,371 @@ jobs:
             -p:DebugType=None `
             -p:DebugSymbols=false
 
+          if (!(Test-Path "$output/FlaUI.Mcp.exe")) {
+            Write-Error "FlaUI.Mcp.exe was not generated"
+            Get-ChildItem -Recurse $output
+            exit 1
+          }
+
           Remove-Item "$output/*.pdb" -Force -ErrorAction SilentlyContinue
 
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: |
-          $file = "artifacts/FlaUI-MCP-win-x64/FlaUI.Mcp.exe"
-
-          if (!(Test-Path $file)) {
-            throw "Executable not found: $file"
-          }
-
-          Get-FileHash $file -Algorithm SHA256 |
-            Format-List |
+          Get-FileHash `
+            "artifacts/FlaUI-MCP-win-x64/FlaUI.Mcp.exe" `
+            -Algorithm SHA256 |
             Out-File "artifacts/FlaUI-MCP-win-x64/SHA256SUMS.txt"
 
-      - name: Create ZIP archive
+      - name: Create ZIP
         shell: pwsh
         run: |
           Compress-Archive `
             -Path "artifacts/FlaUI-MCP-win-x64/*" `
             -DestinationPath "artifacts/FlaUI-MCP-win-x64.zip"
 
-      - name: Upload artifact
+      - name: Upload Windows x64 artifact
         uses: actions/upload-artifact@v4
         with:
           name: FlaUI-MCP-win-x64
           path: artifacts/FlaUI-MCP-win-x64.zip
           if-no-files-found: error
           retention-days: 14
+
+  # =========================================================================
+  # JOB 2 — SCANS DE SÉCURITÉ
+  # =========================================================================
+  security-and-report:
+    name: "🔐 Security scans + Report"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    # Aucun needs: exécution parallèle avec build-win-x64.
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Prepare results directory
+        run: mkdir -p results report
+
+      - name: Binary / precompiled scan
+        continue-on-error: true
+        run: |
+          set +e
+
+          LOG=results/binaries.log
+          FOUND=0
+
+          {
+            echo "# Binary / Precompiled Scan"
+            echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+          } > "$LOG"
+
+          SUSPECT_EXT="exe dll bin msi sys so dylib bat cmd cpl scr pyc class jar war com pif"
+
+          for ext in $SUSPECT_EXT; do
+            mapfile -t FILES < <(
+              find . -type f -iname "*.$ext" \
+                -not -path "*/.git/*" \
+                -not -path "*/node_modules/*" \
+                -not -path "*/dist/*" \
+                -not -path "*/build/*" \
+                2>/dev/null || true
+            )
+
+            if [ "${#FILES[@]}" -gt 0 ]; then
+              echo "### .$ext" >> "$LOG"
+              printf '%s\n' "${FILES[@]}" >> "$LOG"
+              FOUND=1
+            fi
+          done
+
+          echo "## File headers" >> "$LOG"
+
+          while IFS= read -r -d '' file; do
+            TYPE=$(file -b "$file" 2>/dev/null || true)
+
+            if echo "$TYPE" | grep -qE \
+              'PE32|PE32\+|ELF|Mach-O|executable|shared object|MS-DOS executable'; then
+              echo "- \`$file\` → $TYPE" >> "$LOG"
+              FOUND=1
+            fi
+          done < <(
+            find . -type f \
+              -not -path "*/.git/*" \
+              -size +512c \
+              -print0 2>/dev/null
+          )
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "FAIL" > results/binaries.status
+            echo "**Résultat: FAIL**" >> "$LOG"
+          else
+            echo "PASS" > results/binaries.status
+            echo "**Résultat: PASS**" >> "$LOG"
+          fi
+
+          cat "$LOG"
+
+      - name: ClamAV
+        continue-on-error: true
+        run: |
+          set +e
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav clamav-freshclam
+          sudo freshclam --quiet || true
+
+          LOG=results/clamav.log
+
+          clamscan -r -i \
+            --exclude-dir=.git \
+            --exclude-dir=node_modules \
+            --exclude-dir=dist \
+            --exclude-dir=build \
+            --max-filesize=50M \
+            --max-scansize=200M \
+            . > "$LOG" 2>&1
+
+          RC=$?
+
+          if [ "$RC" -eq 0 ]; then
+            echo "PASS" > results/clamav.status
+            echo "**Résultat: PASS**" >> "$LOG"
+          elif [ "$RC" -eq 1 ]; then
+            echo "FAIL" > results/clamav.status
+            echo "**Résultat: FAIL — infection détectée**" >> "$LOG"
+          else
+            echo "WARN" > results/clamav.status
+            echo "**Résultat: WARN — ClamAV exit $RC**" >> "$LOG"
+          fi
+
+          cat "$LOG"
+
+      - name: Gitleaks
+        continue-on-error: true
+        run: |
+          set +e
+
+          curl -sSL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz" |
+            tar -xz gitleaks
+
+          sudo install -m 755 gitleaks /usr/local/bin/gitleaks
+
+          LOG=results/gitleaks.log
+
+          gitleaks detect \
+            --source . \
+            --no-git \
+            --verbose \
+            --report-format json \
+            --report-path results/gitleaks-report.json \
+            2>&1 | tee "$LOG"
+
+          RC=${PIPESTATUS[0]}
+
+          if [ "$RC" -eq 0 ]; then
+            echo "PASS" > results/gitleaks.status
+            echo "**Résultat: PASS**" >> "$LOG"
+          else
+            echo "FAIL" > results/gitleaks.status
+            echo "**Résultat: FAIL — secrets potentiels**" >> "$LOG"
+          fi
+
+      - name: Semgrep
+        continue-on-error: true
+        run: |
+          set +e
+
+          python3 -m pip install --user -q semgrep
+
+          LOG=results/semgrep.log
+
+          semgrep scan \
+            --config p/security-audit \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --json \
+            --output results/semgrep-report.json \
+            . > "$LOG" 2>&1
+
+          RC=$?
+
+          FINDINGS=0
+
+          if [ -f results/semgrep-report.json ]; then
+            FINDINGS=$(
+              python3 -c '
+          import json
+          with open("results/semgrep-report.json") as f:
+              data = json.load(f)
+          print(len(data.get("results", [])))
+          ' 2>/dev/null || echo 0
+            )
+          fi
+
+          {
+            echo ""
+            echo "Semgrep exit code: $RC"
+            echo "Findings: $FINDINGS"
+          } >> "$LOG"
+
+          if [ "$RC" -ge 2 ]; then
+            echo "WARN" > results/semgrep.status
+            echo "**Résultat: WARN — erreur Semgrep**" >> "$LOG"
+          elif [ "$FINDINGS" -gt 0 ]; then
+            echo "WARN" > results/semgrep.status
+            echo "**Résultat: WARN — $FINDINGS finding(s)**" >> "$LOG"
+          else
+            echo "PASS" > results/semgrep.status
+            echo "**Résultat: PASS**" >> "$LOG"
+          fi
+
+          cat "$LOG"
+
+      # Socket est optionnel : un token absent ne doit pas bloquer le rapport.
+      - name: Socket Firewall
+        id: socket
+        continue-on-error: true
+        uses: SocketDev/action@v1
+        with:
+          socket-token: ${{ secrets.SOCKET_SECURITY_API_KEY }}
+          mode: firewall
+
+      - name: Save Socket status
+        if: always()
+        run: |
+          mkdir -p results
+
+          case "${{ steps.socket.outcome }}" in
+            success)
+              echo "PASS" > results/socket.status
+              echo "**Résultat: PASS — Socket Firewall OK**" > results/socket.log
+              ;;
+            skipped)
+              echo "WARN" > results/socket.status
+              echo "**Résultat: WARN — Socket ignoré**" > results/socket.log
+              ;;
+            *)
+              echo "WARN" > results/socket.status
+              echo "**Résultat: WARN — Socket indisponible ou token absent**" > results/socket.log
+              ;;
+          esac
+
+          cat results/socket.log
+
+      - name: Suspicious patterns scan
+        continue-on-error: true
+        run: |
+          set +e
+
+          LOG=results/patterns.log
+
+          grep -RInE \
+            --exclude-dir=.git \
+            --exclude-dir=node_modules \
+            --exclude-dir=dist \
+            --exclude-dir=build \
+            'FromBase64String|Assembly\.Load|Invoke-WebRequest|DownloadString|WebClient|curl|wget|powershell|rundll32|regsvr32|certutil|schtasks|RunKey|HKCU|HKLM' \
+            . > "$LOG" 2>&1
+
+          RC=$?
+
+          if [ "$RC" -eq 0 ]; then
+            echo "WARN" > results/patterns.status
+            echo "**Résultat: WARN — motifs potentiellement sensibles trouvés**" >> "$LOG"
+          else
+            echo "PASS" > results/patterns.status
+            echo "**Résultat: PASS**" >> "$LOG"
+          fi
+
+          cat "$LOG"
+
+      - name: Generate SECURITY_REPORT.md
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          status() {
+            file="results/$1.status"
+            if [ -f "$file" ]; then
+              tr -d '\r\n' < "$file"
+            else
+              echo "N/A"
+            fi
+          }
+
+          log() {
+            file="results/$1.log"
+            if [ -f "$file" ]; then
+              cat "$file"
+            else
+              echo "Log indisponible"
+            fi
+          }
+
+          mkdir -p report
+
+          {
+            echo "# Security Report — FlaUI-MCP"
+            echo
+            echo "| Scan | Statut |"
+            echo "|---|---|"
+            echo "| Binaires précompilés | $(status binaries) |"
+            echo "| ClamAV | $(status clamav) |"
+            echo "| Gitleaks | $(status gitleaks) |"
+            echo "| Semgrep | $(status semgrep) |"
+            echo "| Socket | $(status socket) |"
+            echo "| Patterns suspects | $(status patterns) |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "## Binary scan"
+            echo '```text'
+            log binaries
+            echo '```'
+            echo
+            echo "## ClamAV"
+            echo '```text'
+            log clamav
+            echo '```'
+            echo
+            echo "## Gitleaks"
+            echo '```text'
+            log gitleaks
+            echo '```'
+            echo
+            echo "## Semgrep"
+            echo '```text'
+            log semgrep
+            echo '```'
+            echo
+            echo "## Socket"
+            echo '```text'
+            log socket
+            echo '```'
+            echo
+            echo "## Suspicious patterns"
+            echo '```text'
+            log patterns
+            echo '```'
+          } > report/SECURITY_REPORT.md
+
+          cp -r results report/raw-results
+
+          cat report/SECURITY_REPORT.md
+
+      - name: Upload security report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Security-Report
+          path: report/
+          retention-days: 30
