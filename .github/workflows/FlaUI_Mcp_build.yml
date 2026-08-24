@@ -1,0 +1,91 @@
+name: Build FlaUI-MCP Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build win-x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Display tool versions
+        shell: pwsh
+        run: |
+          dotnet --info
+          git --version
+
+      - name: Restore dependencies
+        run: >
+          dotnet restore
+          src/FlaUI.Mcp/FlaUI.Mcp.csproj
+          --runtime win-x64
+
+      - name: Build
+        run: >
+          dotnet build
+          src/FlaUI.Mcp/FlaUI.Mcp.csproj
+          --configuration Release
+          --runtime win-x64
+          --no-restore
+
+      - name: Publish self-contained single-file executable
+        shell: pwsh
+        run: |
+          $output = "artifacts/FlaUI-MCP-win-x64"
+
+          dotnet publish `
+            src/FlaUI.Mcp/FlaUI.Mcp.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --no-restore `
+            --output $output `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false
+
+          Remove-Item "$output/*.pdb" -Force -ErrorAction SilentlyContinue
+
+      - name: Generate SHA-256 checksum
+        shell: pwsh
+        run: |
+          $file = "artifacts/FlaUI-MCP-win-x64/FlaUI.Mcp.exe"
+
+          if (!(Test-Path $file)) {
+            throw "Executable not found: $file"
+          }
+
+          Get-FileHash $file -Algorithm SHA256 |
+            Format-List |
+            Out-File "artifacts/FlaUI-MCP-win-x64/SHA256SUMS.txt"
+
+      - name: Create ZIP archive
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "artifacts/FlaUI-MCP-win-x64/*" `
+            -DestinationPath "artifacts/FlaUI-MCP-win-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlaUI-MCP-win-x64
+          path: artifacts/FlaUI-MCP-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
