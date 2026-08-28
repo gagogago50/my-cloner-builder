@@ -1,0 +1,103 @@
+name: Build OwnTV from source (no fork, manual run)
+
+# Déclenchement manuel uniquement — build d'artifacts SANS publication dans GitHub Releases
+# Pas besoin de forker ni de push dans ahXN00/OwnTV. Clone read-only du source.
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Type de build (debug = non signé, sans keystore requis)'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+      upload_artifact:
+        description: 'Uploader l''APK en artifact ?'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read  # lecture du repo source
+  actions: write  # upload d'artifacts
+
+jobs:
+  build-owntv:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout OwnTV source (read-only clone)
+        uses: actions/checkout@v4
+        with:
+          # Clone du repo original sans le choisir comme repo du workflow
+          repository: ahXN00/OwnTV
+          path: owntv-source
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up JDK 21 (matches gradle/gradle-daemon-jvm.properties)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Grant execute permission for gradlew
+        working-directory: owntv-source
+        run: chmod +x ./gradlew
+
+      - name: Build OwnTV APK (debug, non signé — pas de keystore)
+        working-directory: owntv-source
+        env:
+          # Variables d'environnement utilisées par le build (pas de secrets requis)
+          VERSION_CODE: 99999
+          VERSION_NAME: 99.99.99
+        run: |
+          echo "Building OwnTV debug APK (non signé, sans keystore, PAS de publication dans GitHub Releases)"
+          ./gradlew assembleStandardDebug --stacktrace
+
+      - name: Locate built APK
+        id: find_apk
+        working-directory: owntv-source
+        run: |
+          # Recherche des APK produits (release ou debug, standard ou x86_64)
+          APK_FILE=$(find app/build/outputs/apk -name '*.apk' | head -n1)
+          if [ -z "$APK_FILE" ]; then
+            echo "Aucun APK trouvé. Liste du dossier :"
+            find app/build/outputs/apk -type f || true
+            exit 1
+          fi
+          echo "apk_path=$APK_FILE" >> "$GITHUB_OUTPUT"
+          echo "APK trouvé : $APK_FILE"
+          echo "Taille : $(ls -lh $APK_FILE)"
+
+      - name: Rename APK for artifact
+        working-directory: owntv-source
+        run: |
+          mkdir -p dist
+          cp "${{ steps.find_apk.outputs.apk_path }}" "dist/OwnTV-manual-debug.apk"
+          ls -lh dist/
+
+      - name: Upload APK artifact (optional)
+        if: ${{ github.event.inputs.upload_artifact == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: OwnTV-manual-debug
+          path: owntv-source/dist/*.apk
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Build summary (PAS de push dans GitHub Releases)
+        run: |
+          echo "=== Build OwnTV terminé ==="
+          echo "Type : debug (non signé, sans keystore)"
+          echo "Artifact upload : ${{ github.event.inputs.upload_artifact }}"
+          echo "Aucun APK n'a été poussé dans GitHub Releases."
+          echo "Le workflow n'a pas modifié le repo source (ahXN00/OwnTV) — aucun fork ni push nécessaire."
