@@ -18,7 +18,7 @@ on:
         default: "master"
         type: string
       lazarus_version:
-        description: "Version de Lazarus (2.2.2 recommande pour CE)"
+        description: "Version de Lazarus"
         required: false
         default: "2.2.6"
         type: choice
@@ -35,12 +35,12 @@ on:
           - "9.0.x"
           - "7.0.x"
       enable_avx:
-        description: "Activer AVX/AVX2 pour DotNetDataCollector"
+        description: "Activer AVX/AVX2"
         required: false
         default: true
         type: boolean
       apply_code_patches:
-        description: "Appliquer les patches d'amelioration"
+        description: "Appliquer les patches"
         required: false
         default: true
         type: boolean
@@ -68,7 +68,7 @@ jobs:
           [extend]
           useDefault = true
           [allowlist]
-          description = "Faux positifs connus - code source Cheat Engine tiers"
+          description = "Faux positifs connus"
           paths = [
             "Cheat Engine/feces\.pas",
             "Cheat Engine/frmluaengineunit\.lfm"
@@ -110,6 +110,21 @@ jobs:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           submodules: recursive
+
+      # ===================================================================
+      # Install missing dependencies (Windows SDK 8.1, .NET 4.6.1, choco)
+      # ===================================================================
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          Write-Host "::group::Installing Chocolatey packages..."
+          # Windows SDK 8.1 (required by old C++ projects)
+          choco install windows-sdk-8.1 -y --no-progress 2>&1 | Out-Null
+          # .NET Framework 4.6.1 Developer Pack (required by CEPluginLibrary)
+          choco install netfx-4.6.1-devpack -y --no-progress 2>&1 | Out-Null
+          # Visual C++ 2013 Redist (build tools legacy support)
+          choco install vcredist2013 -y --no-progress 2>&1 | Out-Null
+          Write-Host "::endgroup::"
 
       # ===================================================================
       # Setup toolchain
@@ -252,6 +267,35 @@ jobs:
           } else {
               Write-Warning "ppc386.exe introuvable apres installation."
           }
+
+      # ===================================================================
+      # Retarget old VS projects (v120, v141_xp -> v143 + Win10 SDK)
+      # ===================================================================
+      - name: Retarget Visual Studio projects to v143
+        shell: pwsh
+        run: |
+          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
+          $vcxprojFiles = Get-ChildItem -Path $ceDir -Recurse -Filter "*.vcxproj" -ErrorAction SilentlyContinue
+          Write-Host "Retargeting $($vcxprojFiles.Count) .vcxproj files..."
+          $retargeted = 0
+          foreach ($proj in $vcxprojFiles) {
+              $content = Get-Content $proj.FullName -Raw -Encoding UTF8
+              $orig = $content
+              # Retarget toolsets
+              $content = $content -replace '<PlatformToolset>v120</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
+              $content = $content -replace '<PlatformToolset>v140</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
+              $content = $content -replace '<PlatformToolset>v141</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
+              $content = $content -replace '<PlatformToolset>v141_xp</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
+              $content = $content -replace '<PlatformToolset>v142</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
+              # Retarget Windows SDK
+              $content = $content -replace '<WindowsTargetPlatformVersion>8\.1</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
+              $content = $content -replace '<WindowsTargetPlatformVersion>8\.0</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
+              if ($content -ne $orig) {
+                  Set-Content -Path $proj.FullName -Value $content -Encoding UTF8 -NoNewline
+                  $retargeted++
+              }
+          }
+          Write-Host "Retargeted $retargeted projects to v143 + Windows 10 SDK"
 
       # ===================================================================
       # Patches d'amelioration
@@ -495,7 +539,7 @@ jobs:
           exit 0
 
       # ===================================================================
-      # Build Visual Studio sub-projects (toutes solutions) + collecte
+      # Build Visual Studio sub-projects avec configs auto-detectees
       # ===================================================================
       - name: Build Visual Studio sub-projects (.sln)
         continue-on-error: true
@@ -507,25 +551,41 @@ jobs:
           New-Item -ItemType Directory -Path $binDir -Force | Out-Null
           New-Item -ItemType Directory -Path $autorunDlls -Force | Out-Null
 
-          $nuget = Get-Command nuget -ErrorAction SilentlyContinue
-          if (-not $nuget) { $nuget = Get-Command nuget.exe -ErrorAction SilentlyContinue }
+          $nuget = Get-Command nuget.exe -ErrorAction SilentlyContinue
           $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
 
-          # Definition: Nom, Plateformes, Type (dotnet|cpp|mixed), Destination, Critique
+          # Fonction pour lire les configs Release d'un .sln
+          function Get-ReleaseConfigs {
+              param([string]$SlnPath)
+              $content = Get-Content $SlnPath -Raw
+              $configs = @()
+              if ($content -match 'GlobalSection\(SolutionConfigurationPlatforms\)\s*=\s*preSolution(.*?)EndGlobalSection') {
+                  $section = $matches[1]
+                  $lines = $section -split "`n"
+                  foreach ($line in $lines) {
+                      if ($line -match '^\s*Release\|(\S+)\s*=') {
+                          $configs += $matches[1]
+                      }
+                  }
+              }
+              return $configs | Select-Object -Unique
+          }
+
+          # Definition: Nom, Type (dotnet|cpp), Destination
           $solutions = @(
-              @{ Name="DotNetDataCollector.sln";         Platforms=@("x86","x64"); Type="dotnet"; Dest="bin";     Critical=$false },
-              @{ Name="DotNetInvasiveDataCollector.sln"; Platforms=@("Any CPU");   Type="dotnet"; Dest="bin";     Critical=$false },
-              @{ Name="MonoDataCollector.sln";           Platforms=@("x86","x64"); Type="cpp";    Dest="autorun"; Critical=$false },
-              @{ Name="CEJVMTI.sln";                     Platforms=@("x86","x64"); Type="cpp";    Dest="autorun"; Critical=$false },
-              @{ Name="Direct x mess.sln";               Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
-              @{ Name="CSCompiler.sln";                  Platforms=@("Any CPU");   Type="dotnet"; Dest="bin";     Critical=$false },
-              @{ Name="tcc.sln";                         Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
-              @{ Name="dbkkernel.sln";                   Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
-              @{ Name="cudaPointerScan.sln";             Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
-              @{ Name="lua53.sln";                       Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
-              @{ Name="CEPluginLibrary.sln";             Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
-              @{ Name="example-c.sln";                   Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
-              @{ Name="QWS.sln";                         Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false }
+              @{ Name="DotNetDataCollector.sln";         Type="cpp";    Dest="bin" },
+              @{ Name="DotNetInvasiveDataCollector.sln"; Type="dotnet"; Dest="bin" },
+              @{ Name="MonoDataCollector.sln";           Type="cpp";    Dest="autorun" },
+              @{ Name="CEJVMTI.sln";                     Type="cpp";    Dest="autorun" },
+              @{ Name="Direct x mess.sln";               Type="cpp";    Dest="bin" },
+              @{ Name="CSCompiler.sln";                  Type="dotnet"; Dest="bin" },
+              @{ Name="tcc.sln";                         Type="cpp";    Dest="bin" },
+              @{ Name="dbkkernel.sln";                   Type="cpp";    Dest="bin" },
+              @{ Name="cudaPointerScan.sln";             Type="cpp";    Dest="bin" },
+              @{ Name="lua53.sln";                       Type="cpp";    Dest="bin" },
+              @{ Name="CEPluginLibrary.sln";             Type="dotnet"; Dest="bin" },
+              @{ Name="example-c.sln";                   Type="cpp";    Dest="bin" },
+              @{ Name="QWS.sln";                         Type="cpp";    Dest="bin" }
           )
 
           foreach ($sol in $solutions) {
@@ -539,50 +599,52 @@ jobs:
               $solBase = [System.IO.Path]::GetFileNameWithoutExtension($solPath.Name)
               Write-Host "::group::BUILD: $($sol.Name)"
 
-              # --- RESTORE ---
-              if ($sol.Type -eq "dotnet") {
-                  if ($nuget) {
-                      Write-Host "  -> nuget restore..."
-                      & $nuget.Source restore "$($solPath.FullName)" -NonInteractive 2>&1
-                  } elseif ($dotnet) {
-                      Write-Host "  -> dotnet restore..."
-                      & dotnet restore "$($solPath.FullName)" 2>&1
-                  }
+              # Detecter les configs Release disponibles
+              $configs = Get-ReleaseConfigs -SlnPath $solPath.FullName
+              if ($configs.Count -eq 0) {
+                  Write-Warning "  Aucune config Release detectee - tentative avec config par defaut"
+                  $configs = @("")
               }
 
-              foreach ($plat in $sol.Platforms) {
-                  $msbuildPlat = if ($plat -eq "Any CPU") { "AnyCPU" } else { $plat }
-                  Write-Host "  -> Plateforme: $plat"
+              # Restore NuGet pour .NET
+              if ($sol.Type -eq "dotnet" -and $nuget) {
+                  Write-Host "  -> nuget restore..."
+                  & $nuget.Source restore "$($solPath.FullName)" -NonInteractive 2>&1
+              }
 
-                  & msbuild "$($solPath.FullName)" `
-                      /nologo /verbosity:minimal `
-                      /p:Configuration=Release `
-                      /p:Platform="$msbuildPlat" 2>&1
+              foreach ($plat in $configs) {
+                  $platArg = if ([string]::IsNullOrWhiteSpace($plat)) { "" } else { "/p:Platform=`"$plat`"" }
+                  Write-Host "  -> Config: Release|$plat"
+
+                  $msbuildArgs = @(
+                      "`"$($solPath.FullName)`"",
+                      "/nologo",
+                      "/verbosity:minimal",
+                      "/p:Configuration=Release"
+                  )
+                  if ($platArg) { $msbuildArgs += $platArg }
+
+                  & msbuild @msbuildArgs 2>&1
                   $exit = $LASTEXITCODE
 
                   if ($exit -ne 0) {
-                      if ($sol.Critical) { throw "CRITIQUE ECHOUE: $($sol.Name) [$plat]" }
-                      else { Write-Warning "  ECHOUE: $($sol.Name) [$plat] (code $exit)" }
+                      Write-Warning "  ECHOUE: $($sol.Name) [Release|$plat] (code $exit)"
                       continue
                   }
                   Write-Host "  -> BUILD OK"
 
-                  # --- COLLECTE EXHAUSTIVE ---
+                  # Collecte
                   $targetDir = if ($sol.Dest -eq "autorun") { $autorunDlls } else { $binDir }
 
-                  # Chercher dans TOUT l'arbre de la solution
                   $allFiles = @()
                   $exts = @('*.dll','*.exe','*.sys','*.lib','*.pdb')
                   foreach ($ext in $exts) {
                       $allFiles += Get-ChildItem -Path $solFolder -Recurse -Filter $ext -ErrorAction SilentlyContinue |
                           Where-Object {
                               ($_.FullName -match 'Release') -and
-                              ($_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj|Obj|ref|refs)\\') -and
-                              ($_.FullName -notmatch '\\(project\.|\.nuget|\.tools)')
+                              ($_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj|Obj|ref|refs)\\')
                           }
                   }
-
-                  # Si toujours rien, fallback encore plus large
                   if ($allFiles.Count -eq 0) {
                       foreach ($ext in $exts) {
                           $allFiles += Get-ChildItem -Path $solFolder -Recurse -Filter $ext -ErrorAction SilentlyContinue |
@@ -595,9 +657,9 @@ jobs:
                   foreach ($file in $allFiles) {
                       try {
                           Copy-Item $file.FullName -Destination $targetDir -Force
-                          Write-Host "    [COLLECT] $($file.Name) ($($file.Length) bytes) -> $($sol.Dest)/"
+                          Write-Host "    [COLLECT] $($file.Name) ($($file.Length) bytes)"
                           $copied++
-                      } catch { Write-Warning "    Echec copie $($file.Name): $_" }
+                      } catch { }
                   }
                   Write-Host "  -> $copied fichier(s) collecte(s)"
               }
@@ -606,7 +668,7 @@ jobs:
           exit 0
 
       # ===================================================================
-      # Fallback DotNetDataCollector via dotnet CLI (si msbuild a echoue)
+      # Fallback DotNetDataCollector via dotnet CLI
       # ===================================================================
       - name: Build DotNetDataCollector fallback (dotnet CLI)
         continue-on-error: true
@@ -622,7 +684,6 @@ jobs:
 
           $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
 
-          # x64
           Write-Host "::group::dotnet build DNC x64 (fallback)"
           & dotnet restore $proj.FullName 2>&1
           & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false 2>&1
@@ -632,7 +693,6 @@ jobs:
           }
           Write-Host "::endgroup::"
 
-          # x86
           Write-Host "::group::dotnet build DNC x86 (fallback)"
           & dotnet build $proj.FullName -c Release -r win-x86 --self-contained false 2>&1
           Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -641,7 +701,6 @@ jobs:
           }
           Write-Host "::endgroup::"
 
-          # AVX
           if ("${{ inputs.enable_avx }}" -eq "true") {
               Write-Host "::group::dotnet build DNC AVX (fallback)"
               & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false `
@@ -666,22 +725,10 @@ jobs:
           $tcclibDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\tcclib"
           $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
           if (-not (Test-Path $tcclibDir)) { Write-Host "tcclib absent"; exit 0 }
-
-          # Recherche recursive tres large
-          $dlls = Get-ChildItem -Path $tcclibDir -Recurse -Include "*.dll" -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -match "tcc|tcclib" }
-          if ($dlls) {
-              foreach ($dll in $dlls) {
-                  Copy-Item $dll.FullName -Destination $binDir -Force
-                  Write-Host "Copie $($dll.Name) -> bin"
-              }
-          } else {
-              # Fallback: tous les DLLs de tcclib
-              $allDlls = Get-ChildItem -Path $tcclibDir -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue
-              foreach ($dll in $allDlls) {
-                  Copy-Item $dll.FullName -Destination $binDir -Force
-                  Write-Host "Copie fallback $($dll.Name) -> bin"
-              }
+          $dlls = Get-ChildItem -Path $tcclibDir -Recurse -Include "*.dll" -ErrorAction SilentlyContinue
+          foreach ($dll in $dlls) {
+              Copy-Item $dll.FullName -Destination $binDir -Force
+              Write-Host "Copie $($dll.Name) -> bin"
           }
           exit 0
 
