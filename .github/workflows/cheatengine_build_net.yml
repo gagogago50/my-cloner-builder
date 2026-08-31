@@ -1,4 +1,4 @@
-name: complete Build Cheat Engine
+name: Secure Build Cheat Engine
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -125,12 +125,24 @@ jobs:
           dotnet-version: ${{ inputs.dotnet_version }}
         continue-on-error: true
 
+      - name: Setup NuGet CLI
+        shell: pwsh
+        run: |
+          $nugetPath = "${env:LOCALAPPDATA}\nuget"
+          New-Item -ItemType Directory -Path $nugetPath -Force | Out-Null
+          $nugetExe = Join-Path $nugetPath "nuget.exe"
+          if (-not (Test-Path $nugetExe)) {
+              Invoke-WebRequest -Uri "https://dist.nuget.org/win-x86-commandline/latest/nuget.exe" -OutFile $nugetExe -UseBasicParsing
+          }
+          echo "$nugetPath" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "NuGet: $nugetExe"
+
       - name: Setup NuGet cache
         if: ${{ success() }}
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ inputs.dotnet_version }}-${{ hashFiles('**/*.csproj') }}
+          key: ${{ runner.os }}-nuget-${{ inputs.dotnet_version }}-${{ hashFiles('**/*.csproj','**/packages.config') }}
           restore-keys: |
             ${{ runner.os }}-nuget-
 
@@ -454,7 +466,6 @@ jobs:
                   if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpr.Name) [64-bit]" }
                   Write-Host "::endgroup::"
               }
-              # Copier les outputs vers bin/
               Get-ChildItem -Path $p -Recurse -Include "*.dll","*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
                   if ($_.FullName -notmatch '\\(lib|packages)\\') {
                       Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
@@ -484,123 +495,10 @@ jobs:
           exit 0
 
       # ===================================================================
-      # Build DotNetDataCollector — x64 (dotnet CLI) + copie
-      # ===================================================================
-      - name: Build DotNetDataCollector (x64)
-        shell: pwsh
-        run: |
-          $dncDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\DotNetDataCollector"
-          if (-not (Test-Path $dncDir)) { Write-Warning "DNC absent"; exit 0 }
-          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-          if (-not $dotnet) { Write-Warning "dotnet absent"; exit 0 }
-
-          $proj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $proj) { Write-Warning "Aucun .csproj DNC"; exit 0 }
-
-          Write-Host "::group::dotnet restore + build DNC x64"
-          & dotnet restore $proj.FullName 2>&1
-          & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false -p:Platform=x64 --no-restore 2>&1
-          Write-Host "Exit code x64: $LASTEXITCODE"
-          Write-Host "::endgroup::"
-
-          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
-          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-          Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-              Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
-              Write-Host "Copie DNC x64: $($_.Name) -> bin"
-          }
-          exit 0
-
-      # ===================================================================
-      # Build DotNetDataCollector — x86 + copie
-      # ===================================================================
-      - name: Build DotNetDataCollector (x86)
-        shell: pwsh
-        run: |
-          $dncDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\DotNetDataCollector"
-          if (-not (Test-Path $dncDir)) { exit 0 }
-          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-          if (-not $dotnet) { exit 0 }
-
-          $proj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $proj) { exit 0 }
-
-          Write-Host "::group::dotnet build DNC x86"
-          & dotnet build $proj.FullName -c Release -r win-x86 --self-contained false -p:Platform=x86 2>&1
-          Write-Host "Exit code x86: $LASTEXITCODE"
-          Write-Host "::endgroup::"
-
-          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
-          Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-              Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
-              Write-Host "Copie DNC x86: $($_.Name) -> bin"
-          }
-          exit 0
-
-      # ===================================================================
-      # Build DotNetDataCollector — AVX variant + copie
-      # ===================================================================
-      - name: Build DotNetDataCollector (AVX variant)
-        if: ${{ inputs.enable_avx == true }}
-        shell: pwsh
-        run: |
-          $dncDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\DotNetDataCollector"
-          if (-not (Test-Path $dncDir)) { exit 0 }
-          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-          if (-not $dotnet) { exit 0 }
-
-          $proj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $proj) { exit 0 }
-
-          Write-Host "::group::dotnet build DNC AVX"
-          & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false `
-              -p:Platform=x64 -p:DefineConstants="AVX;AVX2" -p:Optimize=true -p:TieredCompilation=true -p:AVX=true 2>&1
-          if ($LASTEXITCODE -ne 0) { Write-Warning "AVX build echoue"; exit 0 }
-          Write-Host "::endgroup::"
-
-          $binAvx = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin\avx"
-          New-Item -ItemType Directory -Path $binAvx -Force | Out-Null
-          Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-              $destName = $_.BaseName + ".avx" + $_.Extension
-              Copy-Item $_.FullName -Destination (Join-Path $binAvx $destName) -Force
-              Write-Host "Copie DNC AVX: $destName"
-          }
-          exit 0
-
-      # ===================================================================
-      # Restore NuGet pour toutes les solutions .NET
-      # ===================================================================
-      - name: Restore NuGet packages (all .NET solutions)
-        shell: pwsh
-        run: |
-          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-          if (-not $dotnet) { Write-Warning "dotnet absent"; exit 0 }
-
-          $netSolutions = @(
-              "DotNetDataCollector.sln",
-              "DotNetInvasiveDataCollector.sln",
-              "MonoDataCollector.sln",
-              "CEJVMTI.sln",
-              "CSCompiler.sln"
-          )
-          foreach ($solName in $netSolutions) {
-              $solPath = Get-ChildItem -Path $ceDir -Filter $solName -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($solPath) {
-                  Write-Host "::group::nuget restore $solName"
-                  & dotnet restore "$($solPath.FullName)" 2>&1
-                  Write-Host "Restore $solName exit: $LASTEXITCODE"
-                  Write-Host "::endgroup::"
-              } else {
-                  Write-Warning "$solName introuvable"
-              }
-          }
-          exit 0
-
-      # ===================================================================
-      # Build Visual Studio sub-projects + copie dans bin/ et autorun/dlls/
+      # Build Visual Studio sub-projects (toutes solutions) + collecte
       # ===================================================================
       - name: Build Visual Studio sub-projects (.sln)
+        continue-on-error: true
         shell: pwsh
         run: |
           $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
@@ -609,22 +507,25 @@ jobs:
           New-Item -ItemType Directory -Path $binDir -Force | Out-Null
           New-Item -ItemType Directory -Path $autorunDlls -Force | Out-Null
 
-          # Definition: Nom, Plateformes, EstNet, Destination (bin ou autorun/dlls), Critique
-          # Destination: "bin" = racine CE, "autorun" = autorun/dlls/
+          $nuget = Get-Command nuget -ErrorAction SilentlyContinue
+          if (-not $nuget) { $nuget = Get-Command nuget.exe -ErrorAction SilentlyContinue }
+          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+
+          # Definition: Nom, Plateformes, Type (dotnet|cpp|mixed), Destination, Critique
           $solutions = @(
-              @{ Name="DotNetDataCollector.sln";         Platforms=@("x86","x64"); IsNet=$true;  Dest="bin";     Critical=$false },
-              @{ Name="DotNetInvasiveDataCollector.sln"; Platforms=@("Any CPU");   IsNet=$true;  Dest="bin";     Critical=$false },
-              @{ Name="MonoDataCollector.sln";           Platforms=@("x86","x64"); IsNet=$true;  Dest="autorun"; Critical=$false },
-              @{ Name="CEJVMTI.sln";                     Platforms=@("x86","x64"); IsNet=$true;  Dest="autorun"; Critical=$false },
-              @{ Name="Direct x mess.sln";               Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
-              @{ Name="CSCompiler.sln";                  Platforms=@("Any CPU");   IsNet=$true;  Dest="bin";     Critical=$false },
-              @{ Name="tcc.sln";                         Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
-              @{ Name="dbkkernel.sln";                   Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
-              @{ Name="cudaPointerScan.sln";             Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
-              @{ Name="lua53.sln";                       Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
-              @{ Name="CEPluginLibrary.sln";             Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
-              @{ Name="example-c.sln";                   Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
-              @{ Name="QWS.sln";                         Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false }
+              @{ Name="DotNetDataCollector.sln";         Platforms=@("x86","x64"); Type="dotnet"; Dest="bin";     Critical=$false },
+              @{ Name="DotNetInvasiveDataCollector.sln"; Platforms=@("Any CPU");   Type="dotnet"; Dest="bin";     Critical=$false },
+              @{ Name="MonoDataCollector.sln";           Platforms=@("x86","x64"); Type="cpp";    Dest="autorun"; Critical=$false },
+              @{ Name="CEJVMTI.sln";                     Platforms=@("x86","x64"); Type="cpp";    Dest="autorun"; Critical=$false },
+              @{ Name="Direct x mess.sln";               Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
+              @{ Name="CSCompiler.sln";                  Platforms=@("Any CPU");   Type="dotnet"; Dest="bin";     Critical=$false },
+              @{ Name="tcc.sln";                         Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
+              @{ Name="dbkkernel.sln";                   Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
+              @{ Name="cudaPointerScan.sln";             Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
+              @{ Name="lua53.sln";                       Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
+              @{ Name="CEPluginLibrary.sln";             Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
+              @{ Name="example-c.sln";                   Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false },
+              @{ Name="QWS.sln";                         Platforms=@("x86","x64"); Type="cpp";    Dest="bin";     Critical=$false }
           )
 
           foreach ($sol in $solutions) {
@@ -637,6 +538,17 @@ jobs:
               $solFolder = $solPath.DirectoryName
               $solBase = [System.IO.Path]::GetFileNameWithoutExtension($solPath.Name)
               Write-Host "::group::BUILD: $($sol.Name)"
+
+              # --- RESTORE ---
+              if ($sol.Type -eq "dotnet") {
+                  if ($nuget) {
+                      Write-Host "  -> nuget restore..."
+                      & $nuget.Source restore "$($solPath.FullName)" -NonInteractive 2>&1
+                  } elseif ($dotnet) {
+                      Write-Host "  -> dotnet restore..."
+                      & dotnet restore "$($solPath.FullName)" 2>&1
+                  }
+              }
 
               foreach ($plat in $sol.Platforms) {
                   $msbuildPlat = if ($plat -eq "Any CPU") { "AnyCPU" } else { $plat }
@@ -655,24 +567,28 @@ jobs:
                   }
                   Write-Host "  -> BUILD OK"
 
-                  # --- COLLECTE DES OUTPUTS ---
+                  # --- COLLECTE EXHAUSTIVE ---
                   $targetDir = if ($sol.Dest -eq "autorun") { $autorunDlls } else { $binDir }
 
-                  # Recherche recursive dans le dossier de la solution
-                  $allFiles = Get-ChildItem -Path $solFolder -Recurse -File -ErrorAction SilentlyContinue |
-                      Where-Object {
-                          ($_.Extension -in @('.dll','.exe','.sys','.lib','.pdb')) -and
-                          ($_.FullName -match '\\(Release|release)\\') -and
-                          ($_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj|Obj)\\')
-                      }
-
-                  # Fallback si pas trouve avec Release
-                  if (-not $allFiles) {
-                      $allFiles = Get-ChildItem -Path $solFolder -Recurse -File -ErrorAction SilentlyContinue |
+                  # Chercher dans TOUT l'arbre de la solution
+                  $allFiles = @()
+                  $exts = @('*.dll','*.exe','*.sys','*.lib','*.pdb')
+                  foreach ($ext in $exts) {
+                      $allFiles += Get-ChildItem -Path $solFolder -Recurse -Filter $ext -ErrorAction SilentlyContinue |
                           Where-Object {
-                              ($_.Extension -in @('.dll','.exe','.sys','.lib','.pdb')) -and
-                              ($_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj)\\')
-                          } | Select-Object -First 20
+                              ($_.FullName -match 'Release') -and
+                              ($_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj|Obj|ref|refs)\\') -and
+                              ($_.FullName -notmatch '\\(project\.|\.nuget|\.tools)')
+                          }
+                  }
+
+                  # Si toujours rien, fallback encore plus large
+                  if ($allFiles.Count -eq 0) {
+                      foreach ($ext in $exts) {
+                          $allFiles += Get-ChildItem -Path $solFolder -Recurse -Filter $ext -ErrorAction SilentlyContinue |
+                              Where-Object { $_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj)\\' } |
+                              Select-Object -First 10
+                      }
                   }
 
                   $copied = 0
@@ -690,20 +606,83 @@ jobs:
           exit 0
 
       # ===================================================================
+      # Fallback DotNetDataCollector via dotnet CLI (si msbuild a echoue)
+      # ===================================================================
+      - name: Build DotNetDataCollector fallback (dotnet CLI)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $dncDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\DotNetDataCollector"
+          if (-not (Test-Path $dncDir)) { exit 0 }
+          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+          if (-not $dotnet) { exit 0 }
+
+          $proj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $proj) { exit 0 }
+
+          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
+
+          # x64
+          Write-Host "::group::dotnet build DNC x64 (fallback)"
+          & dotnet restore $proj.FullName 2>&1
+          & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false 2>&1
+          Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName -Destination $binDir -Force
+              Write-Host "Fallback x64: $($_.Name)"
+          }
+          Write-Host "::endgroup::"
+
+          # x86
+          Write-Host "::group::dotnet build DNC x86 (fallback)"
+          & dotnet build $proj.FullName -c Release -r win-x86 --self-contained false 2>&1
+          Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName -Destination $binDir -Force
+              Write-Host "Fallback x86: $($_.Name)"
+          }
+          Write-Host "::endgroup::"
+
+          # AVX
+          if ("${{ inputs.enable_avx }}" -eq "true") {
+              Write-Host "::group::dotnet build DNC AVX (fallback)"
+              & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false `
+                  -p:DefineConstants="AVX;AVX2" -p:Optimize=true -p:AVX=true 2>&1
+              $binAvx = Join-Path $binDir "avx"
+              New-Item -ItemType Directory -Path $binAvx -Force | Out-Null
+              Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+                  $destName = $_.BaseName + ".avx" + $_.Extension
+                  Copy-Item $_.FullName -Destination (Join-Path $binAvx $destName) -Force
+                  Write-Host "Fallback AVX: $destName"
+              }
+              Write-Host "::endgroup::"
+          }
+          exit 0
+
+      # ===================================================================
       # Copier tcclib DLLs
       # ===================================================================
       - name: Copy tcclib DLLs to bin
         shell: pwsh
         run: |
-          $tcclibOut = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\tcclib") -Filter "*.dll" -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -match "tcclib|tcc" }
-          if ($tcclibOut) {
-              $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
-              foreach ($dll in $tcclibOut) {
-                  Copy-Item $dll.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
+          $tcclibDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\tcclib"
+          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
+          if (-not (Test-Path $tcclibDir)) { Write-Host "tcclib absent"; exit 0 }
+
+          # Recherche recursive tres large
+          $dlls = Get-ChildItem -Path $tcclibDir -Recurse -Include "*.dll" -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match "tcc|tcclib" }
+          if ($dlls) {
+              foreach ($dll in $dlls) {
+                  Copy-Item $dll.FullName -Destination $binDir -Force
                   Write-Host "Copie $($dll.Name) -> bin"
               }
-          } else { Write-Host "Aucune DLL tcclib trouvee." }
+          } else {
+              # Fallback: tous les DLLs de tcclib
+              $allDlls = Get-ChildItem -Path $tcclibDir -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue
+              foreach ($dll in $allDlls) {
+                  Copy-Item $dll.FullName -Destination $binDir -Force
+                  Write-Host "Copie fallback $($dll.Name) -> bin"
+              }
+          }
           exit 0
 
       # ===================================================================
