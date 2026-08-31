@@ -89,53 +89,33 @@ jobs:
           python3 << 'PY'
           from pathlib import Path
 
-          def must_exist(p: Path) -> Path:
+          def patch(path, old, new, label):
+              p = Path(path)
               if not p.exists():
-                  raise SystemExit(f"missing {p}")
-              return p
+                  raise SystemExit(f"missing {path}")
+              text = p.read_text()
+              if old not in text:
+                  raise SystemExit(f"{label}: pattern not found, aborting")
+              p.write_text(text.replace(old, new, 1))
 
-          uc = must_exist(Path("lib/services/update_checker.dart"))
-          text = uc.read_text()
-          needle = "static Future<UpdateInfo?> checkForUpdate({String channel = 'stable'}) async {"
-          if needle not in text:
-              raise SystemExit("update_checker.dart: signature changed, aborting")
-          text = text.replace(
-              needle,
-              needle + "\n    return null; // source-build: no GitHub auto-update / APK fetch\n",
-              1,
+          patch(
+              "lib/services/update_checker.dart",
+              "static Future<UpdateInfo?> checkForUpdate({String channel = 'stable'}) async {",
+              "static Future<UpdateInfo?> checkForUpdate({String channel = 'stable'}) async {\n    return null;",
+              "update_checker.dart",
           )
-          uc.write_text(text)
-
-          dl = must_exist(Path("lib/services/apk_downloader.dart"))
-          dlt = dl.read_text()
-          n2 = "required String version,"
-          if "downloadApk" not in dlt or n2 not in dlt:
-              raise SystemExit("apk_downloader.dart: signature changed, aborting")
-          # Insert an early return after the opening of downloadApk's try is fragile;
-          # instead refuse every URL at the HTTPS gate by forcing a dummy fail path:
-          old = """    final uri = Uri.tryParse(url);
-      if (uri == null || uri.scheme != 'https') {
-        _log.e('Refusing to download from invalid or non-HTTPS URL');
-        return null;
-      }"""
-          new = """    _log.w('Source build: APK download disabled');
-      return null;
-      final uri = Uri.tryParse(url);
-      if (uri == null || uri.scheme != 'https') {
-        _log.e('Refusing to download from invalid or non-HTTPS URL');
-        return null;
-      }"""
-          if old not in dlt:
-              raise SystemExit("apk_downloader.dart: HTTPS guard changed, aborting")
-          dl.write_text(dlt.replace(old, new, 1))
-
-          st = must_exist(Path("lib/models/settings.dart"))
-          stt = st.read_text()
-          stt2 = stt.replace("this.checkForUpdates = true,", "this.checkForUpdates = false,", 1)
-          if stt2 == stt:
-              raise SystemExit("settings.dart: checkForUpdates default not found")
-          st.write_text(stt2)
-
+          patch(
+              "lib/services/apk_downloader.dart",
+              "ProgressCallback? onProgress,\n  }) async {",
+              "ProgressCallback? onProgress,\n  }) async {\n    return null;",
+              "apk_downloader.dart",
+          )
+          patch(
+              "lib/models/settings.dart",
+              "this.checkForUpdates = true,",
+              "this.checkForUpdates = false,",
+              "settings.dart",
+          )
           g = Path("lib/models/settings.g.dart")
           if g.exists():
               gt = g.read_text()
@@ -144,15 +124,12 @@ jobs:
                   "checkForUpdates: json['checkForUpdates'] as bool? ?? false,",
                   1,
               ))
-
-          mf = must_exist(Path("android/app/src/main/AndroidManifest.xml"))
-          mft = mf.read_text()
-          mft2 = mft.replace(
-              '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n',
-              "    <!-- REQUEST_INSTALL_PACKAGES removed in source-build (no APK updater) -->\n",
-              1,
+          patch(
+              "android/app/src/main/AndroidManifest.xml",
+              '<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />',
+              '<!-- REQUEST_INSTALL_PACKAGES removed in source-build -->',
+              "AndroidManifest.xml",
           )
-          mf.write_text(mft2)
           print("Update checker, APK downloader, defaults, and install permission patched.")
           PY
 
