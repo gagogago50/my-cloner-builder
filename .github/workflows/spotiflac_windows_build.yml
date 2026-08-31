@@ -1,0 +1,226 @@
+# Build SpotiFLAC Desktop Windows amd64 FROM SOURCE — no fork, no UPX.
+#
+# MANUAL ONLY. Nothing runs on git push / PR / tag / schedule.
+# You start it yourself: Actions → this workflow → "Run workflow".
+#
+# Put this file in an EMPTY GitHub repo (not a fork of SpotiFLAC):
+#   .github/workflows/spotiflac_build_windows.yml
+# This file never pushes, never creates a release, never tags.
+# The .exe is a downloadable Actions artifact only.
+#
+# Toolchain mirrors upstream .github/workflows/build.yml (Windows job):
+#   Go from go.mod, Node 24, pnpm 9, wails CLI pinned to go.mod (not @latest)
+#
+# Before compile, source is patched so the built app does not:
+#   - fetch gist.githubusercontent.com status JSON (remote config)
+#   - look up public IP via ipwho.is / ipapi.co
+#   - auto-check GitHub releases for updates
+# UPX install + packing steps are omitted on purpose.
+
+name: Build SpotiFLAC Windows from source
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream git ref (branch, tag, or SHA). Example: v7.2.2 or main"
+        required: true
+        default: "v7.2.2"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Compile Windows amd64 from upstream source
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    env:
+      NODE_VERSION: "24"
+
+    steps:
+      - name: Checkout upstream source (no fork)
+        uses: actions/checkout@v4
+        with:
+          repository: spotbye/SpotiFLAC
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Refuse prebuilt binaries in the tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          hits=$(find . -type f \( \
+            -iname '*.exe' -o -iname '*.dll' -o -iname '*.so' -o \
+            -iname '*.dylib' -o -iname '*.sys' \
+          \) ! -path './.git/*' || true)
+          if [ -n "$hits" ]; then
+            echo "ERROR: prebuilt binaries present in source tree:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "No prebuilt exe/dll in the cloned tree."
+
+      - name: Disable gist status, IP lookup, and auto-update
+        shell: bash
+        run: |
+          set -euo pipefail
+          python << 'PY'
+          from pathlib import Path
+
+          def patch(path, old, new, label):
+              p = Path(path)
+              if not p.exists():
+                  raise SystemExit(f"missing {path}")
+              text = p.read_text(encoding="utf-8")
+              if old not in text:
+                  raise SystemExit(f"{label}: pattern not found, aborting")
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+              print(f"patched {label}")
+
+          patch(
+              "app.go",
+              '''func (a *App) FetchSpotiFLACStatusPayload(kind string) (map[string]string, error) {
+	var statusURL string
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "next":
+		statusURL = spotiFLACNextStatusURL
+	case "current":
+		statusURL = spotiFLACCurrentStatusURL
+	default:
+		return nil, fmt.Errorf("unknown SpotiFLAC status payload: %s", kind)
+	}
+
+	return runWithTimeout(checkOperationTimeout, func() (map[string]string, error) {
+		return fetchSpotiFLACStatusPayload(statusURL)
+	})
+}''',
+              '''func (a *App) FetchSpotiFLACStatusPayload(kind string) (map[string]string, error) {
+	return map[string]string{}, nil
+}''',
+              "app.go FetchSpotiFLACStatusPayload",
+          )
+
+          patch(
+              "app.go",
+              '''func (a *App) GetCurrentIPInfo() (string, error) {
+	info, err := fetchCurrentIPInfo()
+	if err != nil {
+		return "", err
+	}
+
+	payload, err := json.Marshal(info)
+	if err != nil {
+		return "", err
+	}
+
+	return string(payload), nil
+}''',
+              '''func (a *App) GetCurrentIPInfo() (string, error) {
+	return `{"ip":"","country":"","country_code":"","source":"disabled"}`, nil
+}''',
+              "app.go GetCurrentIPInfo",
+          )
+
+          patch(
+              "frontend/src/App.tsx",
+              '''    const checkForUpdates = async () => {
+        try {
+            const response = await fetch("https://api.github.com/repos/spotbye/SpotiFLAC/releases/latest");''',
+              '''    const checkForUpdates = async () => {
+        return;
+        try {
+            const response = await fetch("https://api.github.com/repos/spotbye/SpotiFLAC/releases/latest");''',
+              "frontend/src/App.tsx checkForUpdates",
+          )
+
+          patch(
+              "frontend/src/lib/settings.ts",
+              "showUpdateNotifications: true,",
+              "showUpdateNotifications: false,",
+              "settings.ts default showUpdateNotifications",
+          )
+
+          patch(
+              "frontend/src/lib/settings.ts",
+              "normalized.showUpdateNotifications = typeof settings.showUpdateNotifications === \"boolean\" ? settings.showUpdateNotifications : true;",
+              "normalized.showUpdateNotifications = typeof settings.showUpdateNotifications === \"boolean\" ? settings.showUpdateNotifications : false;",
+              "settings.ts normalize showUpdateNotifications",
+          )
+
+          print("Gist status, IP lookup, and auto-update patched.")
+          PY
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install Wails CLI (pinned to go.mod, not @latest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          WAILS_VER=$(awk '/github.com\/wailsapp\/wails\/v2 / {print $2; exit}' go.mod)
+          if [ -z "$WAILS_VER" ]; then
+            echo "ERROR: could not read wails version from go.mod"
+            exit 1
+          fi
+          echo "Installing github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VER}"
+          go install "github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VER}"
+          wails version
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run generate-icon
+
+      - name: Build application (windows/amd64, no UPX)
+        run: wails build -platform windows/amd64
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build/bin/SpotiFLAC.exe
+          mkdir -p dist
+          REF_SAFE=$(echo "${{ inputs.ref }}" | tr '/ ' '__')
+          cp build/bin/SpotiFLAC.exe "dist/SpotiFLAC-${REF_SAFE}-windows-amd64.exe"
+          ls -la dist/
+          echo "Built Windows amd64 from source ref=${{ inputs.ref }} (no UPX)"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: dist/SpotiFLAC-*-windows-amd64.exe
+          if-no-files-found: error
+          retention-days: 14
