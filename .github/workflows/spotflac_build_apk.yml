@@ -4,24 +4,19 @@
 # You start it yourself: Actions → this workflow → "Run workflow".
 #
 # Put this file in an EMPTY GitHub repo (not a fork of SpotiFLAC-Mobile):
-#   .github/workflows/build-spotiflac-from-source.yml
-# A fork would still contain upstream ci.yml / release.yml / auto-tag.yml
-# and a push would fire those. This file never pushes, never creates a
-# release, never tags, never talks to Telegram.
-#
-# It checkouts spotiflacapp/SpotiFLAC-Mobile (public clone).
-# APK stays as a downloadable Actions artifact — not committed, not released.
+#   .github/workflows/spotflac_build_apk.yml
+# This file never pushes, never creates a release, never tags, never talks
+# to Telegram. APK is a downloadable Actions artifact only.
 #
 # Toolchain mirrors upstream release.yml + ci.yml:
 #   Flutter .fvmrc, Go go_backend/go.mod, Java 25, NDK 29.0.14206865
 #
-# Optional signing secrets (omit = debug-signed APK):
-#   KEYSTORE_BASE64, KEY_ALIAS, KEYSTORE_PASSWORD, KEY_PASSWORD
+# Debug APK only for now. Release + keystore signing are off
+# (GitHub forbids `secrets` in `if:` — that was the L232 parse error).
 
 name: Build SpotiFLAC from source
 
 on:
-  # Do not add push / pull_request / release / schedule here.
   workflow_dispatch:
     inputs:
       ref:
@@ -39,13 +34,12 @@ on:
           - arm32
           - arm64,arm32
 
-# Read-only token: cannot git push, cannot create tags or GitHub Releases.
 permissions:
   contents: read
 
 jobs:
   build-android:
-    name: Compile APK from upstream source
+    name: Compile debug APK from upstream source
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -57,8 +51,6 @@ jobs:
             /usr/local/share/boost /usr/share/swift /usr/local/.ghcup || true
           df -h
 
-      # Clone the official repo. persist-credentials: false so GITHUB_TOKEN
-      # of *this* repo is never sent to upstream.
       - name: Checkout upstream source (no fork)
         uses: actions/checkout@v6
         with:
@@ -81,8 +73,6 @@ jobs:
           fi
           echo "No prebuilt APK/AAR/SO in the cloned tree."
 
-      # Kill in-app GitHub update search + APK download/install, including the
-      # non-dismissible forced update (forceUpdateThreshold = 3).
       - name: Disable auto-update and prebuilt APK installer
         run: |
           set -euo pipefail
@@ -221,24 +211,12 @@ jobs:
             *)     echo "targets=android-arm,android-arm64" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - name: Build APK (release, compiled here)
+      - name: Build APK (debug)
         run: |
           set -euo pipefail
-          flutter build apk --release --split-per-abi \
+          flutter build apk --debug --split-per-abi \
             --target-platform "${{ steps.plats.outputs.targets }}"
           ls -la build/app/outputs/flutter-apk/
-
-      - name: Optional official-style signing
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: build/app/outputs/flutter-apk
-          signingKeyBase64: ${{ secrets.KEYSTORE_BASE64 }}
-          alias: ${{ secrets.KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-        env:
-          BUILD_TOOLS_VERSION: "36.0.0"
 
       - name: Rename APKs
         run: |
@@ -246,22 +224,14 @@ jobs:
           VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d'+' -f1)
           REF_SAFE=$(echo "${{ inputs.ref }}" | tr '/ ' '__')
           cd build/app/outputs/flutter-apk
-
-          rename_apk() {
-            unsigned="$1"
-            dest="$2"
-            signed="${unsigned%.apk}-signed.apk"
-            if [ -f "$signed" ]; then
-              mv "$signed" "$dest"
-            elif [ -f "$unsigned" ]; then
-              mv "$unsigned" "$dest"
-            fi
-          }
-
-          rename_apk app-arm64-v8a-release.apk "SpotiFLAC-${VERSION}-source-${REF_SAFE}-arm64.apk"
-          rename_apk app-armeabi-v7a-release.apk "SpotiFLAC-${VERSION}-source-${REF_SAFE}-arm32.apk"
+          if [ -f app-arm64-v8a-debug.apk ]; then
+            mv app-arm64-v8a-debug.apk "SpotiFLAC-${VERSION}-debug-${REF_SAFE}-arm64.apk"
+          fi
+          if [ -f app-armeabi-v7a-debug.apk ]; then
+            mv app-armeabi-v7a-debug.apk "SpotiFLAC-${VERSION}-debug-${REF_SAFE}-arm32.apk"
+          fi
           ls -la SpotiFLAC-*.apk
-          echo "Built from source ref=${{ inputs.ref }} version=${VERSION}"
+          echo "Built DEBUG from source ref=${{ inputs.ref }} version=${VERSION}"
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v6
