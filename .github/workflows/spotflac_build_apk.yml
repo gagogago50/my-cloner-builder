@@ -1,0 +1,295 @@
+# Build SpotiFLAC Mobile FROM SOURCE — no fork, no prebuilt APK download.
+#
+# MANUAL ONLY. Nothing runs on git push / PR / tag / schedule.
+# You start it yourself: Actions → this workflow → "Run workflow".
+#
+# Put this file in an EMPTY GitHub repo (not a fork of SpotiFLAC-Mobile):
+#   .github/workflows/build-spotiflac-from-source.yml
+# A fork would still contain upstream ci.yml / release.yml / auto-tag.yml
+# and a push would fire those. This file never pushes, never creates a
+# release, never tags, never talks to Telegram.
+#
+# It checkouts spotiflacapp/SpotiFLAC-Mobile (public clone).
+# APK stays as a downloadable Actions artifact — not committed, not released.
+#
+# Toolchain mirrors upstream release.yml + ci.yml:
+#   Flutter .fvmrc, Go go_backend/go.mod, Java 25, NDK 29.0.14206865
+#
+# Optional signing secrets (omit = debug-signed APK):
+#   KEYSTORE_BASE64, KEY_ALIAS, KEYSTORE_PASSWORD, KEY_PASSWORD
+
+name: Build SpotiFLAC from source
+
+on:
+  # Do not add push / pull_request / release / schedule here.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream git ref (branch, tag, or SHA). Example: main or v4.9.0"
+        required: true
+        default: "main"
+        type: string
+      abis:
+        description: "Android ABIs to build"
+        required: true
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - arm32
+          - arm64,arm32
+
+# Read-only token: cannot git push, cannot create tags or GitHub Releases.
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    name: Compile APK from upstream source
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup || true
+          df -h
+
+      # Clone the official repo. persist-credentials: false so GITHUB_TOKEN
+      # of *this* repo is never sent to upstream.
+      - name: Checkout upstream source (no fork)
+        uses: actions/checkout@v6
+        with:
+          repository: spotiflacapp/SpotiFLAC-Mobile
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Refuse prebuilt artifacts in the tree
+        run: |
+          set -euo pipefail
+          hits=$(find . -type f \( \
+            -name '*.apk' -o -name '*.aab' -o -name '*.ipa' -o \
+            -name '*.so' -o -name '*.aar' -o -name '*.dex' -o \
+            -name 'gobackend.aar' \
+          \) ! -path './.git/*' || true)
+          if [ -n "$hits" ]; then
+            echo "ERROR: prebuilt binaries present in source tree:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "No prebuilt APK/AAR/SO in the cloned tree."
+
+      # Kill in-app GitHub update search + APK download/install, including the
+      # non-dismissible forced update (forceUpdateThreshold = 3).
+      - name: Disable auto-update and prebuilt APK installer
+        run: |
+          set -euo pipefail
+          python3 << 'PY'
+          from pathlib import Path
+
+          def must_exist(p: Path) -> Path:
+              if not p.exists():
+                  raise SystemExit(f"missing {p}")
+              return p
+
+          uc = must_exist(Path("lib/services/update_checker.dart"))
+          text = uc.read_text()
+          needle = "static Future<UpdateInfo?> checkForUpdate({String channel = 'stable'}) async {"
+          if needle not in text:
+              raise SystemExit("update_checker.dart: signature changed, aborting")
+          text = text.replace(
+              needle,
+              needle + "\n    return null; // source-build: no GitHub auto-update / APK fetch\n",
+              1,
+          )
+          uc.write_text(text)
+
+          dl = must_exist(Path("lib/services/apk_downloader.dart"))
+          dlt = dl.read_text()
+          n2 = "required String version,"
+          if "downloadApk" not in dlt or n2 not in dlt:
+              raise SystemExit("apk_downloader.dart: signature changed, aborting")
+          # Insert an early return after the opening of downloadApk's try is fragile;
+          # instead refuse every URL at the HTTPS gate by forcing a dummy fail path:
+          old = """    final uri = Uri.tryParse(url);
+      if (uri == null || uri.scheme != 'https') {
+        _log.e('Refusing to download from invalid or non-HTTPS URL');
+        return null;
+      }"""
+          new = """    _log.w('Source build: APK download disabled');
+      return null;
+      final uri = Uri.tryParse(url);
+      if (uri == null || uri.scheme != 'https') {
+        _log.e('Refusing to download from invalid or non-HTTPS URL');
+        return null;
+      }"""
+          if old not in dlt:
+              raise SystemExit("apk_downloader.dart: HTTPS guard changed, aborting")
+          dl.write_text(dlt.replace(old, new, 1))
+
+          st = must_exist(Path("lib/models/settings.dart"))
+          stt = st.read_text()
+          stt2 = stt.replace("this.checkForUpdates = true,", "this.checkForUpdates = false,", 1)
+          if stt2 == stt:
+              raise SystemExit("settings.dart: checkForUpdates default not found")
+          st.write_text(stt2)
+
+          g = Path("lib/models/settings.g.dart")
+          if g.exists():
+              gt = g.read_text()
+              g.write_text(gt.replace(
+                  "checkForUpdates: json['checkForUpdates'] as bool? ?? true,",
+                  "checkForUpdates: json['checkForUpdates'] as bool? ?? false,",
+                  1,
+              ))
+
+          mf = must_exist(Path("android/app/src/main/AndroidManifest.xml"))
+          mft = mf.read_text()
+          mft2 = mft.replace(
+              '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n',
+              "    <!-- REQUEST_INSTALL_PACKAGES removed in source-build (no APK updater) -->\n",
+              1,
+          )
+          mf.write_text(mft2)
+          print("Update checker, APK downloader, defaults, and install permission patched.")
+          PY
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go_backend/go.mod
+          cache-dependency-path: go_backend/go.sum
+
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Cache Android NDK
+        uses: actions/cache@v5
+        with:
+          path: /usr/local/lib/android/sdk/ndk/29.0.14206865
+          key: ndk-29.0.14206865
+
+      - name: Install Android SDK & NDK
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:?ANDROID_HOME missing on runner}"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;29.0.14206865" \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Install gomobile
+        working-directory: go_backend
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile
+          gomobile init
+
+      - name: Build Go backend for Android (from source)
+        working-directory: go_backend
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p ../android/app/libs
+          gomobile bind \
+            -target=android/arm,android/arm64 \
+            -androidapi 24 \
+            -o ../android/app/libs/gobackend.aar \
+            .
+          test -f ../android/app/libs/gobackend.aar
+          echo "gomobile AAR built locally (not downloaded)."
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Generate app icons
+        run: dart run flutter_launcher_icons
+
+      - name: Select target platforms
+        id: plats
+        run: |
+          case "${{ inputs.abis }}" in
+            arm64) echo "targets=android-arm64" >> "$GITHUB_OUTPUT" ;;
+            arm32) echo "targets=android-arm" >> "$GITHUB_OUTPUT" ;;
+            *)     echo "targets=android-arm,android-arm64" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build APK (release, compiled here)
+        run: |
+          set -euo pipefail
+          flutter build apk --release --split-per-abi \
+            --target-platform "${{ steps.plats.outputs.targets }}"
+          ls -la build/app/outputs/flutter-apk/
+
+      - name: Optional official-style signing
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: build/app/outputs/flutter-apk
+          signingKeyBase64: ${{ secrets.KEYSTORE_BASE64 }}
+          alias: ${{ secrets.KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: "36.0.0"
+
+      - name: Rename APKs
+        run: |
+          set -euo pipefail
+          VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d'+' -f1)
+          REF_SAFE=$(echo "${{ inputs.ref }}" | tr '/ ' '__')
+          cd build/app/outputs/flutter-apk
+
+          rename_apk() {
+            unsigned="$1"
+            dest="$2"
+            signed="${unsigned%.apk}-signed.apk"
+            if [ -f "$signed" ]; then
+              mv "$signed" "$dest"
+            elif [ -f "$unsigned" ]; then
+              mv "$unsigned" "$dest"
+            fi
+          }
+
+          rename_apk app-arm64-v8a-release.apk "SpotiFLAC-${VERSION}-source-${REF_SAFE}-arm64.apk"
+          rename_apk app-armeabi-v7a-release.apk "SpotiFLAC-${VERSION}-source-${REF_SAFE}-arm32.apk"
+          ls -la SpotiFLAC-*.apk
+          echo "Built from source ref=${{ inputs.ref }} version=${VERSION}"
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: spotiflac-source-apk
+          path: build/app/outputs/flutter-apk/SpotiFLAC-*.apk
+          if-no-files-found: error
+          retention-days: 14
