@@ -116,17 +116,14 @@ jobs:
           ref: ${{ inputs.ref }}
           submodules: recursive
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Setup MSBuild pour les sous-projets .sln
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Setup MSBuild + .NET SDK
+      # ----------------------------------------------------------------------
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Setup .NET SDK pour DotNetDataCollector
-      # ──────────────────────────────────────────────────────────────────────
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
@@ -142,9 +139,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-nuget-
 
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
       # Setup Lazarus
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
       - name: Setup Lazarus
         uses: gcarreno/setup-lazarus@v3
         with:
@@ -176,9 +173,9 @@ jobs:
           Write-Host "Racine Lazarus: $lazDir"
           echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Tentative d'installation du cross-compiler i386-win32 (best-effort, retry)
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Cross-compiler i386-win32 (best-effort)
+      # ----------------------------------------------------------------------
       - name: Try install i386 cross-compiler (non-fatal, with retry)
         continue-on-error: true
         shell: pwsh
@@ -260,9 +257,9 @@ jobs:
               Write-Warning "ppc386.exe introuvable apres installation."
           }
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Patches d'amelioration du code Cheat Engine (AVX2, exception handling, perf)
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Patches d'amelioration du code
+      # ----------------------------------------------------------------------
       - name: Apply Cheat Engine code improvement patches
         if: ${{ inputs.apply_code_patches == true }}
         shell: pwsh
@@ -280,12 +277,10 @@ jobs:
           # --- Patch 1: DotNetDataCollector - Ajout support AVX2 intrinsiques ---
           $dncDir = Join-Path $ceDir "DotNetDataCollector"
           if (Test-Path $dncDir) {
-              # Creer un fichier d'extensions AVX2 reutilisable
               $avxHelperPath = Join-Path $dncDir "Avx2MemoryScanner.cs"
               if (-not (Test-Path $avxHelperPath)) {
                   $avxCode = @'
           // Avx2MemoryScanner.cs - Amelioration: scanner memoire vectorise AVX2
-          // Genere automatiquement par le workflow - active si le runtime supporte AVX2
           using System;
           using System.Runtime.Intrinsics;
           using System.Runtime.Intrinsics.X86;
@@ -296,15 +291,9 @@ jobs:
               {
                   public static bool IsSupported => Avx2.IsSupported;
 
-                  /// <summary>
-                  /// Compare 32 octets en parallele via AVX2 (8x plus rapide qu'une boucle scalaire).
-                  /// Fallback automatique sur Sse2 puis scalaire si AVX2 indisponible.
-                  /// </summary>
                   public static unsafe bool ContainsPattern(byte* buffer, int length, byte pattern, byte mask)
                   {
                       if (length <= 0) return false;
-
-                      // Chemin AVX2 (32 octets par iteration)
                       if (Avx2.IsSupported && length >= 32) {
                           var vPattern = Vector256.Create(pattern);
                           var vMask    = Vector256.Create(mask);
@@ -320,14 +309,11 @@ jobs:
                               }
                               i += 32;
                           }
-                          // Queue scalaire
                           for (; i < length; i++) {
                               if ((buffer[i] & mask) == (pattern & mask)) return true;
                           }
                           return false;
                       }
-
-                      // Chemin SSE2 (16 octets par iteration)
                       if (Sse2.IsSupported && length >= 16) {
                           var vPattern = Vector128.Create(pattern);
                           var vMask    = Vector128.Create(mask);
@@ -345,17 +331,12 @@ jobs:
                           }
                           return false;
                       }
-
-                      // Chemin scalaire (fallback)
                       for (int i = 0; i < length; i++) {
                           if ((buffer[i] & mask) == (pattern & mask)) return true;
                       }
                       return false;
                   }
 
-                  /// <summary>
-                  /// Recherche de signature multi-octets vectorisee (premier match = OK).
-                  /// </summary>
                   public static unsafe int IndexOfPattern(byte* buffer, int length, byte[] pattern, byte[] mask)
                   {
                       if (pattern == null || pattern.Length == 0 || length < pattern.Length) return -1;
@@ -374,42 +355,32 @@ jobs:
                   Add-PatchLog "Ajout Avx2MemoryScanner.cs (support AVX2/SSE2 avec fallback scalaire)"
               }
 
-              # --- Patch 2: ameliorer DotNetDataCollector.csproj (Release + AVX flag) ---
               $csprojFiles = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue
               foreach ($csproj in $csprojFiles) {
                   $content = Get-Content $csproj.FullName -Raw -Encoding UTF8
                   $modified = $false
-
-                  # Forcer Release avec optimisations JIT
                   if ($content -notmatch '<Optimize>') {
                       $content = $content -replace '</PropertyGroup>', '  <Optimize>true</Optimize>`n  <TieredCompilation>true</TieredCompilation>`n  <ServerGarbageCollection>true</ServerGarbageCollection>`n  <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>`n  <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>`n</PropertyGroup>'
                       $modified = $true
                       Add-PatchLog "$($csproj.Name): active Optimize+TieredCompilation+ServerGC"
                   }
-
-                  # Activer les intrinsiques AVX2 si supportees par le runtime
                   if ($content -notmatch '<EnableHWIntrinsic') {
                       $content = $content -replace '</Project>', '  <PropertyGroup Condition="''$(Configuration)''==''Release''">`n    <EnableHWIntrinsic>true</EnableHWIntrinsic>`n    <AVX>true</AVX>`n  </PropertyGroup>`n</Project>'
                       $modified = $true
                       Add-PatchLog "$($csproj.Name): active EnableHWIntrinsic+AVX en Release"
                   }
-
                   if ($modified) {
-                      # Nettoyer les retours litteraux `n en vrais newlines
                       $content = $content -replace '`n', "`n"
                       Set-Content -Path $csproj.FullName -Value $content -Encoding UTF8 -NoNewline
                   }
               }
 
-              # --- Patch 3: ameliorer Program.cs / MainForm.cs (exception handling robuste) ---
               $csFiles = Get-ChildItem -Path $dncDir -Filter "*.cs" -Recurse -ErrorAction SilentlyContinue |
                   Where-Object { $_.Name -notmatch 'Avx2MemoryScanner' }
               foreach ($cs in $csFiles) {
                   try {
                       $content = Get-Content $cs.FullName -Raw -Encoding UTF8
                       $orig = $content
-
-                      # Remplacer les catch vides (catch {} ou catch (Exception) {}) par un logging minimal
                       $content = [System.Text.RegularExpressions.Regex]::Replace(
                           $content,
                           'catch\s*\(\s*Exception(\s+\w+)?\s*\)\s*\{\s*\}',
@@ -420,7 +391,6 @@ jobs:
                           'catch\s*\{\s*\}',
                           'catch (System.Exception ex) { System.Diagnostics.Debug.WriteLine("DotNetDataCollector: " + ex.ToString()); }'
                       )
-
                       if ($content -ne $orig) {
                           Set-Content -Path $cs.FullName -Value $content -Encoding UTF8 -NoNewline
                           Add-PatchLog "$($cs.Name): remplace les catch vides par logging debug"
@@ -433,17 +403,14 @@ jobs:
               Add-PatchLog "DotNetDataCollector absent - patches .NET sautes"
           }
 
-          # --- Patch 4: lazbuild - activer -O4 AVX2 sur les projets Pascal si possible ---
+          # --- Patch 4: lazbuild - activer -O4 AVX2 ---
           $lpiFiles = Get-ChildItem -Path $ceDir -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
           $avxModesAdded = 0
           foreach ($lpi in $lpiFiles) {
               try {
                   $content = Get-Content $lpi.FullName -Raw -Encoding UTF8
-                  # Si le projet a deja un mode AVX2, on ne touche pas
                   if ($content -match 'O4 AVX2') { continue }
-                  # Si le projet a un mode Release 64-Bit mais pas de mode AVX2, on en ajoute un par clonage
                   if ($content -match '<Mode Name="Release 64-Bit">') {
-                      # Insertion defensive - on n'ajoute QUE si la structure est compatible
                       $newMode = '    <Mode Name="Release 64-Bit O4 AVX2">' + "`n" +
                                   '      <CompilerOptions>`n' +
                                   '        <Options>`n' +
@@ -452,7 +419,6 @@ jobs:
                                   '        </Options>`n' +
                                   '      </CompilerOptions>`n' +
                                   '    </Mode>'
-                      # On n'inserre que dans les projets principaux pour eviter la pollution
                       if ($lpi.Name -eq 'cheatengine.lpi') {
                           $content = $content -replace '(<BuildModes>)', "`$1`n$newMode"
                           Set-Content -Path $lpi.FullName -Value $content -Encoding UTF8 -NoNewline
@@ -467,14 +433,13 @@ jobs:
               Add-PatchLog "Mode 'Release 64-Bit O4 AVX2' ajoute a $avxModesAdded projet(s) Pascal"
           }
 
-          # Afficher le resume des patches
           Write-Host "::group::Resume des patches appliques"
           Get-Content $patchLog | ForEach-Object { Write-Host $_ }
           Write-Host "::endgroup::"
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Enregistrer les packages personnalisés de Cheat Engine (avec retry)
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Enregistrer les packages personnalises CE
+      # ----------------------------------------------------------------------
       - name: Register and Build Cheat Engine Packages
         shell: pwsh
         env:
@@ -499,9 +464,9 @@ jobs:
           }
           & lazbuild --build-ide= 2>&1 | Out-Null
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Build Cheat Engine — modes Release (avec AVX2)
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Build Cheat Engine principal
+      # ----------------------------------------------------------------------
       - name: Build Cheat Engine (all release modes)
         shell: pwsh
         run: |
@@ -519,9 +484,8 @@ jobs:
               $exitCode = $LASTEXITCODE
               Write-Host "::endgroup::"
               if ($exitCode -ne 0) {
-                  # Le mode AVX2 peut echouer si FPC ne supporte pas -CfAVX2 - on rend non fatal
                   if ($mode -like "*AVX2*") {
-                      Write-Warning "Mode CRITIQUE '$mode' echoue (code $exitCode) - degrade en non-fatal (mode AVX2 optionnel)"
+                      Write-Warning "Mode CRITIQUE '$mode' echoue (code $exitCode) - degrade en non-fatal"
                   } else {
                       throw "Mode CRITIQUE '$mode' echoue (code $exitCode)"
                   }
@@ -545,58 +509,37 @@ jobs:
           Write-Host "::endgroup::"
           exit 0
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Build DotNetDataCollector — Windows AMD64 (x64)
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Build DotNetDataCollector — x64
+      # ----------------------------------------------------------------------
       - name: Build DotNetDataCollector (Windows AMD64 / x64)
         shell: pwsh
         run: |
           $dncDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\DotNetDataCollector"
-          if (-not (Test-Path $dncDir)) {
-              Write-Warning "DotNetDataCollector absent - step saute"
-              exit 0
-          }
+          if (-not (Test-Path $dncDir)) { Write-Warning "DotNetDataCollector absent"; exit 0 }
 
           $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
           if (-not $dotnet) {
-              Write-Warning "SDK .NET indisponible - tentative via msbuild"
               $sln = Get-ChildItem -Path $dncDir -Filter "*.sln" -ErrorAction SilentlyContinue | Select-Object -First 1
               $csproj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($sln) {
-                  & msbuild $sln.FullName /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x64 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "msbuild x64 echoue" }
-              } elseif ($csproj) {
-                  & msbuild $csproj.FullName /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x64 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "msbuild x64 echoue" }
-              }
+              if ($sln) { & msbuild $sln.FullName /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x64 2>&1 }
+              elseif ($csproj) { & msbuild $csproj.FullName /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x64 2>&1 }
               exit 0
           }
 
-          Write-Host "::group::dotnet build x64 (Release)"
           $proj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $proj) {
-              Write-Warning "Aucun .csproj trouve dans DotNetDataCollector"
-              exit 0
-          }
+          if (-not $proj) { Write-Warning "Aucun .csproj"; exit 0 }
+
+          Write-Host "::group::dotnet build x64 (Release)"
           & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false -p:Platform=x64 2>&1
           if ($LASTEXITCODE -ne 0) {
-              Write-Warning "dotnet build x64 echoue (code $LASTEXITCODE) - retry sans RID"
               & dotnet build $proj.FullName -c Release -p:Platform=x64 2>&1
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "dotnet build x64 definitivement echoue"
-                  exit 0
-              }
           }
           Write-Host "::endgroup::"
 
-          # Copier les sorties vers bin\
           $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
           New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-          $outDirs = @(
-              (Join-Path $dncDir "bin\Release"),
-              (Join-Path $dncDir "bin\x64\Release"),
-              (Join-Path $dncDir "obj\Release")
-          )
+          $outDirs = @((Join-Path $dncDir "bin\Release"), (Join-Path $dncDir "bin\x64\Release"), (Join-Path $dncDir "obj\Release"))
           foreach ($d in $outDirs) {
               if (Test-Path $d) {
                   Get-ChildItem -Path $d -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -607,59 +550,38 @@ jobs:
           }
           exit 0
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Build DotNetDataCollector — Windows x86 (32-bit)
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Build DotNetDataCollector — x86
+      # ----------------------------------------------------------------------
       - name: Build DotNetDataCollector (Windows x86 / 32-bit)
         shell: pwsh
         run: |
           $dncDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\DotNetDataCollector"
-          if (-not (Test-Path $dncDir)) {
-              Write-Warning "DotNetDataCollector absent - step saute"
-              exit 0
-          }
+          if (-not (Test-Path $dncDir)) { Write-Warning "DotNetDataCollector absent"; exit 0 }
 
           $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
           if (-not $dotnet) {
-              Write-Warning "SDK .NET indisponible - tentative via msbuild"
               $sln = Get-ChildItem -Path $dncDir -Filter "*.sln" -ErrorAction SilentlyContinue | Select-Object -First 1
               $csproj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($sln) {
-                  & msbuild $sln.FullName /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x86 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "msbuild x86 echoue" }
-              } elseif ($csproj) {
-                  & msbuild $csproj.FullName /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x86 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "msbuild x86 echoue" }
-              }
+              if ($sln) { & msbuild $sln.FullName /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x86 2>&1 }
+              elseif ($csproj) { & msbuild $csproj.FullName /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x86 2>&1 }
               exit 0
           }
 
-          Write-Host "::group::dotnet build x86 (Release)"
           $proj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $proj) {
-              Write-Warning "Aucun .csproj trouve dans DotNetDataCollector"
-              exit 0
-          }
+          if (-not $proj) { Write-Warning "Aucun .csproj"; exit 0 }
+
+          Write-Host "::group::dotnet build x86 (Release)"
           & dotnet build $proj.FullName -c Release -r win-x86 --self-contained false -p:Platform=x86 2>&1
           if ($LASTEXITCODE -ne 0) {
-              Write-Warning "dotnet build x86 echoue (code $LASTEXITCODE) - retry sans RID"
               & dotnet build $proj.FullName -c Release -p:Platform=x86 2>&1
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "dotnet build x86 definitivement echoue"
-                  exit 0
-              }
           }
           Write-Host "::endgroup::"
 
-          # Copier les sorties vers bin\x86\
           $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
           $binX86 = Join-Path $binDir "x86"
           New-Item -ItemType Directory -Path $binX86 -Force | Out-Null
-          $outDirs = @(
-              (Join-Path $dncDir "bin\Release"),
-              (Join-Path $dncDir "bin\x86\Release"),
-              (Join-Path $dncDir "obj\Release")
-          )
+          $outDirs = @((Join-Path $dncDir "bin\Release"), (Join-Path $dncDir "bin\x86\Release"), (Join-Path $dncDir "obj\Release"))
           foreach ($d in $outDirs) {
               if (Test-Path $d) {
                   Get-ChildItem -Path $d -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -670,56 +592,32 @@ jobs:
           }
           exit 0
 
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
       # Build DotNetDataCollector — variante AVX/AVX2
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
       - name: Build DotNetDataCollector (AVX / AVX2 variant)
         if: ${{ inputs.enable_avx == true }}
         shell: pwsh
         run: |
           $dncDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\DotNetDataCollector"
-          if (-not (Test-Path $dncDir)) {
-              Write-Warning "DotNetDataCollector absent - step AVX saute"
-              exit 0
-          }
+          if (-not (Test-Path $dncDir)) { Write-Warning "Absent"; exit 0 }
 
           $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-          if (-not $dotnet) {
-              Write-Warning "SDK .NET indisponible - step AVX saute"
-              exit 0
-          }
+          if (-not $dotnet) { Write-Warning "SDK .NET indisponible"; exit 0 }
 
           $proj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $proj) {
-              Write-Warning "Aucun .csproj trouve - step AVX saute"
-              exit 0
-          }
+          if (-not $proj) { Write-Warning "Aucun .csproj"; exit 0 }
 
-          # Compilation avec flags AVX explicites
-          # AVX2 est actif par defaut sur .NET 7+ si le CPU supporte (JIT detecte automatiquement)
-          # On force les flags pour rendre la variante identifiable.
           Write-Host "::group::dotnet build AVX (Release, x64)"
           & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false `
-              -p:Platform=x64 `
-              -p:DefineConstants="AVX;AVX2" `
-              -p:Optimize=true `
-              -p:TieredCompilation=true `
-              -p:AVX=true 2>&1
-          if ($LASTEXITCODE -ne 0) {
-              Write-Warning "dotnet build AVX echoue (code $LASTEXITCODE) - non-fatal"
-              exit 0
-          }
+              -p:Platform=x64 -p:DefineConstants="AVX;AVX2" -p:Optimize=true -p:TieredCompilation=true -p:AVX=true 2>&1
+          if ($LASTEXITCODE -ne 0) { Write-Warning "dotnet build AVX echoue"; exit 0 }
           Write-Host "::endgroup::"
 
-          # Copier les sorties vers bin\avx\
           $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
           $binAvx = Join-Path $binDir "avx"
           New-Item -ItemType Directory -Path $binAvx -Force | Out-Null
-          $outDirs = @(
-              (Join-Path $dncDir "bin\Release"),
-              (Join-Path $dncDir "bin\x64\Release"),
-              (Join-Path $dncDir "obj\Release")
-          )
+          $outDirs = @((Join-Path $dncDir "bin\Release"), (Join-Path $dncDir "bin\x64\Release"), (Join-Path $dncDir "obj\Release"))
           foreach ($d in $outDirs) {
               if (Test-Path $d) {
                   Get-ChildItem -Path $d -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -731,10 +629,10 @@ jobs:
           }
           exit 0
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Sous-projets Lazarus — Build 64-bit UNIQUEMENT
-      # ──────────────────────────────────────────────────────────────────────
-      - name: Build Lazarus sub-projects (64-bit only)
+      # ----------------------------------------------------------------------
+      # Build Lazarus sub-projects (speedhack, luaclient, VEHDebug, etc.)
+      # ----------------------------------------------------------------------
+      - name: Build Lazarus sub-projects
         shell: pwsh
         run: |
           $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
@@ -754,9 +652,7 @@ jobs:
               foreach ($lpi in $lpiFiles) {
                   Write-Host "::group::lazbuild $($lpi.Name) [64-bit]"
                   & lazbuild --build-mode="Release" --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpi.FullName)" 2>&1
-                  if ($LASTEXITCODE -ne 0) {
-                      Write-Warning "Echec $($lpi.Name) [Release 64-bit] (code $LASTEXITCODE) - non-fatal"
-                  }
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpi.Name) [Release 64-bit]" }
                   Write-Host "::endgroup::"
               }
 
@@ -764,15 +660,13 @@ jobs:
               foreach ($lpr in $lprFiles) {
                   Write-Host "::group::lazbuild $($lpr.Name) [64-bit]"
                   & lazbuild --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpr.FullName)" 2>&1
-                  if ($LASTEXITCODE -ne 0) {
-                      Write-Warning "Echec $($lpr.Name) [64-bit] (code $LASTEXITCODE) - non-fatal"
-                  }
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpr.Name) [64-bit]" }
                   Write-Host "::endgroup::"
               }
           }
 
           if ($env:HAVE_PPC386 -eq "true") {
-              Write-Host ">> Cross-compiler ppc386 present - compilation des config 32-bit"
+              Write-Host ">> Cross-compiler ppc386 present - compilation 32-bit"
               foreach ($sub in ($subDirs + $skipDirs)) {
                   $p = Join-Path $ceDir $sub
                   if (-not (Test-Path $p)) { continue }
@@ -789,31 +683,92 @@ jobs:
           }
           exit 0
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Sous-projets Visual Studio
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Restore NuGet pour toutes les solutions .NET (corrige l'erreur assets.json)
+      # ----------------------------------------------------------------------
+      - name: Restore NuGet packages (.NET solutions)
+        shell: pwsh
+        run: |
+          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
+          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+          if (-not $dotnet) { Write-Warning "dotnet introuvable - skip restore"; exit 0 }
+
+          $netSolutions = @("DotNetDataCollector.sln", "DotNetInvasiveDataCollector.sln", "MonoDataCollector.sln", "CEJVMTI.sln", "CSCompiler.sln")
+          foreach ($solName in $netSolutions) {
+              $solPath = Get-ChildItem -Path $ceDir -Filter $solName -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($solPath) {
+                  Write-Host "::group::nuget restore $solName"
+                  & dotnet restore "$($solPath.FullName)" 2>&1
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Restore echoue pour $solName" }
+                  Write-Host "::endgroup::"
+              } else {
+                  Write-Warning "$solName introuvable"
+              }
+          }
+          exit 0
+
+      # ----------------------------------------------------------------------
+      # Build Visual Studio sub-projects (cible par solution, plateformes correctes)
+      # ----------------------------------------------------------------------
       - name: Build Visual Studio sub-projects (.sln)
         shell: pwsh
         run: |
-          $slnFiles = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE "Cheat Engine") -Filter "*.sln" -Recurse -ErrorAction SilentlyContinue
-          Write-Host "Solutions VS: $($slnFiles.Count)"
-          foreach ($sln in $slnFiles) {
-              Write-Host "::group::msbuild $($sln.Name)"
-              foreach ($platform in @("x86", "x64")) {
-                  & msbuild "$($sln.FullName)" /nologo /verbosity:minimal /p:Configuration=Release /p:Platform="$platform" 2>&1
-                  if ($LASTEXITCODE -ne 0) {
-                      & msbuild "$($sln.FullName)" /nologo /verbosity:minimal /p:Configuration=Release 2>&1
-                      if ($LASTEXITCODE -ne 0) { Write-Warning "Echec msbuild $($sln.Name)" }
-                      break
+          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
+          $binDir = Join-Path $ceDir "bin"
+          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+
+          # Definition des solutions avec leurs plateformes et criticite
+          $solutions = @(
+              @{ Name="DotNetDataCollector.sln";       Platforms=@("x86","x64"); IsNet=$true;  Critical=$false },
+              @{ Name="DotNetInvasiveDataCollector.sln"; Platforms=@("Any CPU");   IsNet=$true;  Critical=$false },
+              @{ Name="MonoDataCollector.sln";         Platforms=@("x86","x64"); IsNet=$true;  Critical=$false },
+              @{ Name="CEJVMTI.sln";                   Platforms=@("x86","x64"); IsNet=$true;  Critical=$false },
+              @{ Name="Direct x mess.sln";             Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
+              @{ Name="CSCompiler.sln";                Platforms=@("Any CPU");   IsNet=$true;  Critical=$false },
+              @{ Name="tcc.sln";                       Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
+              @{ Name="dbkkernel.sln";                 Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
+              @{ Name="cudaPointerScan.sln";           Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
+              @{ Name="lua53.sln";                     Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
+              @{ Name="CEPluginLibrary.sln";           Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
+              @{ Name="example-c.sln";                 Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
+              @{ Name="QWS.sln";                       Platforms=@("x86","x64"); IsNet=$false; Critical=$false }
+          )
+
+          foreach ($sol in $solutions) {
+              $solPath = Get-ChildItem -Path $ceDir -Filter $sol.Name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $solPath) {
+                  Write-Warning "$($sol.Name) introuvable dans l'arbre - skip"
+                  continue
+              }
+
+              Write-Host "::group::msbuild $($sol.Name)"
+
+              foreach ($plat in $sol.Platforms) {
+                  $msbuildPlat = $plat
+                  if ($plat -eq "Any CPU") { $msbuildPlat = "AnyCPU" }
+
+                  Write-Host "--- Plateforme: $plat (msbuild: $msbuildPlat) ---"
+                  & msbuild "$($solPath.FullName)" `
+                      /nologo /verbosity:minimal `
+                      /p:Configuration=Release `
+                      /p:Platform="$msbuildPlat" 2>&1
+
+                  $exit = $LASTEXITCODE
+                  if ($exit -ne 0) {
+                      if ($sol.Critical) {
+                          throw "BUILD CRITIQUE ECHOUE: $($sol.Name) [$plat] (code $exit)"
+                      } else {
+                          Write-Warning "BUILD NON-CRITIQUE ECHOUE: $($sol.Name) [$plat] (code $exit)"
+                      }
                   }
               }
               Write-Host "::endgroup::"
           }
           exit 0
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Copier tcclib -> bin
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Copier tcclib DLLs
+      # ----------------------------------------------------------------------
       - name: Copy tcclib DLLs to bin
         shell: pwsh
         run: |
@@ -828,17 +783,14 @@ jobs:
           } else { Write-Host "Aucune DLL tcclib trouvee." }
           exit 0
 
-      # ──────────────────────────────────────────────────────────────────────
-      # Checksums SHA256 + manifeste de build
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
+      # Checksums SHA256 + manifeste
+      # ----------------------------------------------------------------------
       - name: Generate SHA256 checksums and build manifest
         shell: pwsh
         run: |
           $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
-          if (-not (Test-Path $binDir)) {
-              Write-Warning "bin introuvable - manifeste saute"
-              exit 0
-          }
+          if (-not (Test-Path $binDir)) { Write-Warning "bin introuvable"; exit 0 }
 
           $manifest = Join-Path $env:GITHUB_WORKSPACE "build_manifest.txt"
           "Cheat Engine Build Manifest" | Out-File -FilePath $manifest -Encoding utf8
@@ -865,9 +817,9 @@ jobs:
           Write-Host "Checksums: $hashes"
           exit 0
 
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
       # Resume final + GitHub Step Summary
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
       - name: List final bin folder + write GitHub Step Summary
         shell: pwsh
         run: |
