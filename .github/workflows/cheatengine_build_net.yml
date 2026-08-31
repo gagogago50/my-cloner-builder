@@ -1,4 +1,4 @@
-name: Secure Build Cheat Engine
+name: complete Build Cheat Engine
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,11 +16,6 @@ on:
         description: "branch / tag / sha"
         required: false
         default: "master"
-        type: string
-      artifact_path:
-        description: "Glob du binaire principal a uploader"
-        required: true
-        default: "Cheat Engine/bin/**"
         type: string
       lazarus_version:
         description: "Version de Lazarus (2.2.2 recommande pour CE)"
@@ -432,7 +427,64 @@ jobs:
           exit 0
 
       # ===================================================================
-      # Build DotNetDataCollector — x64 (dotnet CLI)
+      # Build Lazarus sub-projects + copie dans bin/
+      # ===================================================================
+      - name: Build Lazarus sub-projects
+        shell: pwsh
+        run: |
+          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
+          $binDir = Join-Path $ceDir "bin"
+          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+          $subDirs = @("speedhack","luaclient","VEHDebug","Tutorial","betterControls","plugin","launcher","winhook","xmplayer")
+
+          foreach ($sub in $subDirs) {
+              $p = Join-Path $ceDir $sub
+              if (-not (Test-Path $p)) { continue }
+              $lpiFiles = Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
+              foreach ($lpi in $lpiFiles) {
+                  Write-Host "::group::lazbuild $($lpi.Name) [64-bit]"
+                  & lazbuild --build-mode="Release" --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpi.FullName)" 2>&1
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpi.Name) [64-bit]" }
+                  Write-Host "::endgroup::"
+              }
+              $lprFiles = Get-ChildItem -Path $p -Filter "*.lpr" -Recurse -ErrorAction SilentlyContinue
+              foreach ($lpr in $lprFiles) {
+                  Write-Host "::group::lazbuild $($lpr.Name) [64-bit]"
+                  & lazbuild --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpr.FullName)" 2>&1
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpr.Name) [64-bit]" }
+                  Write-Host "::endgroup::"
+              }
+              # Copier les outputs vers bin/
+              Get-ChildItem -Path $p -Recurse -Include "*.dll","*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+                  if ($_.FullName -notmatch '\\(lib|packages)\\') {
+                      Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
+                      Write-Host "[COPY] $($_.Name) -> bin/"
+                  }
+              }
+          }
+
+          if ($env:HAVE_PPC386 -eq "true") {
+              Write-Host ">> Compilation 32-bit"
+              foreach ($sub in $subDirs) {
+                  $p = Join-Path $ceDir $sub
+                  if (-not (Test-Path $p)) { continue }
+                  Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                      Write-Host "::group::lazbuild $($_.Name) [32-bit]"
+                      & lazbuild --build-mode="Release" --cpu=i386 --os=win32 --ws=win32 --max-process-count=4 "$($_.FullName)" 2>&1
+                      Write-Host "::endgroup::"
+                  }
+                  Get-ChildItem -Path $p -Recurse -Include "*.dll","*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+                      if ($_.FullName -notmatch '\\(lib|packages)\\') {
+                          Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
+                          Write-Host "[COPY-32] $($_.Name) -> bin/"
+                      }
+                  }
+              }
+          }
+          exit 0
+
+      # ===================================================================
+      # Build DotNetDataCollector — x64 (dotnet CLI) + copie
       # ===================================================================
       - name: Build DotNetDataCollector (x64)
         shell: pwsh
@@ -453,17 +505,14 @@ jobs:
 
           $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
           New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-          $searchRoots = @($dncDir)
-          foreach ($root in $searchRoots) {
-              Get-ChildItem -Path $root -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-                  Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
-                  Write-Host "Copie DNC x64: $($_.Name) -> bin"
-              }
+          Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
+              Write-Host "Copie DNC x64: $($_.Name) -> bin"
           }
           exit 0
 
       # ===================================================================
-      # Build DotNetDataCollector — x86
+      # Build DotNetDataCollector — x86 + copie
       # ===================================================================
       - name: Build DotNetDataCollector (x86)
         shell: pwsh
@@ -481,16 +530,15 @@ jobs:
           Write-Host "Exit code x86: $LASTEXITCODE"
           Write-Host "::endgroup::"
 
-          $binX86 = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin\x86"
-          New-Item -ItemType Directory -Path $binX86 -Force | Out-Null
+          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
           Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-              Copy-Item $_.FullName -Destination $binX86 -Force -ErrorAction SilentlyContinue
-              Write-Host "Copie DNC x86: $($_.Name)"
+              Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
+              Write-Host "Copie DNC x86: $($_.Name) -> bin"
           }
           exit 0
 
       # ===================================================================
-      # Build DotNetDataCollector — AVX variant
+      # Build DotNetDataCollector — AVX variant + copie
       # ===================================================================
       - name: Build DotNetDataCollector (AVX variant)
         if: ${{ inputs.enable_avx == true }}
@@ -516,48 +564,6 @@ jobs:
               $destName = $_.BaseName + ".avx" + $_.Extension
               Copy-Item $_.FullName -Destination (Join-Path $binAvx $destName) -Force
               Write-Host "Copie DNC AVX: $destName"
-          }
-          exit 0
-
-      # ===================================================================
-      # Build Lazarus sub-projects
-      # ===================================================================
-      - name: Build Lazarus sub-projects
-        shell: pwsh
-        run: |
-          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $subDirs = @("speedhack","luaclient","VEHDebug","Tutorial","betterControls","plugin","launcher","winhook","xmplayer")
-
-          foreach ($sub in $subDirs) {
-              $p = Join-Path $ceDir $sub
-              if (-not (Test-Path $p)) { continue }
-              $lpiFiles = Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
-              foreach ($lpi in $lpiFiles) {
-                  Write-Host "::group::lazbuild $($lpi.Name) [64-bit]"
-                  & lazbuild --build-mode="Release" --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpi.FullName)" 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpi.Name) [64-bit]" }
-                  Write-Host "::endgroup::"
-              }
-              $lprFiles = Get-ChildItem -Path $p -Filter "*.lpr" -Recurse -ErrorAction SilentlyContinue
-              foreach ($lpr in $lprFiles) {
-                  Write-Host "::group::lazbuild $($lpr.Name) [64-bit]"
-                  & lazbuild --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpr.FullName)" 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpr.Name) [64-bit]" }
-                  Write-Host "::endgroup::"
-              }
-          }
-
-          if ($env:HAVE_PPC386 -eq "true") {
-              Write-Host ">> Compilation 32-bit"
-              foreach ($sub in $subDirs) {
-                  $p = Join-Path $ceDir $sub
-                  if (-not (Test-Path $p)) { continue }
-                  Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                      Write-Host "::group::lazbuild $($_.Name) [32-bit]"
-                      & lazbuild --build-mode="Release" --cpu=i386 --os=win32 --ws=win32 --max-process-count=4 "$($_.FullName)" 2>&1
-                      Write-Host "::endgroup::"
-                  }
-              }
           }
           exit 0
 
@@ -592,46 +598,49 @@ jobs:
           exit 0
 
       # ===================================================================
-      # Build Visual Studio sub-projects + collecte immediate des outputs
+      # Build Visual Studio sub-projects + copie dans bin/ et autorun/dlls/
       # ===================================================================
-      - name: Build Visual Studio sub-projects (.sln) + collect outputs
+      - name: Build Visual Studio sub-projects (.sln)
         shell: pwsh
         run: |
           $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
           $binDir = Join-Path $ceDir "bin"
-          $artifactsDir = Join-Path $binDir "artifacts"
-          New-Item -ItemType Directory -Path $artifactsDir -Force | Out-Null
+          $autorunDlls = Join-Path $binDir "autorun\dlls"
+          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $autorunDlls -Force | Out-Null
 
-          # Definition: Nom, Plateformes, EstNet, Critique
+          # Definition: Nom, Plateformes, EstNet, Destination (bin ou autorun/dlls), Critique
+          # Destination: "bin" = racine CE, "autorun" = autorun/dlls/
           $solutions = @(
-              @{ Name="DotNetDataCollector.sln";         Platforms=@("x86","x64"); IsNet=$true;  Critical=$false },
-              @{ Name="DotNetInvasiveDataCollector.sln"; Platforms=@("Any CPU");   IsNet=$true;  Critical=$false },
-              @{ Name="MonoDataCollector.sln";           Platforms=@("x86","x64"); IsNet=$true;  Critical=$false },
-              @{ Name="CEJVMTI.sln";                     Platforms=@("x86","x64"); IsNet=$true;  Critical=$false },
-              @{ Name="Direct x mess.sln";               Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
-              @{ Name="CSCompiler.sln";                  Platforms=@("Any CPU");   IsNet=$true;  Critical=$false },
-              @{ Name="tcc.sln";                         Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
-              @{ Name="dbkkernel.sln";                   Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
-              @{ Name="cudaPointerScan.sln";             Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
-              @{ Name="lua53.sln";                       Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
-              @{ Name="CEPluginLibrary.sln";             Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
-              @{ Name="example-c.sln";                   Platforms=@("x86","x64"); IsNet=$false; Critical=$false },
-              @{ Name="QWS.sln";                         Platforms=@("x86","x64"); IsNet=$false; Critical=$false }
+              @{ Name="DotNetDataCollector.sln";         Platforms=@("x86","x64"); IsNet=$true;  Dest="bin";     Critical=$false },
+              @{ Name="DotNetInvasiveDataCollector.sln"; Platforms=@("Any CPU");   IsNet=$true;  Dest="bin";     Critical=$false },
+              @{ Name="MonoDataCollector.sln";           Platforms=@("x86","x64"); IsNet=$true;  Dest="autorun"; Critical=$false },
+              @{ Name="CEJVMTI.sln";                     Platforms=@("x86","x64"); IsNet=$true;  Dest="autorun"; Critical=$false },
+              @{ Name="Direct x mess.sln";               Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
+              @{ Name="CSCompiler.sln";                  Platforms=@("Any CPU");   IsNet=$true;  Dest="bin";     Critical=$false },
+              @{ Name="tcc.sln";                         Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
+              @{ Name="dbkkernel.sln";                   Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
+              @{ Name="cudaPointerScan.sln";             Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
+              @{ Name="lua53.sln";                       Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
+              @{ Name="CEPluginLibrary.sln";             Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
+              @{ Name="example-c.sln";                   Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false },
+              @{ Name="QWS.sln";                         Platforms=@("x86","x64"); IsNet=$false; Dest="bin";     Critical=$false }
           )
 
           foreach ($sol in $solutions) {
               $solPath = Get-ChildItem -Path $ceDir -Filter $sol.Name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
               if (-not $solPath) {
-                  Write-Warning "$($sol.Name) introuvable - SKIP"
+                  Write-Warning "[$($sol.Name)] introuvable - SKIP"
                   continue
               }
 
+              $solFolder = $solPath.DirectoryName
               $solBase = [System.IO.Path]::GetFileNameWithoutExtension($solPath.Name)
-              Write-Host "::group::msbuild $($sol.Name)"
+              Write-Host "::group::BUILD: $($sol.Name)"
 
               foreach ($plat in $sol.Platforms) {
                   $msbuildPlat = if ($plat -eq "Any CPU") { "AnyCPU" } else { $plat }
-                  Write-Host "--- Plateforme: $plat ---"
+                  Write-Host "  -> Plateforme: $plat"
 
                   & msbuild "$($solPath.FullName)" `
                       /nologo /verbosity:minimal `
@@ -641,57 +650,40 @@ jobs:
 
                   if ($exit -ne 0) {
                       if ($sol.Critical) { throw "CRITIQUE ECHOUE: $($sol.Name) [$plat]" }
-                      else { Write-Warning "NON-CRITIQUE ECHOUE: $($sol.Name) [$plat] (code $exit)" }
+                      else { Write-Warning "  ECHOUE: $($sol.Name) [$plat] (code $exit)" }
                       continue
                   }
+                  Write-Host "  -> BUILD OK"
 
                   # --- COLLECTE DES OUTPUTS ---
-                  $solFolder = $solPath.DirectoryName
-                  $destFolder = Join-Path $artifactsDir "$solBase\$plat"
-                  New-Item -ItemType Directory -Path $destFolder -Force | Out-Null
+                  $targetDir = if ($sol.Dest -eq "autorun") { $autorunDlls } else { $binDir }
 
-                  # Patterns de sortie classiques VS
-                  $searchPatterns = @(
-                      (Join-Path $solFolder "bin\$msbuildPlat\Release\*"),
-                      (Join-Path $solFolder "bin\Release\*"),
-                      (Join-Path $solFolder "bin\x64\Release\*"),
-                      (Join-Path $solFolder "bin\x86\Release\*"),
-                      (Join-Path $solFolder "$solBase\bin\$msbuildPlat\Release\*"),
-                      (Join-Path $solFolder "$solBase\bin\Release\*"),
-                      (Join-Path $solFolder "x64\Release\*"),
-                      (Join-Path $solFolder "x86\Release\*"),
-                      (Join-Path $solFolder "Release\*"),
-                      (Join-Path $solFolder "obj\$msbuildPlat\Release\*"),
-                      (Join-Path $solFolder "obj\Release\*")
-                  )
+                  # Recherche recursive dans le dossier de la solution
+                  $allFiles = Get-ChildItem -Path $solFolder -Recurse -File -ErrorAction SilentlyContinue |
+                      Where-Object {
+                          ($_.Extension -in @('.dll','.exe','.sys','.lib','.pdb')) -and
+                          ($_.FullName -match '\\(Release|release)\\') -and
+                          ($_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj|Obj)\\')
+                      }
+
+                  # Fallback si pas trouve avec Release
+                  if (-not $allFiles) {
+                      $allFiles = Get-ChildItem -Path $solFolder -Recurse -File -ErrorAction SilentlyContinue |
+                          Where-Object {
+                              ($_.Extension -in @('.dll','.exe','.sys','.lib','.pdb')) -and
+                              ($_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj)\\')
+                          } | Select-Object -First 20
+                  }
 
                   $copied = 0
-                  foreach ($pattern in $searchPatterns) {
-                      if (Test-Path $pattern) {
-                          Get-ChildItem -Path $pattern -Include "*.dll","*.exe","*.pdb","*.lib" -ErrorAction SilentlyContinue | ForEach-Object {
-                              try {
-                                  Copy-Item $_.FullName -Destination $destFolder -Force
-                                  Write-Host "  [COLLECT] $($_.Name) -> artifacts/$solBase/$plat/"
-                                  $copied++
-                              } catch { Write-Warning "  Echec copie $($_.Name): $_" }
-                          }
-                      }
+                  foreach ($file in $allFiles) {
+                      try {
+                          Copy-Item $file.FullName -Destination $targetDir -Force
+                          Write-Host "    [COLLECT] $($file.Name) ($($file.Length) bytes) -> $($sol.Dest)/"
+                          $copied++
+                      } catch { Write-Warning "    Echec copie $($file.Name): $_" }
                   }
-
-                  # Fallback: recherche recursive dans le dossier de la solution
-                  if ($copied -eq 0) {
-                      Write-Host "  Fallback recherche recursive dans $($solPath.DirectoryName)..."
-                      Get-ChildItem -Path $solFolder -Recurse -Include "*.dll","*.exe" -ErrorAction SilentlyContinue |
-                          Where-Object { $_.FullName -match '\\(bin|obj)\\' -and $_.FullName -match 'Release' } |
-                          ForEach-Object {
-                              try {
-                                  Copy-Item $_.FullName -Destination $destFolder -Force
-                                  Write-Host "  [COLLECT-FB] $($_.Name)"
-                                  $copied++
-                              } catch { }
-                          }
-                  }
-                  Write-Host "  -> $copied fichier(s) collecte(s) pour $solBase [$plat]"
+                  Write-Host "  -> $copied fichier(s) collecte(s)"
               }
               Write-Host "::endgroup::"
           }
@@ -704,40 +696,38 @@ jobs:
         shell: pwsh
         run: |
           $tcclibOut = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\tcclib") -Filter "*.dll" -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -match "tcclib" }
+              Where-Object { $_.Name -match "tcclib|tcc" }
           if ($tcclibOut) {
               $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
               foreach ($dll in $tcclibOut) {
                   Copy-Item $dll.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
                   Write-Host "Copie $($dll.Name) -> bin"
               }
-          }
+          } else { Write-Host "Aucune DLL tcclib trouvee." }
           exit 0
 
       # ===================================================================
-      # Collecte Lazarus outputs (DLLs/EXEs des sous-projets)
+      # Diagnostic - arborescence finale
       # ===================================================================
-      - name: Collect Lazarus sub-project outputs
+      - name: Diagnostic - list all collected outputs
         shell: pwsh
         run: |
-          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $binDir = Join-Path $ceDir "bin"
-          $lazDir = Join-Path $binDir "lazarus-projects"
-          New-Item -ItemType Directory -Path $lazDir -Force | Out-Null
-
-          $subDirs = @("speedhack","luaclient","VEHDebug","Tutorial","betterControls","plugin","launcher","winhook","xmplayer")
-          foreach ($sub in $subDirs) {
-              $p = Join-Path $ceDir $sub
-              if (-not (Test-Path $p)) { continue }
-              Get-ChildItem -Path $p -Recurse -Include "*.dll","*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-                  $rel = $_.FullName.Substring($p.Length + 1)
-                  $destFolder = Join-Path $lazDir $sub
-                  New-Item -ItemType Directory -Path $destFolder -Force | Out-Null
-                  Copy-Item $_.FullName -Destination $destFolder -Force
-                  Write-Host "[LAZARUS] $sub/$rel -> lazarus-projects/$sub/"
+          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
+          Write-Host "::group::Arborescence bin/"
+          function Show-Tree {
+              param([string]$Path, [string]$Indent = "")
+              Get-ChildItem -Path $Path -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
+                  if ($_.PSIsContainer) {
+                      Write-Host "$Indent[$($_.Name)]"
+                      Show-Tree -Path $_.FullName -Indent "$Indent  "
+                  } else {
+                      Write-Host "$Indent$($_.Name) ($($_.Length) bytes)"
+                  }
               }
           }
-          exit 0
+          if (Test-Path $binDir) { Show-Tree -Path $binDir }
+          else { Write-Warning "bin/ introuvable" }
+          Write-Host "::endgroup::"
 
       # ===================================================================
       # Checksums + manifeste
@@ -802,35 +792,12 @@ jobs:
       # ===================================================================
       # Artifacts upload
       # ===================================================================
-      - name: Upload artifact (main)
+      - name: Upload artifact (main CE build)
         uses: actions/upload-artifact@v4
         with:
           name: cheat-engine-win64-${{ inputs.ref || 'master' }}
-          path: ${{ inputs.artifact_path }}
+          path: Cheat Engine/bin/**
           if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload VS sub-projects artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: vs-subprojects-${{ inputs.ref || 'master' }}
-          path: |
-            Cheat Engine/bin/artifacts/**
-            Cheat Engine/bin/lazarus-projects/**
-            Cheat Engine/bin/build_manifest.txt
-            Cheat Engine/bin/SHA256SUMS.txt
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Upload DotNetDataCollector artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dotnetdatacollector-multiarch-${{ inputs.ref || 'master' }}
-          path: |
-            Cheat Engine/bin/DotNetDataCollector*
-            Cheat Engine/bin/x86/DotNetDataCollector*
-            Cheat Engine/bin/avx/DotNetDataCollector*
-          if-no-files-found: warn
           retention-days: 14
 
       - name: Upload patches log
