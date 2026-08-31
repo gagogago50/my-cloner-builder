@@ -4,7 +4,7 @@
 # You start it yourself: Actions → this workflow → "Run workflow".
 #
 # Put this file in an EMPTY GitHub repo (not a fork of SpotiFLAC):
-#   .github/workflows/spotiflac_build_windows.yml
+#   .github/workflows/spotiflac_windows_build.yml
 # This file never pushes, never creates a release, never tags.
 # The .exe is a downloadable Actions artifact only.
 #
@@ -68,83 +68,62 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python << 'PY'
+          python - <<'PY'
           from pathlib import Path
+          import re
 
-          def patch(path, old, new, label):
+          def must_sub(path, pattern, repl, label, flags=0):
               p = Path(path)
               if not p.exists():
-                  raise SystemExit(f"missing {path}")
+                  raise SystemExit("missing " + path)
+              text = p.read_text(encoding="utf-8")
+              new, n = re.subn(pattern, repl, text, count=1, flags=flags)
+              if n != 1:
+                  raise SystemExit(label + ": pattern not found, aborting")
+              p.write_text(new, encoding="utf-8")
+              print("patched " + label)
+
+          def must_replace(path, old, new, label):
+              p = Path(path)
+              if not p.exists():
+                  raise SystemExit("missing " + path)
               text = p.read_text(encoding="utf-8")
               if old not in text:
-                  raise SystemExit(f"{label}: pattern not found, aborting")
+                  raise SystemExit(label + ": pattern not found, aborting")
               p.write_text(text.replace(old, new, 1), encoding="utf-8")
-              print(f"patched {label}")
+              print("patched " + label)
 
-          patch(
+          must_sub(
               "app.go",
-              '''func (a *App) FetchSpotiFLACStatusPayload(kind string) (map[string]string, error) {
-	var statusURL string
-	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "next":
-		statusURL = spotiFLACNextStatusURL
-	case "current":
-		statusURL = spotiFLACCurrentStatusURL
-	default:
-		return nil, fmt.Errorf("unknown SpotiFLAC status payload: %s", kind)
-	}
-
-	return runWithTimeout(checkOperationTimeout, func() (map[string]string, error) {
-		return fetchSpotiFLACStatusPayload(statusURL)
-	})
-}''',
-              '''func (a *App) FetchSpotiFLACStatusPayload(kind string) (map[string]string, error) {
-	return map[string]string{}, nil
-}''',
+              r"func \(a \*App\) FetchSpotiFLACStatusPayload\(kind string\) \(map\[string\]string, error\) \{.*?\n\}",
+              "func (a *App) FetchSpotiFLACStatusPayload(kind string) (map[string]string, error) {\n    return map[string]string{}, nil\n}",
               "app.go FetchSpotiFLACStatusPayload",
+              re.S,
           )
 
-          patch(
+          must_sub(
               "app.go",
-              '''func (a *App) GetCurrentIPInfo() (string, error) {
-	info, err := fetchCurrentIPInfo()
-	if err != nil {
-		return "", err
-	}
-
-	payload, err := json.Marshal(info)
-	if err != nil {
-		return "", err
-	}
-
-	return string(payload), nil
-}''',
-              '''func (a *App) GetCurrentIPInfo() (string, error) {
-	return `{"ip":"","country":"","country_code":"","source":"disabled"}`, nil
-}''',
+              r"func \(a \*App\) GetCurrentIPInfo\(\) \(string, error\) \{.*?\n\}",
+              "func (a *App) GetCurrentIPInfo() (string, error) {\n    return \"{}\", nil\n}",
               "app.go GetCurrentIPInfo",
+              re.S,
           )
 
-          patch(
+          must_replace(
               "frontend/src/App.tsx",
-              '''    const checkForUpdates = async () => {
-        try {
-            const response = await fetch("https://api.github.com/repos/spotbye/SpotiFLAC/releases/latest");''',
-              '''    const checkForUpdates = async () => {
-        return;
-        try {
-            const response = await fetch("https://api.github.com/repos/spotbye/SpotiFLAC/releases/latest");''',
+              "const checkForUpdates = async () => {\n        try {\n            const response = await fetch(\"https://api.github.com/repos/spotbye/SpotiFLAC/releases/latest\");",
+              "const checkForUpdates = async () => {\n        return;\n        try {\n            const response = await fetch(\"https://api.github.com/repos/spotbye/SpotiFLAC/releases/latest\");",
               "frontend/src/App.tsx checkForUpdates",
           )
 
-          patch(
+          must_replace(
               "frontend/src/lib/settings.ts",
               "showUpdateNotifications: true,",
               "showUpdateNotifications: false,",
               "settings.ts default showUpdateNotifications",
           )
 
-          patch(
+          must_replace(
               "frontend/src/lib/settings.ts",
               "normalized.showUpdateNotifications = typeof settings.showUpdateNotifications === \"boolean\" ? settings.showUpdateNotifications : true;",
               "normalized.showUpdateNotifications = typeof settings.showUpdateNotifications === \"boolean\" ? settings.showUpdateNotifications : false;",
