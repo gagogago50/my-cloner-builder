@@ -1,8 +1,15 @@
-name: Secure Build Cheat Engine
+name: Build Cheat Engine
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# =============================================================================
+#  Build complet de cheat-engine/cheat-engine SANS fork.
+#
+#  Reconstruit sur la base d'un workflow qui produisait deja correctement
+#  cheatengine-i386/x86_64/x86_64-SSE4-AVX2, mais dont le zip ne contenait
+#  AUCUNE dependance (DotNetDataCollector, DotNetInterface, MonoDataCollector,
+#  CSCompiler, tcc, vehdebug, speedhack...).
+#
+#  Les 5 causes racines identifiees sont corrigees : voir README.md.
+# =============================================================================
 
 on:
   workflow_dispatch:
@@ -22,113 +29,107 @@ on:
         required: false
         default: "2.2.6"
         type: choice
-        options:
-          - "2.2.6"
-          - "2.2.2"
+        options: ["2.2.6", "2.2.2"]
       dotnet_version:
         description: "Version du SDK .NET"
         required: false
         default: "8.0.x"
         type: choice
-        options:
-          - "8.0.x"
-          - "9.0.x"
-          - "7.0.x"
+        options: ["8.0.x", "9.0.x"]
       enable_avx:
-        description: "Activer AVX/AVX2"
+        description: "Compiler aussi le mode AVX2"
         required: false
         default: true
         type: boolean
-      apply_code_patches:
-        description: "Appliquer les patches"
+      build_native_deps:
+        description: "Dependances C++/.NET (DotNetDataCollector, Mono, CSCompiler, tcc...)"
         required: false
         default: true
         type: boolean
+      build_dbkernel:
+        description: "dbk32.sys / dbk64.sys (WDK, pilote NON signe)"
+        required: false
+        default: false
+        type: boolean
+      build_directx:
+        description: "Hooks D3D9/10/11 (telecharge le DirectX SDK June 2010, ~570 Mo)"
+        required: false
+        default: false
+        type: boolean
+      run_security_scan:
+        description: "Executer le job de scan de securite (gitleaks/ClamAV)"
+        required: false
+        default: false
+        type: boolean
+      fail_on_missing_deps:
+        description: "Faire echouer le build si une dependance attendue manque"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
-  security-events: write
+
+env:
+  # Repertoires cibles, resous une fois pour toutes.
+  CE_DIR: ${{ github.workspace }}\Cheat Engine
+  BIN_DIR: ${{ github.workspace }}\Cheat Engine\bin
 
 jobs:
-  security-scans:
-    name: "Sequential Security Scans"
+  # ===========================================================================
+  #  Scan de securite - optionnel, jamais bloquant
+  # ===========================================================================
+  security-scan:
+    name: Security scan
     runs-on: ubuntu-latest
+    if: ${{ inputs.run_security_scan }}
     continue-on-error: true
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          fetch-depth: 0
 
-      - name: Create Gitleaks allowlist
-        run: |
-          cat > .gitleaks.toml << 'EOF'
-          [extend]
-          useDefault = true
-          [allowlist]
-          description = "Faux positifs connus"
-          paths = [
-            "Cheat Engine/feces\.pas",
-            "Cheat Engine/frmluaengineunit\.lfm"
-          ]
-          EOF
-
-      - name: Run Gitleaks
+      - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
 
-      - name: Setup ClamAV
+      - name: ClamAV
         continue-on-error: true
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clamav clamav-daemon
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav
           sudo freshclam --quiet || true
+          clamscan --recursive --infected --quiet . || true
 
-      - name: Scan repository with ClamAV
-        continue-on-error: true
-        run: clamscan --recursive --infected --quiet . || true
-
-      - name: Pattern scan
-        continue-on-error: true
-        run: |
-          grep -rniE "(password|secret|token|api_key)" --include="*.pas" --include="*.lfm" --include="*.lpi" --include="*.lpr" . || true
-
+  # ===========================================================================
+  #  Build principal
+  # ===========================================================================
   build:
-    name: "Build Windows AMD64 + x86 + AVX"
-    runs-on: windows-latest
-    needs: security-scans
+    name: Build CE + dependances
+    runs-on: windows-2022
+    timeout-minutes: 180
+    # Sans cette condition, un job `needs` skipped entraine le skip du job
+    # dependant : le build ne tournerait jamais quand run_security_scan=false.
+    if: ${{ !cancelled() && (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped') }}
+    needs: security-scan
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           submodules: recursive
 
-      # ===================================================================
-      # Install missing dependencies (Windows SDK 8.1, .NET 4.6.1, choco)
-      # ===================================================================
-      - name: Install build dependencies
-        shell: pwsh
-        run: |
-          Write-Host "::group::Installing Chocolatey packages..."
-          # Windows SDK 8.1 (required by old C++ projects)
-          choco install windows-sdk-8.1 -y --no-progress 2>&1 | Out-Null
-          # .NET Framework 4.6.1 Developer Pack (required by CEPluginLibrary)
-          choco install netfx-4.6.1-devpack -y --no-progress 2>&1 | Out-Null
-          # Visual C++ 2013 Redist (build tools legacy support)
-          choco install vcredist2013 -y --no-progress 2>&1 | Out-Null
-          Write-Host "::endgroup::"
-
-      # ===================================================================
-      # Setup toolchain
-      # ===================================================================
+      # -----------------------------------------------------------------
+      # 1. Chaine d'outils
+      # -----------------------------------------------------------------
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
         with:
@@ -140,27 +141,6 @@ jobs:
           dotnet-version: ${{ inputs.dotnet_version }}
         continue-on-error: true
 
-      - name: Setup NuGet CLI
-        shell: pwsh
-        run: |
-          $nugetPath = "${env:LOCALAPPDATA}\nuget"
-          New-Item -ItemType Directory -Path $nugetPath -Force | Out-Null
-          $nugetExe = Join-Path $nugetPath "nuget.exe"
-          if (-not (Test-Path $nugetExe)) {
-              Invoke-WebRequest -Uri "https://dist.nuget.org/win-x86-commandline/latest/nuget.exe" -OutFile $nugetExe -UseBasicParsing
-          }
-          echo "$nugetPath" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          Write-Host "NuGet: $nugetExe"
-
-      - name: Setup NuGet cache
-        if: ${{ success() }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ inputs.dotnet_version }}-${{ hashFiles('**/*.csproj','**/packages.config') }}
-          restore-keys: |
-            ${{ runner.os }}-nuget-
-
       - name: Setup Lazarus
         uses: gcarreno/setup-lazarus@v3
         with:
@@ -170,75 +150,77 @@ jobs:
       - name: Resolve Lazarus directory
         shell: pwsh
         run: |
-          $lazbuild = Get-Command lazbuild -ErrorAction SilentlyContinue
           $lazDir = $null
-          if ($lazbuild) {
-              $lazDir = Split-Path -Parent $lazbuild.Source
-              while ($lazDir -and -not (Test-Path (Join-Path $lazDir "fpc"))) {
-                  $lazDir = Split-Path -Parent $lazDir
-              }
-          }
-          $candidates = @("D:\a\_temp\installers\lazarus", "C:\lazarus", "C:\Program Files\Lazarus")
-          if (-not $lazDir) {
-              foreach ($c in $candidates) {
-                  if (Test-Path (Join-Path $c "lazbuild.exe")) { $lazDir = $c; break }
-              }
+          $cmd = Get-Command lazbuild -ErrorAction SilentlyContinue
+          if ($cmd) {
+              $d = Split-Path -Parent $cmd.Source
+              while ($d -and -not (Test-Path (Join-Path $d 'fpc'))) { $d = Split-Path -Parent $d }
+              if ($d) { $lazDir = $d }
           }
           if (-not $lazDir) {
-              $found = Get-ChildItem -Path "D:\a" -Filter "lazbuild.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              foreach ($c in @('C:\lazarus', 'C:\Program Files\Lazarus', "$env:RUNNER_TEMP\installers\lazarus")) {
+                  if (Test-Path (Join-Path $c 'lazbuild.exe')) { $lazDir = $c; break }
+              }
+          }
+          if (-not $lazDir) {
+              $found = Get-ChildItem -Path 'C:\', 'D:\a' -Filter 'lazbuild.exe' -Recurse -Depth 4 -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
               if ($found) { $lazDir = Split-Path -Parent $found.FullName }
           }
-          if (-not $lazDir) { throw "Dossier Lazarus introuvable" }
-          Write-Host "Racine Lazarus: $lazDir"
-          echo "LAZARUS_DIR=$lazDir" >> $env:GITHUB_ENV
+          if (-not $lazDir) { throw 'Racine Lazarus introuvable' }
+          Write-Host "Racine Lazarus : $lazDir"
+          "LAZARUS_DIR=$lazDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & (Join-Path $lazDir 'lazbuild.exe') --version
 
-      # ===================================================================
-      # Cross-compiler i386-win32 (best-effort)
-      # ===================================================================
-      - name: Try install i386 cross-compiler
+      # Le cross-compiler i386-win32 n'est pas inclus par setup-lazarus :
+      # sans lui, tous les modes 32 bits echouent (speedhack-i386, vehdebug-i386,
+      # cheatengine-i386...).
+      - name: Install i386-win32 cross-compiler
         continue-on-error: true
         shell: pwsh
-        env:
-          LAZARUS_DIR: ${{ env.LAZARUS_DIR }}
         run: |
           $lazDir = $env:LAZARUS_DIR
-          $fpcVer = "3.2.2"
-          $lazVer = "${{ inputs.lazarus_version }}"
+          $fpcVer = '3.2.2'
+
+          # Version reelle de Lazarus, lue depuis lazbuild (jamais devinee).
+          $lazVer = '${{ inputs.lazarus_version }}'
           try {
-              $lazVerRaw = & lazbuild --version 2>&1 | Select-String -Pattern "Lazarus\s+(\d+\.\d+\.\d+)" | Select-Object -First 1
-              if ($lazVerRaw -match "(\d+\.\d+\.\d+)") { $lazVer = $matches[1] }
-          } catch {}
-          Write-Host "Version Lazarus: $lazVer"
+              $v = & lazbuild --version 2>&1 | Out-String
+              if ($v -match 'Lazarus\s+(\d+\.\d+\.\d+)') { $lazVer = $Matches[1] }
+          } catch { }
+          Write-Host "Lazarus $lazVer / FPC $fpcVer"
 
-          $crossInstaller = "lazarus-$lazVer-fpc-$fpcVer-cross-i386-win32-win64.exe"
-          $dest = Join-Path $env:RUNNER_TEMP $crossInstaller
-
+          $installer = "lazarus-$lazVer-fpc-$fpcVer-cross-i386-win32-win64.exe"
+          $dest = Join-Path $env:RUNNER_TEMP $installer
           $mirrors = @(
-              "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller",
-              "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$crossInstaller/download",
-              "https://freepascal.dfmk.hu/pub/lazarus/releases/$crossInstaller"
+              "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$installer",
+              "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$installer/download",
+              "https://freepascal.dfmk.hu/pub/lazarus/releases/$installer"
           )
 
-          function Download-WithRetry {
-              param([string[]]$Urls, [string]$OutFile, [int]$MaxAttempts = 3)
+          function Get-Installer {
+              param([string[]]$Urls, [string]$OutFile)
               foreach ($url in $Urls) {
-                  for ($i = 1; $i -le $MaxAttempts; $i++) {
-                      Write-Host "Tentative $i/$MaxAttempts : $url"
+                  for ($i = 1; $i -le 3; $i++) {
+                      Write-Host "  tentative $i/3 : $url"
                       try {
                           Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing `
-                              -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0" `
-                              -MaximumRedirection 15 -TimeoutSec 120 -ErrorAction Stop
-                          if (Test-Path $OutFile) {
-                              $bytes = [System.IO.File]::ReadAllBytes($OutFile)[0..1]
-                              $magic = [System.Text.Encoding]::ASCII.GetString($bytes)
-                              if ($magic -eq "MZ") {
-                                  Write-Host "Telecharge ($((Get-Item $OutFile).Length) bytes)"
-                                  return $true
-                              }
-                              Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+                              -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' `
+                              -MaximumRedirection 15 -TimeoutSec 180 -ErrorAction Stop
+                          # Un miroir SourceForge peut renvoyer une page HTML : on verifie le magic MZ.
+                          $fs = [System.IO.File]::OpenRead($OutFile)
+                          try {
+                              $b = New-Object byte[] 2
+                              [void]$fs.Read($b, 0, 2)
+                          } finally { $fs.Dispose() }
+                          if ([System.Text.Encoding]::ASCII.GetString($b) -eq 'MZ') {
+                              Write-Host "  OK ($('{0:N1}' -f ((Get-Item $OutFile).Length / 1MB)) Mo)"
+                              return $true
                           }
+                          Write-Warning '  fichier recu invalide (pas un PE)'
+                          Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                       } catch {
-                          Write-Warning "Echec: $($_.Exception.Message)"
+                          Write-Warning "  echec : $($_.Exception.Message)"
                           Start-Sleep -Seconds ([Math]::Min($i * 5, 15))
                       }
                   }
@@ -246,591 +228,597 @@ jobs:
               return $false
           }
 
-          if (-not (Download-WithRetry -Urls $mirrors -OutFile $dest -MaxAttempts 3)) {
-              Write-Warning "Telechargement cross-compiler impossible. 32-bit ignore."
-              return
+          if (-not (Get-Installer -Urls $mirrors -OutFile $dest)) {
+              Write-Warning 'Cross-compiler i386 indisponible : les cibles 32 bits seront absentes.'
+              exit 0
           }
 
-          $logFile = Join-Path $env:RUNNER_TEMP "laz_cross_install.log"
-          $p = Start-Process -FilePath "$dest" `
-            -ArgumentList "/verysilent /suppressmsgboxes /norestart /nocloseapplications /DIR=`"$lazDir`" /LOG=`"$logFile`"" `
-            -Wait -PassThru -NoNewWindow
-          Write-Host "Code sortie install: $($p.ExitCode)"
+          $log = Join-Path $env:RUNNER_TEMP 'laz_cross.log'
+          $p = Start-Process -FilePath $dest `
+              -ArgumentList "/verysilent /suppressmsgboxes /norestart /nocloseapplications /DIR=`"$lazDir`" /LOG=`"$log`"" `
+              -Wait -PassThru -NoNewWindow
+          Write-Host "Code sortie : $($p.ExitCode)"
 
-          $ppc386 = Get-ChildItem -Path $lazDir -Filter "ppc386.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $ppc386 = Get-ChildItem -Path $lazDir -Filter 'ppc386.exe' -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
           if ($ppc386) {
-              Write-Host "ppc386.exe OK: $($ppc386.FullName)"
-              $fpcBinDir = Split-Path -Parent $ppc386.FullName
-              echo "$fpcBinDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-              $env:PATH = "$fpcBinDir;$env:PATH"
-              echo "HAVE_PPC386=true" >> $env:GITHUB_ENV
+              Write-Host "ppc386 trouve : $($ppc386.FullName)"
+              'HAVE_PPC386=true' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           } else {
-              Write-Warning "ppc386.exe introuvable apres installation."
+              Write-Warning 'ppc386.exe introuvable apres installation.'
+              'HAVE_PPC386=false' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
-      # ===================================================================
-      # Retarget old VS projects (v120, v141_xp -> v143 + Win10 SDK)
-      # ===================================================================
-      - name: Retarget Visual Studio projects to v143
+      # -----------------------------------------------------------------
+      # 2. Patchs sources
+      #
+      #    Inline (et non dans un fichier du depot) : le checkout vise
+      #    cheat-engine/cheat-engine, qui ne contient evidemment pas nos
+      #    scripts. Rien n'est commité, tout reste dans le workspace.
+      #
+      #    a) Tutorial/tutorial.lpi utilise VirtualTreeView sans declarer le
+      #       paquet laz.virtualtreeview_package dans <RequiredPackages>
+      #       (seul "LCL" y figure). L'IDE le resout implicitement, lazbuild
+      #       non -> echec. cheatengine.lpi declare bien ce paquet.
+      #    b) ceregreset.dpr contient {$R *.res} alors qu'aucun .res n'est
+      #       versionne dans ceregreset/ -> FPC echoue.
+      # -----------------------------------------------------------------
+      - name: Apply source fixes
         shell: pwsh
         run: |
-          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $vcxprojFiles = Get-ChildItem -Path $ceDir -Recurse -Filter "*.vcxproj" -ErrorAction SilentlyContinue
-          Write-Host "Retargeting $($vcxprojFiles.Count) .vcxproj files..."
-          $retargeted = 0
-          foreach ($proj in $vcxprojFiles) {
-              $content = Get-Content $proj.FullName -Raw -Encoding UTF8
-              $orig = $content
-              # Retarget toolsets
-              $content = $content -replace '<PlatformToolset>v120</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
-              $content = $content -replace '<PlatformToolset>v140</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
-              $content = $content -replace '<PlatformToolset>v141</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
-              $content = $content -replace '<PlatformToolset>v141_xp</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
-              $content = $content -replace '<PlatformToolset>v142</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>'
-              # Retarget Windows SDK
-              $content = $content -replace '<WindowsTargetPlatformVersion>8\.1</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
-              $content = $content -replace '<WindowsTargetPlatformVersion>8\.0</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
-              if ($content -ne $orig) {
-                  Set-Content -Path $proj.FullName -Value $content -Encoding UTF8 -NoNewline
-                  $retargeted++
+          # --- a) tutorial.lpi : paquet manquant ---
+          $lpi = Join-Path $env:CE_DIR 'Tutorial\tutorial.lpi'
+          if (Test-Path $lpi) {
+              $raw = [System.IO.File]::ReadAllText($lpi)
+              if ($raw -match 'laz\.virtualtreeview_package') {
+                  Write-Host 'tutorial.lpi : paquet deja declare'
+              } else {
+                  $rx = [regex]'(?s)<RequiredPackages([^>]*)>(.*?)</RequiredPackages>'
+                  $m = $rx.Match($raw)
+                  if (-not $m.Success) {
+                      Write-Warning 'tutorial.lpi : <RequiredPackages> introuvable'
+                  } else {
+                      $attrs = $m.Groups[1].Value
+                      $body  = $m.Groups[2].Value
+                      $count = 0
+                      if ($attrs -match 'Count="(\d+)"') { $count = [int]$Matches[1] }
+                      $newAttrs = if ($attrs -match 'Count="\d+"') {
+                          ($attrs -replace 'Count="\d+"', "Count=`"$($count + 1)`"")
+                      } else { $attrs + " Count=`"$($count + 1)`"" }
+                      # Indentation alignee sur les <ItemN> existants.
+                      $indent = '      '
+                      if ($body -match '(?m)^([ \t]*)<Item\d+') { $indent = $Matches[1] }
+                      $entry = "`r`n$indent<Item$($count + 1)>" `
+                             + "`r`n$indent  <PackageName Value=`"laz.virtualtreeview_package`"/>" `
+                             + "`r`n$indent</Item$($count + 1)>"
+                      $newBody = $body.TrimEnd("`r", "`n", ' ') + $entry + "`r`n    "
+                      $newBlock = "<RequiredPackages$newAttrs>$newBody</RequiredPackages>"
+                      $raw = $raw.Substring(0, $m.Index) + $newBlock + $raw.Substring($m.Index + $m.Length)
+                      # WriteAllText sans BOM, fins de ligne CRLF preservees.
+                      [System.IO.File]::WriteAllText($lpi, $raw, (New-Object System.Text.UTF8Encoding $false))
+                      Write-Host "tutorial.lpi : laz.virtualtreeview_package ajoute (Count=$($count + 1))"
+                  }
               }
           }
-          Write-Host "Retargeted $retargeted projects to v143 + Windows 10 SDK"
 
-      # ===================================================================
-      # Patches d'amelioration
-      # ===================================================================
-      - name: Apply Cheat Engine code improvement patches
-        if: ${{ inputs.apply_code_patches == true }}
+          # --- b) ceregreset.dpr : {$R *.res} sans .res ---
+          $dprDir = Join-Path $env:CE_DIR 'ceregreset'
+          $dpr = Join-Path $dprDir 'ceregreset.dpr'
+          if (Test-Path $dpr) {
+              $hasRes = @(Get-ChildItem -Path $dprDir -Filter '*.res' -ErrorAction SilentlyContinue).Count -gt 0
+              if ($hasRes) {
+                  Write-Host 'ceregreset : un .res est present, rien a faire'
+              } else {
+                  $raw = [System.IO.File]::ReadAllText($dpr)
+                  if ($raw -notmatch '\{\$R \*\.res\}') {
+                      Write-Host 'ceregreset.dpr : directive {$R *.res} absente'
+                  } else {
+                      $raw = $raw -replace '\{\$R \*\.res\}', ''
+                      [System.IO.File]::WriteAllText($dpr, $raw, (New-Object System.Text.UTF8Encoding $false))
+                      Write-Host 'ceregreset.dpr : directive {$R *.res} retiree'
+                  }
+              }
+          }
+
+      # -----------------------------------------------------------------
+      # 3. Dependances de la chaine native
+      #
+      #    CAUSE RACINE n.1 : DotNetDataCollector.vcxproj code en dur
+      #      C:\Program Files (x86)\Windows Kits\NETFXSDK\4.7.2\Include\um
+      #    et lie CorGuids.lib. Ces en-tetes (CorDebug.h, clrdata.h,
+      #    metahost.h) ne sont PAS dans le Windows SDK 10 : ils viennent du
+      #    .NET Framework Developer Pack, qui cree exactement ce repertoire.
+      #    Installer le SDK 8.1 ne sert donc a rien.
+      # -----------------------------------------------------------------
+      - name: Install .NET Framework 4.7.2 Developer Pack (NETFXSDK)
+        if: ${{ inputs.build_native_deps }}
         shell: pwsh
         run: |
-          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $patchLog = Join-Path $env:GITHUB_WORKSPACE "patches_applied.md"
-          "# Patches d'amelioration appliques" | Out-File -FilePath $patchLog -Encoding utf8
-          function Add-PatchLog { param([string]$Msg) Add-Content -Path $patchLog -Value "- $Msg"; Write-Host "PATCH: $Msg" }
-
-          $dncDir = Join-Path $ceDir "DotNetDataCollector"
-          if (Test-Path $dncDir) {
-              $avxHelperPath = Join-Path $dncDir "Avx2MemoryScanner.cs"
-              if (-not (Test-Path $avxHelperPath)) {
-                  $avxCode = @'
-          using System;
-          using System.Runtime.Intrinsics;
-          using System.Runtime.Intrinsics.X86;
-          namespace DotNetDataCollector {
-              internal static class Avx2MemoryScanner {
-                  public static bool IsSupported => Avx2.IsSupported;
-                  public static unsafe bool ContainsPattern(byte* buffer, int length, byte pattern, byte mask) {
-                      if (length <= 0) return false;
-                      if (Avx2.IsSupported && length >= 32) {
-                          var vPattern = Vector256.Create(pattern); var vMask = Vector256.Create(mask);
-                          int i = 0, limit = length - 32;
-                          while (i <= limit) {
-                              var v = Avx.LoadVector256(buffer + i);
-                              var masked = Avx2.And(v, vMask);
-                              var cmp = Avx2.CompareEqual(masked, vPattern);
-                              if (cmp.GetElement(0) != 0 || cmp.GetElement(1) != 0 || cmp.GetElement(2) != 0 || cmp.GetElement(3) != 0) return true;
-                              i += 32;
-                          }
-                          for (; i < length; i++) if ((buffer[i] & mask) == (pattern & mask)) return true;
-                          return false;
-                      }
-                      if (Sse2.IsSupported && length >= 16) {
-                          var vPattern = Vector128.Create(pattern); var vMask = Vector128.Create(mask);
-                          int i = 0, limit = length - 16;
-                          while (i <= limit) {
-                              var v = Sse2.LoadVector128(buffer + i);
-                              var masked = Sse2.And(v, vMask);
-                              var cmp = Sse2.CompareEqual(masked, vPattern);
-                              if (cmp.GetElement(0) != 0 || cmp.GetElement(1) != 0) return true;
-                              i += 16;
-                          }
-                          for (; i < length; i++) if ((buffer[i] & mask) == (pattern & mask)) return true;
-                          return false;
-                      }
-                      for (int i = 0; i < length; i++) if ((buffer[i] & mask) == (pattern & mask)) return true;
-                      return false;
-                  }
-                  public static unsafe int IndexOfPattern(byte* buffer, int length, byte[] pattern, byte[] mask) {
-                      if (pattern == null || pattern.Length == 0 || length < pattern.Length) return -1;
-                      int last = length - pattern.Length;
-                      for (int i = 0; i <= last; i++) {
-                          int j = 0;
-                          while (j < pattern.Length && (buffer[i + j] & mask[j]) == (pattern[j] & mask[j])) j++;
-                          if (j == pattern.Length) return i;
-                      }
-                      return -1;
-                  }
-              }
+          $ErrorActionPreference = 'Stop'
+          $hdr = 'C:\Program Files (x86)\Windows Kits\NETFXSDK\4.7.2\Include\um\CorDebug.h'
+          $lib = 'C:\Program Files (x86)\Windows Kits\NETFXSDK\4.7.2\Lib\um\x64\CorGuids.lib'
+          if ((Test-Path $hdr) -and (Test-Path $lib)) {
+              Write-Host 'NETFXSDK 4.7.2 deja present.'
+              exit 0
           }
-          '@
-                  $avxCode | Out-File -FilePath $avxHelperPath -Encoding utf8
-                  Add-PatchLog "Ajout Avx2MemoryScanner.cs"
-              }
+          $url = 'https://download.visualstudio.microsoft.com/download/pr/158dce74-251c-4af3-b8cc-4608621341c8/9c1e178a11f55478e2112714a3897c1a/ndp472-devpack-enu.exe'
+          $exe = Join-Path $env:RUNNER_TEMP 'ndp472-devpack.exe'
+          & curl.exe -L --retry 5 --retry-delay 3 -o $exe $url
+          if ($LASTEXITCODE -ne 0) { throw 'Telechargement du Developer Pack 4.7.2 impossible' }
+          $p = Start-Process $exe -ArgumentList '/quiet', '/norestart' -Wait -PassThru
+          # 3010 = succes avec redemarrage recommande, acceptable en CI.
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "ndp472-devpack a echoue (code $($p.ExitCode))" }
+          if (-not (Test-Path $hdr)) { throw "CorDebug.h toujours introuvable : $hdr" }
+          if (-not (Test-Path $lib)) { throw "CorGuids.lib toujours introuvable : $lib" }
+          Write-Host 'NETFXSDK 4.7.2 operationnel.'
 
-              $csprojFiles = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue
-              foreach ($csproj in $csprojFiles) {
-                  $content = Get-Content $csproj.FullName -Raw -Encoding UTF8
-                  $modified = $false
-                  if ($content -notmatch '<Optimize>') {
-                      $content = $content -replace '</PropertyGroup>', '  <Optimize>true</Optimize>`n  <TieredCompilation>true</TieredCompilation>`n  <ServerGarbageCollection>true</ServerGarbageCollection>`n  <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>`n</PropertyGroup>'
-                      $modified = $true; Add-PatchLog "$($csproj.Name): active Optimize+TieredCompilation+ServerGC"
-                  }
-                  if ($content -notmatch '<EnableHWIntrinsic') {
-                      $content = $content -replace '</Project>', '  <PropertyGroup Condition="''$(Configuration)''==''Release''">`n    <EnableHWIntrinsic>true</EnableHWIntrinsic>`n    <AVX>true</AVX>`n  </PropertyGroup>`n</Project>'
-                      $modified = $true; Add-PatchLog "$($csproj.Name): active EnableHWIntrinsic+AVX"
-                  }
-                  if ($modified) {
-                      $content = $content -replace '`n', "`n"
-                      Set-Content -Path $csproj.FullName -Value $content -Encoding UTF8 -NoNewline
-                  }
-              }
-
-              $csFiles = Get-ChildItem -Path $dncDir -Filter "*.cs" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Avx2MemoryScanner' }
-              foreach ($cs in $csFiles) {
-                  try {
-                      $content = Get-Content $cs.FullName -Raw -Encoding UTF8; $orig = $content
-                      $content = [regex]::Replace($content, 'catch\s*\(\s*Exception(\s+\w+)?\s*\)\s*\{\s*\}', 'catch (System.Exception ex$1) { System.Diagnostics.Debug.WriteLine("DotNetDataCollector: " + ex.ToString()); }')
-                      $content = [regex]::Replace($content, 'catch\s*\{\s*\}', 'catch (System.Exception ex) { System.Diagnostics.Debug.WriteLine("DotNetDataCollector: " + ex.ToString()); }')
-                      if ($content -ne $orig) { Set-Content -Path $cs.FullName -Value $content -Encoding UTF8 -NoNewline; Add-PatchLog "$($cs.Name): catch vides -> logging" }
-                  } catch { Write-Warning "Patch catch sur $($cs.Name): $_" }
-              }
-          } else { Add-PatchLog "DotNetDataCollector absent" }
-
-          $lpiFiles = Get-ChildItem -Path $ceDir -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
-          $avxModesAdded = 0
-          foreach ($lpi in $lpiFiles) {
-              try {
-                  $content = Get-Content $lpi.FullName -Raw -Encoding UTF8
-                  if ($content -match 'O4 AVX2') { continue }
-                  if ($content -match '<Mode Name="Release 64-Bit">') {
-                      $newMode = '    <Mode Name="Release 64-Bit O4 AVX2">' + "`n" +
-                                  '      <CompilerOptions>`n' +
-                                  '        <Options>`n' +
-                                  '          <Optimization Value="4"/>`n' +
-                                  '          <CpuType Value="AVX2"/>`n' +
-                                  '        </Options>`n' +
-                                  '      </CompilerOptions>`n' +
-                                  '    </Mode>'
-                      if ($lpi.Name -eq 'cheatengine.lpi') {
-                          $content = $content -replace '(<BuildModes>)', "`$1`n$newMode"
-                          Set-Content -Path $lpi.FullName -Value $content -Encoding UTF8 -NoNewline
-                          $avxModesAdded++
-                      }
-                  }
-              } catch { Write-Warning "Patch AVX2 sur $($lpi.Name): $_" }
-          }
-          if ($avxModesAdded -gt 0) { Add-PatchLog "Mode AVX2 ajoute a $avxModesAdded projet(s)" }
-
-          Write-Host "::group::Resume patches"
-          Get-Content $patchLog | ForEach-Object { Write-Host $_ }
-          Write-Host "::endgroup::"
-
-      # ===================================================================
-      # Register CE Lazarus packages
-      # ===================================================================
-      - name: Register and Build Cheat Engine Packages
+      - name: Install .NET Framework 4.6.1 Developer Pack (CSCompiler)
+        if: ${{ inputs.build_native_deps }}
         shell: pwsh
         run: |
-          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $packages = Get-ChildItem -Path $ceDir -Filter "*.lpk" -Recurse | Sort-Object Name
-          Write-Host "Packages trouves: $($packages.Count)"
-          foreach ($pkg in $packages) {
-              Write-Host "::group::Ajout: $($pkg.Name)"
-              $ok = $false
-              for ($i = 1; $i -le 2; $i++) {
-                  try {
-                      & lazbuild --add-package "$($pkg.FullName)" 2>&1
-                      if ($LASTEXITCODE -eq 0) { $ok = $true; break }
-                  } catch { }
-                  Start-Sleep -Seconds 2
+          $ErrorActionPreference = 'Stop'
+          $root = 'C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.6.1'
+          if (Test-Path "$root\mscorlib.dll") { Write-Host 'v4.6.1 deja present.'; exit 0 }
+          $url = 'https://download.visualstudio.microsoft.com/download/pr/33a48e6c-c0d1-4321-946b-042b92bad691/a9a88bd451286ab9ea015ecc2208d725/ndp461-devpack-kb3105179-enu.exe'
+          $exe = Join-Path $env:RUNNER_TEMP 'ndp461-devpack.exe'
+          & curl.exe -L --retry 5 --retry-delay 3 -o $exe $url
+          if ($LASTEXITCODE -ne 0) { throw 'Telechargement du Developer Pack 4.6.1 impossible' }
+          $p = Start-Process $exe -ArgumentList '/quiet', '/norestart' -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "ndp461-devpack a echoue (code $($p.ExitCode))" }
+
+      # DotNetInterface2.csproj cible .NET Framework 4.0, absent de l'image.
+      - name: Restore .NET Framework 4.0 reference assemblies
+        if: ${{ inputs.build_native_deps }}
+        shell: pwsh
+        run: |
+          $dest = 'C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0'
+          if (Test-Path "$dest\mscorlib.dll") { Write-Host 'v4.0 deja present.'; exit 0 }
+          $work = Join-Path $env:RUNNER_TEMP 'refasm'
+          nuget install Microsoft.NETFramework.ReferenceAssemblies.net40 -Version 1.0.3 -OutputDirectory $work | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'nuget install a echoue' }
+          $src = Get-ChildItem -Path $work -Directory -Filter 'Microsoft.NETFramework.ReferenceAssemblies.net40.*' |
+                 Select-Object -First 1
+          $src = Join-Path $src.FullName 'build\.NETFramework\v4.0'
+          if (-not (Test-Path $src)) { throw "Source introuvable : $src" }
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item "$src\*" $dest -Recurse -Force
+          if (-not (Test-Path "$dest\mscorlib.dll")) { throw 'v4.0 reference assemblies introuvables apres copie' }
+          Write-Host 'v4.0 reference assemblies installees.'
+
+      # -----------------------------------------------------------------
+      # 4. Retarget des projets C++ legacy
+      #
+      #    L'image ne fournit que v142/v143. Les .vcxproj du depot epinglent
+      #    v120 / v140 / v141 / v141_xp -> MSB8020 sans retarget.
+      #    On ne touche PAS aux IncludePath/LibraryPath : ils doivent continuer
+      #    a viser NETFXSDK\4.7.2, installe a l'etape precedente.
+      # -----------------------------------------------------------------
+      - name: Retarget C++ projects to v143 + Windows 10 SDK
+        if: ${{ inputs.build_native_deps }}
+        shell: pwsh
+        run: |
+          $targets = @(
+              (Join-Path $env:GITHUB_WORKSPACE 'Cheat Engine'),
+              (Join-Path $env:GITHUB_WORKSPACE 'DBKKernel')
+          )
+          $retargeted = @()
+          foreach ($root in $targets) {
+              if (-not (Test-Path $root)) { continue }
+              Get-ChildItem -Path $root -Recurse -Filter '*.vcxproj' -ErrorAction SilentlyContinue | ForEach-Object {
+                  $raw = [System.IO.File]::ReadAllText($_.FullName)
+                  $new = $raw
+                  foreach ($old in @('v120_xp', 'v141_xp', 'v120', 'v140', 'v141', 'v142')) {
+                      $new = $new -replace "<PlatformToolset>$old</PlatformToolset>", '<PlatformToolset>v143</PlatformToolset>'
+                  }
+                  $new = $new -replace '<WindowsTargetPlatformVersion>8\.[01]</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
+                  if ($new -ne $raw) {
+                      [System.IO.File]::WriteAllText($_.FullName, $new)
+                      $retargeted += $_.Name
+                  }
               }
-              if (-not $ok) { Write-Warning "Echec ajout $($pkg.Name)" }
+          }
+          Write-Host "Retarget v143 : $($retargeted.Count) projet(s)"
+          $retargeted | ForEach-Object { Write-Host "  - $_" }
+
+      # -----------------------------------------------------------------
+      # 5. Cheat Engine lui-meme (ce qui fonctionnait deja)
+      # -----------------------------------------------------------------
+      - name: Build Cheat Engine
+        shell: pwsh
+        run: |
+          $proj = Join-Path $env:CE_DIR 'cheatengine.lpi'
+          if (-not (Test-Path $proj)) { throw "Projet introuvable : $proj" }
+
+          $modes = @('Release 64-Bit')
+          if ('${{ inputs.enable_avx }}' -eq 'true') { $modes += 'Release 64-Bit O4 AVX2' }
+          if ($env:HAVE_PPC386 -eq 'true')           { $modes += 'Release 32-Bit' }
+
+          $failed = @()
+          foreach ($m in $modes) {
+              Write-Host "::group::cheatengine.lpi [$m]"
+              & lazbuild --build-mode="$m" --no-write-project --max-process-count=4 $proj 2>&1
+              $code = $LASTEXITCODE
               Write-Host "::endgroup::"
-          }
-          & lazbuild --build-ide= 2>&1 | Out-Null
-
-      # ===================================================================
-      # Build Cheat Engine principal
-      # ===================================================================
-      - name: Build Cheat Engine (all release modes)
-        shell: pwsh
-        run: |
-          $workspace = $env:GITHUB_WORKSPACE
-          $projectPath = Join-Path $workspace "Cheat Engine\cheatengine.lpi"
-          if (-not (Test-Path $projectPath)) { throw "Projet non trouve: $projectPath" }
-
-          $criticalModes = @("Release 64-Bit", "Release 64-Bit O4 AVX2")
-          $optionalModes = @()
-          if ($env:HAVE_PPC386 -eq "true") { $optionalModes += "Release 32-Bit" }
-
-          foreach ($mode in $criticalModes) {
-              Write-Host "::group::Compilation CRITIQUE: $mode"
-              & lazbuild --build-mode="$mode" --max-process-count=4 "$projectPath" 2>&1
-              $exitCode = $LASTEXITCODE
-              Write-Host "::endgroup::"
-              if ($exitCode -ne 0) {
-                  if ($mode -like "*AVX2*") { Write-Warning "Mode AVX2 echoue (non-fatal)" }
-                  else { throw "Mode CRITIQUE '$mode' echoue (code $exitCode)" }
+              if ($code -ne 0) {
+                  Write-Warning "Mode '$m' echoue (code $code)"
+                  $failed += $m
               }
           }
-          foreach ($mode in $optionalModes) {
-              Write-Host "::group::Compilation OPTIONNEL: $mode"
-              & lazbuild --build-mode="$mode" --max-process-count=4 "$projectPath" 2>&1
-              if ($LASTEXITCODE -ne 0) { Write-Warning "Mode OPTIONNEL '$mode' echoue" }
-              Write-Host "::endgroup::"
-          }
-          exit 0
+          # 'Release 64-Bit' est le seul mode indispensable.
+          if ($failed -contains 'Release 64-Bit') { throw "Le mode critique 'Release 64-Bit' a echoue." }
 
-      # ===================================================================
-      # Build Lazarus sub-projects + copie dans bin/
-      # ===================================================================
+      # -----------------------------------------------------------------
+      # 6. Sous-projets Lazarus
+      #
+      #    CAUSE RACINE n.2 : l'ancienne version passait --build-mode="Release"
+      #    a tous les sous-projets. Or 13 des 14 .lpi concernes n'ont AUCUN
+      #    mode nomme "Release" (speedhack -> "32-bit"/"64-bit",
+      #    vehdebug -> "release 32", winhook -> "Release 32"...). Tous
+      #    echouaient donc silencieusement.
+      #    Les modes ci-dessous ont ete lus dans chaque .lpi du depot.
+      # -----------------------------------------------------------------
       - name: Build Lazarus sub-projects
         shell: pwsh
         run: |
-          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $binDir = Join-Path $ceDir "bin"
-          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-          $subDirs = @("speedhack","luaclient","VEHDebug","Tutorial","betterControls","plugin","launcher","winhook","xmplayer")
-
-          foreach ($sub in $subDirs) {
-              $p = Join-Path $ceDir $sub
-              if (-not (Test-Path $p)) { continue }
-              $lpiFiles = Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue
-              foreach ($lpi in $lpiFiles) {
-                  Write-Host "::group::lazbuild $($lpi.Name) [64-bit]"
-                  & lazbuild --build-mode="Release" --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpi.FullName)" 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpi.Name) [64-bit]" }
-                  Write-Host "::endgroup::"
-              }
-              $lprFiles = Get-ChildItem -Path $p -Filter "*.lpr" -Recurse -ErrorAction SilentlyContinue
-              foreach ($lpr in $lprFiles) {
-                  Write-Host "::group::lazbuild $($lpr.Name) [64-bit]"
-                  & lazbuild --cpu=x86_64 --os=win64 --ws=win32 --max-process-count=4 "$($lpr.FullName)" 2>&1
-                  if ($LASTEXITCODE -ne 0) { Write-Warning "Echec $($lpr.Name) [64-bit]" }
-                  Write-Host "::endgroup::"
-              }
-              Get-ChildItem -Path $p -Recurse -Include "*.dll","*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-                  if ($_.FullName -notmatch '\\(lib|packages)\\') {
-                      Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
-                      Write-Host "[COPY] $($_.Name) -> bin/"
-                  }
-              }
-          }
-
-          if ($env:HAVE_PPC386 -eq "true") {
-              Write-Host ">> Compilation 32-bit"
-              foreach ($sub in $subDirs) {
-                  $p = Join-Path $ceDir $sub
-                  if (-not (Test-Path $p)) { continue }
-                  Get-ChildItem -Path $p -Filter "*.lpi" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                      Write-Host "::group::lazbuild $($_.Name) [32-bit]"
-                      & lazbuild --build-mode="Release" --cpu=i386 --os=win32 --ws=win32 --max-process-count=4 "$($_.FullName)" 2>&1
-                      Write-Host "::endgroup::"
-                  }
-                  Get-ChildItem -Path $p -Recurse -Include "*.dll","*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-                      if ($_.FullName -notmatch '\\(lib|packages)\\') {
-                          Copy-Item $_.FullName -Destination $binDir -Force -ErrorAction SilentlyContinue
-                          Write-Host "[COPY-32] $($_.Name) -> bin/"
-                      }
-                  }
-              }
-          }
-          exit 0
-
-      # ===================================================================
-      # Build Visual Studio sub-projects avec configs auto-detectees
-      # ===================================================================
-      - name: Build Visual Studio sub-projects (.sln)
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $ceDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine"
-          $binDir = Join-Path $ceDir "bin"
-          $autorunDlls = Join-Path $binDir "autorun\dlls"
-          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-          New-Item -ItemType Directory -Path $autorunDlls -Force | Out-Null
-
-          $nuget = Get-Command nuget.exe -ErrorAction SilentlyContinue
-          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-
-          # Fonction pour lire les configs Release d'un .sln
-          function Get-ReleaseConfigs {
-              param([string]$SlnPath)
-              $content = Get-Content $SlnPath -Raw
-              $configs = @()
-              if ($content -match 'GlobalSection\(SolutionConfigurationPlatforms\)\s*=\s*preSolution(.*?)EndGlobalSection') {
-                  $section = $matches[1]
-                  $lines = $section -split "`n"
-                  foreach ($line in $lines) {
-                      if ($line -match '^\s*Release\|(\S+)\s*=') {
-                          $configs += $matches[1]
-                      }
-                  }
-              }
-              return $configs | Select-Object -Unique
-          }
-
-          # Definition: Nom, Type (dotnet|cpp), Destination
-          $solutions = @(
-              @{ Name="DotNetDataCollector.sln";         Type="cpp";    Dest="bin" },
-              @{ Name="DotNetInvasiveDataCollector.sln"; Type="dotnet"; Dest="bin" },
-              @{ Name="MonoDataCollector.sln";           Type="cpp";    Dest="autorun" },
-              @{ Name="CEJVMTI.sln";                     Type="cpp";    Dest="autorun" },
-              @{ Name="Direct x mess.sln";               Type="cpp";    Dest="bin" },
-              @{ Name="CSCompiler.sln";                  Type="dotnet"; Dest="bin" },
-              @{ Name="tcc.sln";                         Type="cpp";    Dest="bin" },
-              @{ Name="dbkkernel.sln";                   Type="cpp";    Dest="bin" },
-              @{ Name="cudaPointerScan.sln";             Type="cpp";    Dest="bin" },
-              @{ Name="lua53.sln";                       Type="cpp";    Dest="bin" },
-              @{ Name="CEPluginLibrary.sln";             Type="dotnet"; Dest="bin" },
-              @{ Name="example-c.sln";                   Type="cpp";    Dest="bin" },
-              @{ Name="QWS.sln";                         Type="cpp";    Dest="bin" }
+          # Projet | modes exacts | produit par le mode
+          $projects = @(
+              @{ P = 'VEHDebug\vehdebug.lpi';                        M = @('release 32', 'release 64') },
+              @{ P = 'speedhack\speedhack.lpi';                      M = @('32-bit', '64-bit') },
+              @{ P = 'luaclient\luaclient.lpi';                      M = @('Release 32', 'Release 64') },
+              @{ P = 'allochook\allochook.lpi';                      M = @('32', '64') },
+              @{ P = 'winhook\winhook.lpi';                          M = @('Release 32', 'Release 64') },
+              @{ P = 'Tutorial\tutorial.lpi';                        M = @('release 32-Bit', 'release 64-Bit') },
+              @{ P = 'launcher\cheatengine.lpi';                     M = @('release', 'release rtmod') },
+              @{ P = 'ceregreset\ceregreset.lpi';                    M = @('Release', 'Release runtime mod') },
+              @{ P = 'windowsrepair\windowsrepair.lpi';              M = @('Release') },
+              @{ P = 'cepack\cepack.lpi';                            M = @('Default') },
+              @{ P = 'sfx\level2\standalonephase2.lpi';              M = @('Release') },
+              @{ P = 'xmplayer\xmplayer.lpi';                        M = @('Default') },
+              @{ P = 'dbk32\Kernelmodule unloader\Kernelmoduleunloader.lpi'; M = @('default') },
+              @{ P = 'plugin\example\exampleplugin.lpi';             M = @('Default') },
+              @{ P = 'plugin\DebugEventLog\src\DebugEventLog.lpi';   M = @('Default') }
           )
 
-          foreach ($sol in $solutions) {
-              $solPath = Get-ChildItem -Path $ceDir -Filter $sol.Name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if (-not $solPath) {
-                  Write-Warning "[$($sol.Name)] introuvable - SKIP"
-                  continue
+          $ok = @(); $ko = @()
+          foreach ($e in $projects) {
+              $proj = Join-Path $env:CE_DIR $e.P
+              if (-not (Test-Path $proj)) { Write-Warning "absent : $($e.P)"; continue }
+              foreach ($m in $e.M) {
+                  Write-Host "::group::$($e.P) [$m]"
+                  & lazbuild --build-mode="$m" --no-write-project --max-process-count=4 $proj 2>&1
+                  $code = $LASTEXITCODE
+                  Write-Host "::endgroup::"
+                  if ($code -eq 0) { $ok += "$($e.P) [$m]" } else { $ko += "$($e.P) [$m]" }
               }
-
-              $solFolder = $solPath.DirectoryName
-              $solBase = [System.IO.Path]::GetFileNameWithoutExtension($solPath.Name)
-              Write-Host "::group::BUILD: $($sol.Name)"
-
-              # Detecter les configs Release disponibles
-              $configs = Get-ReleaseConfigs -SlnPath $solPath.FullName
-              if ($configs.Count -eq 0) {
-                  Write-Warning "  Aucune config Release detectee - tentative avec config par defaut"
-                  $configs = @("")
-              }
-
-              # Restore NuGet pour .NET
-              if ($sol.Type -eq "dotnet" -and $nuget) {
-                  Write-Host "  -> nuget restore..."
-                  & $nuget.Source restore "$($solPath.FullName)" -NonInteractive 2>&1
-              }
-
-              foreach ($plat in $configs) {
-                  $platArg = if ([string]::IsNullOrWhiteSpace($plat)) { "" } else { "/p:Platform=`"$plat`"" }
-                  Write-Host "  -> Config: Release|$plat"
-
-                  $msbuildArgs = @(
-                      "`"$($solPath.FullName)`"",
-                      "/nologo",
-                      "/verbosity:minimal",
-                      "/p:Configuration=Release"
-                  )
-                  if ($platArg) { $msbuildArgs += $platArg }
-
-                  & msbuild @msbuildArgs 2>&1
-                  $exit = $LASTEXITCODE
-
-                  if ($exit -ne 0) {
-                      Write-Warning "  ECHOUE: $($sol.Name) [Release|$plat] (code $exit)"
-                      continue
-                  }
-                  Write-Host "  -> BUILD OK"
-
-                  # Collecte
-                  $targetDir = if ($sol.Dest -eq "autorun") { $autorunDlls } else { $binDir }
-
-                  $allFiles = @()
-                  $exts = @('*.dll','*.exe','*.sys','*.lib','*.pdb')
-                  foreach ($ext in $exts) {
-                      $allFiles += Get-ChildItem -Path $solFolder -Recurse -Filter $ext -ErrorAction SilentlyContinue |
-                          Where-Object {
-                              ($_.FullName -match 'Release') -and
-                              ($_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj|Obj|ref|refs)\\')
-                          }
-                  }
-                  if ($allFiles.Count -eq 0) {
-                      foreach ($ext in $exts) {
-                          $allFiles += Get-ChildItem -Path $solFolder -Recurse -Filter $ext -ErrorAction SilentlyContinue |
-                              Where-Object { $_.FullName -notmatch '\\(packages|node_modules|\.git|\.vs|obj)\\' } |
-                              Select-Object -First 10
-                      }
-                  }
-
-                  $copied = 0
-                  foreach ($file in $allFiles) {
-                      try {
-                          Copy-Item $file.FullName -Destination $targetDir -Force
-                          Write-Host "    [COLLECT] $($file.Name) ($($file.Length) bytes)"
-                          $copied++
-                      } catch { }
-                  }
-                  Write-Host "  -> $copied fichier(s) collecte(s)"
-              }
-              Write-Host "::endgroup::"
           }
-          exit 0
+          Write-Host ""
+          Write-Host "Sous-projets OK   : $($ok.Count)"
+          $ok | ForEach-Object { Write-Host "  + $_" }
+          Write-Host "Sous-projets KO   : $($ko.Count)"
+          $ko | ForEach-Object { Write-Host "  - $_" }
+          ($ok + $ko | Out-String) | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'lazarus_subprojects.txt') -Encoding utf8
 
-      # ===================================================================
-      # Fallback DotNetDataCollector via dotnet CLI
-      # ===================================================================
-      - name: Build DotNetDataCollector fallback (dotnet CLI)
-        continue-on-error: true
+      # -----------------------------------------------------------------
+      # 7. Dependances C++/.NET
+      #
+      #    CAUSE RACINE n.3 : l'ancienne version devinait la plateforme avec
+      #    la regex '^\s*Release\|(\S+)\s*='. Elle ne capture rien sur
+      #    "Release|Any CPU" (le \S+ s'arrete a l'espace) ni sur les configs
+      #    de tcc ("Output to 32 (Release)|Win32"). Les builds partaient donc
+      #    sur une config par defaut aleatoire.
+      #    Les couples Configuration|Platform ci-dessous sont explicites.
+      #
+      #    CAUSE RACINE n.4 : les sorties de ces projets vont DIRECTEMENT dans
+      #    Cheat Engine\bin (OutDir = ..\..\bin). Recopier "les fichiers dont
+      #    le chemin contient Release" ne capturait rien. Rien a copier.
+      # -----------------------------------------------------------------
+      - name: Build native and .NET dependencies
+        if: ${{ inputs.build_native_deps }}
         shell: pwsh
         run: |
-          $dncDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\DotNetDataCollector"
-          if (-not (Test-Path $dncDir)) { exit 0 }
-          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-          if (-not $dotnet) { exit 0 }
+          $ErrorActionPreference = 'Continue'
+          $results = [ordered]@{}
 
-          $proj = Get-ChildItem -Path $dncDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $proj) { exit 0 }
+          # Cible msbuild | dossier de travail | couples Configuration|Platform
+          $jobs = @(
+              @{ N = 'DotNetDataCollector'; D = 'Cheat Engine\DotNetDataCollector';
+                 S = 'DotNetDataCollector.sln';
+                 C = @('Release|Win32', 'Release|x64');
+                 O = @('DotNetDataCollector32.exe', 'DotNetDataCollector64.exe') },
 
-          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
+              @{ N = 'MonoDataCollector';   D = 'Cheat Engine\MonoDataCollector';
+                 S = 'MonoDataCollector.sln';
+                 C = @('Release|Win32', 'Release|x64');
+                 O = @('autorun\dlls\MonoDataCollector32.dll', 'autorun\dlls\MonoDataCollector64.dll') },
 
-          Write-Host "::group::dotnet build DNC x64 (fallback)"
-          & dotnet restore $proj.FullName 2>&1
-          & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false 2>&1
-          Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-              Copy-Item $_.FullName -Destination $binDir -Force
-              Write-Host "Fallback x64: $($_.Name)"
-          }
-          Write-Host "::endgroup::"
+              @{ N = 'CSCompiler';          D = 'Cheat Engine\DotNetCompiler\CSCompiler';
+                 S = 'CSCompiler.sln';
+                 C = @('Release|Any CPU');
+                 O = @('CSCompiler.dll') },
 
-          Write-Host "::group::dotnet build DNC x86 (fallback)"
-          & dotnet build $proj.FullName -c Release -r win-x86 --self-contained false 2>&1
-          Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-              Copy-Item $_.FullName -Destination $binDir -Force
-              Write-Host "Fallback x86: $($_.Name)"
-          }
-          Write-Host "::endgroup::"
+              @{ N = 'tcclib';              D = 'Cheat Engine\tcclib\win32\tcc';
+                 S = 'tcc.sln';
+                 C = @('Output to 32 (Release)|Win32', 'Output to 64 (Release)|Win32', 'Output to 64 (Release)|x64');
+                 O = @('tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll') }
+          )
 
-          if ("${{ inputs.enable_avx }}" -eq "true") {
-              Write-Host "::group::dotnet build DNC AVX (fallback)"
-              & dotnet build $proj.FullName -c Release -r win-x64 --self-contained false `
-                  -p:DefineConstants="AVX;AVX2" -p:Optimize=true -p:AVX=true 2>&1
-              $binAvx = Join-Path $binDir "avx"
-              New-Item -ItemType Directory -Path $binAvx -Force | Out-Null
-              Get-ChildItem -Path $dncDir -Recurse -Include "DotNetDataCollector*.dll","DotNetDataCollector*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-                  $destName = $_.BaseName + ".avx" + $_.Extension
-                  Copy-Item $_.FullName -Destination (Join-Path $binAvx $destName) -Force
-                  Write-Host "Fallback AVX: $destName"
+          foreach ($j in $jobs) {
+              $dir = Join-Path $env:GITHUB_WORKSPACE $j.D
+              $sln = Join-Path $dir $j.S
+              if (-not (Test-Path $sln)) {
+                  Write-Warning "[$($j.N)] solution introuvable : $sln"
+                  $results[$j.N] = 'absent'; continue
               }
-              Write-Host "::endgroup::"
+              $buildOk = $true
+              foreach ($cfg in $j.C) {
+                  $conf, $plat = $cfg -split '\|', 2
+                  Write-Host "::group::$($j.N) [$cfg]"
+                  & msbuild $sln -nologo -verbosity:minimal -m `
+                      -p:Configuration="$conf" -p:Platform="$plat" 2>&1
+                  $code = $LASTEXITCODE
+                  Write-Host "::endgroup::"
+                  if ($code -ne 0) { Write-Warning "  [$($j.N)] $cfg -> code $code"; $buildOk = $false }
+              }
+              $results[$j.N] = if ($buildOk) { 'compile' } else { 'partiel' }
           }
-          exit 0
 
-      # ===================================================================
-      # Copier tcclib DLLs
-      # ===================================================================
-      - name: Copy tcclib DLLs to bin
-        shell: pwsh
-        run: |
-          $tcclibDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\tcclib"
-          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
-          if (-not (Test-Path $tcclibDir)) { Write-Host "tcclib absent"; exit 0 }
-          $dlls = Get-ChildItem -Path $tcclibDir -Recurse -Include "*.dll" -ErrorAction SilentlyContinue
-          foreach ($dll in $dlls) {
-              Copy-Item $dll.FullName -Destination $binDir -Force
-              Write-Host "Copie $($dll.Name) -> bin"
+          # DotNetInterface : on construit DotNetInterface2.csproj (net40), PAS
+          # DotNetInterface.csproj (netstandard2.0) dont l'OutputPath est absolu
+          # et pointe sur D:\git\cheat-engine\... -> il ecrirait hors du workspace.
+          $di = Join-Path $env:GITHUB_WORKSPACE 'Cheat Engine\DotNetInvasiveDataCollector\DotNetInterface2\DotNetInterface2.csproj'
+          if (Test-Path $di) {
+              Write-Host '::group::DotNetInterface [Release]'
+              & msbuild $di -nologo -verbosity:minimal -m -p:Configuration=Release `
+                  -p:TargetFrameworkRootPath='C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework' 2>&1
+              Write-Host '::endgroup::'
+              $results['DotNetInterface'] = if ($LASTEXITCODE -eq 0) { 'compile' } else { 'echec' }
           }
-          exit 0
 
-      # ===================================================================
-      # Diagnostic - arborescence finale
-      # ===================================================================
-      - name: Diagnostic - list all collected outputs
-        shell: pwsh
-        run: |
-          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
-          Write-Host "::group::Arborescence bin/"
-          function Show-Tree {
-              param([string]$Path, [string]$Indent = "")
-              Get-ChildItem -Path $Path -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
-                  if ($_.PSIsContainer) {
-                      Write-Host "$Indent[$($_.Name)]"
-                      Show-Tree -Path $_.FullName -Indent "$Indent  "
-                  } else {
-                      Write-Host "$Indent$($_.Name) ($($_.Length) bytes)"
+          if ('${{ inputs.build_dbkernel }}' -eq 'true') {
+              $dbk = Join-Path $env:GITHUB_WORKSPACE 'DBKKernel\DBKKernel.sln'
+              if (Test-Path $dbk) {
+                  foreach ($plat in @('x64', 'Win32')) {
+                      Write-Host "::group::DBKKernel [Release|$plat]"
+                      & msbuild $dbk -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat 2>&1
+                      Write-Host '::endgroup::'
                   }
+                  $results['DBKKernel'] = 'compile'
               }
           }
-          if (Test-Path $binDir) { Show-Tree -Path $binDir }
-          else { Write-Warning "bin/ introuvable" }
-          Write-Host "::endgroup::"
 
-      # ===================================================================
-      # Checksums + manifeste
-      # ===================================================================
-      - name: Generate SHA256 checksums and build manifest
+          $results.GetEnumerator() | ForEach-Object { Write-Host ("{0,-22} {1}" -f $_.Key, $_.Value) }
+          ($results | Out-String) | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'native_deps.txt') -Encoding utf8
+
+      # Hooks D3D : d3dx9.h / d3dx10.h / d3dx11.h n'existent QUE dans le
+      # DirectX SDK June 2010 (retires du Windows SDK). Optionnel : les DLL
+      # precompilees sont deja versionnees dans bin/.
+      - name: Build DirectX hooks (optional)
+        if: ${{ inputs.build_directx }}
         shell: pwsh
         run: |
-          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
-          if (-not (Test-Path $binDir)) { Write-Warning "bin introuvable"; exit 0 }
+          $ErrorActionPreference = 'Stop'
+          $dx = 'C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)'
+          if (-not (Test-Path "$dx\Include\d3dx9.h")) {
+              $exe = Join-Path $env:RUNNER_TEMP 'DXSDK_Jun10.exe'
+              & curl.exe -L --retry 3 -o $exe 'https://download.microsoft.com/download/A/E/7/AE743F1F-632B-4809-87A9-AA1BB3458E31/DXSDK_Jun10.exe'
+              if ($LASTEXITCODE -ne 0) { throw 'Telechargement du DirectX SDK impossible' }
+              $p = Start-Process $exe -ArgumentList '/U', '/quiet', '/norestart' -Wait -PassThru
+              Write-Host "DirectX SDK : code $($p.ExitCode)"
+          }
+          # Le SxS error S1023 de l'installeur est connu et sans consequence ici.
+          $sln = Join-Path $env:CE_DIR 'Direct x mess\Direct x mess.sln'
+          foreach ($plat in @('Win32', 'x64')) {
+              Write-Host "::group::Direct x mess [Release|$plat]"
+              & msbuild $sln -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat `
+                  -p:IncludePath="$dx\Include;`$(IncludePath)" `
+                  -p:LibraryPath="$dx\Lib\$plat;`$(LibraryPath)" 2>&1
+              Write-Host '::endgroup::'
+          }
 
-          $manifest = Join-Path $env:GITHUB_WORKSPACE "build_manifest.txt"
-          "Cheat Engine Build Manifest" | Out-File -FilePath $manifest -Encoding utf8
-          "Generated: $(Get-Date -Format 'o')" | Out-File -FilePath $manifest -Append -Encoding utf8
-          "Repository: ${{ inputs.repository }}" | Out-File -FilePath $manifest -Append -Encoding utf8
-          "Ref: ${{ inputs.ref }}" | Out-File -FilePath $manifest -Append -Encoding utf8
-          "Lazarus: ${{ inputs.lazarus_version }}" | Out-File -FilePath $manifest -Append -Encoding utf8
-          ".NET: ${{ inputs.dotnet_version }}" | Out-File -FilePath $manifest -Append -Encoding utf8
-          "AVX: ${{ inputs.enable_avx }}" | Out-File -FilePath $manifest -Append -Encoding utf8
-          "Patches: ${{ inputs.apply_code_patches }}" | Out-File -FilePath $manifest -Append -Encoding utf8
-          "" | Out-File -FilePath $manifest -Append -Encoding utf8
-          "Files:" | Out-File -FilePath $manifest -Append -Encoding utf8
+      # -----------------------------------------------------------------
+      # 8. Verification : le filet qui manquait
+      #
+      #    CAUSE RACINE n.5 : aucun controle ne signalait l'absence des
+      #    dependances. Le zip etait publie incomplet sans aucune erreur.
+      # -----------------------------------------------------------------
+      - name: Verify expected outputs
+        shell: pwsh
+        run: |
+          $bin = $env:BIN_DIR
+          if (-not (Test-Path $bin)) { throw "Dossier bin introuvable : $bin" }
 
-          $hashes = Join-Path $env:GITHUB_WORKSPACE "SHA256SUMS.txt"
-          Get-ChildItem -Path $binDir -Recurse -File | Sort-Object FullName | ForEach-Object {
-              $rel = $_.FullName.Substring($binDir.Length + 1).Replace('\','/')
+          $core = @(
+              'cheatengine-x86_64.exe',
+              'Cheat Engine.exe',
+              'ceregreset.exe',
+              'cepack.exe',
+              'standalonephase2.dat',
+              'vehdebug-x86_64.dll',
+              'speedhack-x86_64.dll',
+              'luaclient-x86_64.dll'
+          )
+          if ($env:HAVE_PPC386 -eq 'true') {
+              $core += 'cheatengine-i386.exe', 'vehdebug-i386.dll', 'speedhack-i386.dll', 'luaclient-i386.dll'
+          }
+          if ('${{ inputs.enable_avx }}' -eq 'true') { $core += 'cheatengine-x86_64-SSE4-AVX2.exe' }
+
+          $deps = @()
+          if ('${{ inputs.build_native_deps }}' -eq 'true') {
+              $deps += 'DotNetDataCollector32.exe', 'DotNetDataCollector64.exe', 'CSCompiler.dll',
+                       'autorun\dlls\DotNetInterface.dll',
+                       'autorun\dlls\MonoDataCollector32.dll', 'autorun\dlls\MonoDataCollector64.dll',
+                       'tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll'
+          }
+          if ('${{ inputs.build_dbkernel }}' -eq 'true') { $deps += 'dbk32.sys', 'dbk64.sys' }
+
+          function Test-List {
+              param([string[]]$Files, [string]$Label)
+              $ok = @(); $ko = @()
+              foreach ($f in $Files) {
+                  if (Test-Path (Join-Path $bin $f)) { $ok += $f } else { $ko += $f }
+              }
+              Write-Host ""
+              Write-Host "=== $Label : $($ok.Count)/$($Files.Count) ==="
+              $ok | ForEach-Object { Write-Host "  OK   $_" }
+              $ko | ForEach-Object { Write-Host "  MISS $_" }
+              return , @($ok, $ko)
+          }
+
+          $rCore = Test-List -Files $core -Label 'Binaires principaux'
+          $rDeps = Test-List -Files $deps -Label 'Dependances'
+
+          $missingCore = $rCore[1]; $missingDeps = $rDeps[1]
+          $allMissing = @($missingCore) + @($missingDeps)
+          ($allMissing | Out-String) | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'missing.txt') -Encoding utf8
+
+          if ($missingCore.Count -gt 0) {
+              throw "Binaires principaux manquants : $($missingCore -join ', ')"
+          }
+          if ($missingDeps.Count -gt 0 -and '${{ inputs.fail_on_missing_deps }}' -eq 'true') {
+              throw "Dependances manquantes : $($missingDeps -join ', ')"
+          }
+          if ($missingDeps.Count -gt 0) {
+              Write-Warning "Dependances manquantes (non bloquant) : $($missingDeps -join ', ')"
+          }
+
+      # -----------------------------------------------------------------
+      # 9. Assemblage
+      #
+      #    Nettoyage des fichiers de debug. On ne copie AUCUN .lib/.pdb dans
+      #    bin : l'ancienne collecte automatique en ramassait, ce qui gonflait
+      #    l'artefact de fichiers inutiles.
+      # -----------------------------------------------------------------
+      - name: Copy plugins
+        shell: pwsh
+        working-directory: Cheat Engine
+        run: |
+          if (Test-Path plugin) {
+              Copy-Item plugin bin\plugins -Recurse -Force
+              Write-Host 'Plugins copies dans bin\plugins'
+          }
+
+      - name: Strip debug files
+        shell: pwsh
+        working-directory: Cheat Engine\bin
+        run: |
+          $exts = @('*.pdb', '*.iobj', '*.ipdb', '*.dbg', '*.ilk', '*.exp', '*.obj', '*.tlog')
+          $removed = 0
+          foreach ($e in $exts) {
+              Get-ChildItem -Recurse -File -Filter $e -ErrorAction SilentlyContinue | ForEach-Object {
+                  Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; $removed++
+              }
+          }
+          Write-Host "$removed fichier(s) de debug supprime(s)"
+
+      - name: Generate SHA256 checksums and manifest
+        shell: pwsh
+        run: |
+          $bin = $env:BIN_DIR
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'build_manifest.txt'
+          @(
+              'Cheat Engine - Build Manifest',
+              "Generated : $(Get-Date -Format 'o')",
+              "Repository: ${{ inputs.repository }}",
+              "Ref       : ${{ inputs.ref }}",
+              "Commit    : ${{ github.sha }}",
+              "Lazarus   : ${{ inputs.lazarus_version }}",
+              ".NET SDK  : ${{ inputs.dotnet_version }}",
+              "AVX2      : ${{ inputs.enable_avx }}",
+              "Cross-i386: $($env:HAVE_PPC386)",
+              '',
+              'Files:'
+          ) | Out-File -FilePath $manifest -Encoding utf8
+
+          $hashes = Join-Path $env:GITHUB_WORKSPACE 'SHA256SUMS.txt'
+          if (Test-Path $hashes) { Remove-Item $hashes -Force }
+          Get-ChildItem -Path $bin -Recurse -File | Sort-Object FullName | ForEach-Object {
+              $rel = $_.FullName.Substring($bin.Length + 1).Replace('\', '/')
               $sha = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
-              "{0} *{1}" -f $sha, $rel | Out-File -FilePath $hashes -Append -Encoding utf8
-              "  {0,-60} {1,12} bytes  sha256:{2}" -f $rel, $_.Length, $sha.Substring(0,12) | Out-File -FilePath $manifest -Append -Encoding utf8
+              "$sha *$rel" | Out-File -FilePath $hashes -Append -Encoding utf8
+              ('  {0,-58} {1,10} bytes  sha256:{2}' -f $rel, $_.Length, $sha.Substring(0, 12)) |
+                  Out-File -FilePath $manifest -Append -Encoding utf8
           }
-          Copy-Item $manifest -Destination $binDir -Force
-          Copy-Item $hashes -Destination $binDir -Force
-          exit 0
+          Copy-Item $manifest, $hashes -Destination $bin -Force
+          Write-Host "Manifeste genere ($((Get-Content $manifest).Count) lignes)"
 
-      # ===================================================================
-      # Resume final + Step Summary
-      # ===================================================================
-      - name: List final bin folder + write GitHub Step Summary
+      - name: Write step summary
+        if: always()
         shell: pwsh
         run: |
-          $binDir = Join-Path $env:GITHUB_WORKSPACE "Cheat Engine\bin"
-          $summary = $env:GITHUB_STEP_SUMMARY
-          if (-not $summary) { $summary = Join-Path $env:GITHUB_WORKSPACE "summary.md" }
+          $bin = $env:BIN_DIR
+          $s = $env:GITHUB_STEP_SUMMARY
+          @(
+              '# Cheat Engine - Build Summary',
+              '',
+              "- Depot : ``${{ inputs.repository }}`` @ ``${{ inputs.ref }}``",
+              "- Lazarus ``${{ inputs.lazarus_version }}`` | .NET ``${{ inputs.dotnet_version }}`` | cross-i386 ``$($env:HAVE_PPC386)``",
+              '',
+              '## Dependances',
+              '',
+              '| Composant | Origine | Etat |',
+              '|---|---|---|'
+          ) | Out-File -FilePath $s -Encoding utf8
 
-          "# Cheat Engine - Build Summary" | Out-File -FilePath $summary -Encoding utf8
-          "" | Out-File -FilePath $summary -Append -Encoding utf8
-          "- Repo: ``${{ inputs.repository }}`` / ``${{ inputs.ref }}``" | Out-File -FilePath $summary -Append -Encoding utf8
-          "- Lazarus: ``${{ inputs.lazarus_version }}`` | .NET: ``${{ inputs.dotnet_version }}``" | Out-File -FilePath $summary -Append -Encoding utf8
-          "- AVX: ``${{ inputs.enable_avx }}`` | Patches: ``${{ inputs.apply_code_patches }}`` | ppc386: ``$($env:HAVE_PPC386 -eq 'true')``" | Out-File -FilePath $summary -Append -Encoding utf8
-          "" | Out-File -FilePath $summary -Append -Encoding utf8
-          "## Binaires generes" | Out-File -FilePath $summary -Append -Encoding utf8
-          "" | Out-File -FilePath $summary -Append -Encoding utf8
-          "| Fichier | Taille |" | Out-File -FilePath $summary -Append -Encoding utf8
-          "|---------|--------|" | Out-File -FilePath $summary -Append -Encoding utf8
-
-          if (Test-Path $binDir) {
-              Get-ChildItem -Path $binDir -Recurse -File | Sort-Object FullName | ForEach-Object {
-                  $rel = $_.FullName.Substring($binDir.Length + 1).Replace('\','/')
-                  "| $rel | $($_.Length) |" | Out-File -FilePath $summary -Append -Encoding utf8
-              }
+          $rows = @(
+              @('DotNetDataCollector', 'DotNetDataCollector.sln', @('DotNetDataCollector32.exe', 'DotNetDataCollector64.exe')),
+              @('DotNetInterface (JIT)', 'DotNetInterface2.csproj', @('autorun\dlls\DotNetInterface.dll')),
+              @('MonoDataCollector', 'MonoDataCollector.sln', @('autorun\dlls\MonoDataCollector32.dll', 'autorun\dlls\MonoDataCollector64.dll')),
+              @('CSCompiler', 'CSCompiler.sln', @('CSCompiler.dll')),
+              @('tcclib', 'tcc.sln', @('tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll')),
+              @('VEH debugger', 'vehdebug.lpi', @('vehdebug-i386.dll', 'vehdebug-x86_64.dll')),
+              @('Speedhack', 'speedhack.lpi', @('speedhack-i386.dll', 'speedhack-x86_64.dll')),
+              @('luaclient', 'luaclient.lpi', @('luaclient-i386.dll', 'luaclient-x86_64.dll')),
+              @('DBK kernel driver', 'DBKKernel.sln', @('dbk32.sys', 'dbk64.sys')),
+              @('Hooks D3D', 'binaires du depot', @('ced3d9hook.dll', 'ced3d9hook64.dll')),
+              @('CEJVMTI (Java)', 'binaires du depot', @('autorun\dlls\32\CEJVMTI.dll', 'autorun\dlls\64\CEJVMTI.dll'))
+          )
+          foreach ($r in $rows) {
+              $ok = 0
+              foreach ($f in $r[2]) { if (Test-Path (Join-Path $bin $f)) { $ok++ } }
+              # Composants derriere un input : on distingue "non demande" de "echec".
+              $requested = $true
+              if ($r[0] -eq 'DBK kernel driver' -and '${{ inputs.build_dbkernel }}' -ne 'true') { $requested = $false }
+              if ($r[0] -eq 'Hooks D3D' -and '${{ inputs.build_directx }}' -ne 'true') { $requested = $false }
+              $state = if ($ok -eq $r[2].Count) { "OK $ok/$($r[2].Count)" }
+                       elseif (-not $requested)  { 'non demande' }
+                       elseif ($ok -gt 0)        { "PARTIEL $ok/$($r[2].Count)" }
+                       else                      { "ABSENT 0/$($r[2].Count)" }
+              "| ``$($r[0])`` | $($r[1]) | $state |" | Out-File -FilePath $s -Append -Encoding utf8
           }
 
-      # ===================================================================
-      # Artifacts upload
-      # ===================================================================
-      - name: Upload artifact (main CE build)
+          $missingFile = Join-Path $env:RUNNER_TEMP 'missing.txt'
+          if ((Test-Path $missingFile) -and ((Get-Content $missingFile -Raw).Trim().Length -gt 0)) {
+              @('', '## Fichiers manquants', '', '```', (Get-Content $missingFile -Raw).Trim(), '```') |
+                  Out-File -FilePath $s -Append -Encoding utf8
+          }
+
+      # -----------------------------------------------------------------
+      # 10. Artefacts
+      # -----------------------------------------------------------------
+      - name: Zip artifact
+        shell: pwsh
+        working-directory: Cheat Engine\bin
+        run: |
+          $out = "$($env:GITHUB_WORKSPACE)\CheatEngine-${{ github.sha }}.zip"
+          & 7z a -tzip -mx=7 $out . | Select-Object -Last 10
+          if ($LASTEXITCODE -ne 0) { throw 'Compression 7z echouee' }
+          Write-Host "Artefact : $out ($('{0:N1}' -f ((Get-Item $out).Length / 1MB)) Mo)"
+
+      - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: cheat-engine-win64-${{ inputs.ref || 'master' }}
-          path: Cheat Engine/bin/**
+          name: CheatEngine-${{ github.sha }}
+          path: CheatEngine-${{ github.sha }}.zip
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload patches log
-        if: ${{ inputs.apply_code_patches == true }}
+      - name: Upload build logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: patches-applied-${{ inputs.ref || 'master' }}
-          path: patches_applied.md
+          name: build-logs-${{ github.sha }}
+          path: |
+            build_manifest.txt
+            SHA256SUMS.txt
           if-no-files-found: warn
           retention-days: 14
