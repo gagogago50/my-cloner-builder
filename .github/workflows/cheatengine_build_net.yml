@@ -468,6 +468,8 @@ jobs:
               @{ P = 'allochook\allochook.lpi';                      M = @('32', '64') },
               @{ P = 'winhook\winhook.lpi';                          M = @('Release 32', 'Release 64') },
               @{ P = 'Tutorial\tutorial.lpi';                        M = @('release 32-Bit', 'release 64-Bit') },
+              # gtutorial-*.exe est lance par MainUnit.pas et Unit10.pas
+              @{ P = 'Tutorial\graphical\project1.lpi';              M = @('Release 32', 'Release 64') },
               @{ P = 'launcher\cheatengine.lpi';                     M = @('release', 'release rtmod') },
               @{ P = 'ceregreset\ceregreset.lpi';                    M = @('Release', 'Release runtime mod') },
               @{ P = 'windowsrepair\windowsrepair.lpi';              M = @('Release') },
@@ -538,8 +540,20 @@ jobs:
 
               @{ N = 'tcclib';              D = 'Cheat Engine\tcclib\win32\tcc';
                  S = 'tcc.sln';
-                 C = @('Output to 32 (Release)|Win32', 'Output to 64 (Release)|Win32', 'Output to 64 (Release)|x64');
-                 O = @('tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll') }
+                 # Mapping verifie dans tcc.vcxproj : TargetName = tcc$(PlatformArchitecture)-<cible>
+                 # et PlatformArchitecture vaut 32 pour Win32, 64 pour x64. D'ou :
+                 #   Output to 32 (Release)|Win32          -> tcc32-32.dll
+                 #   Output to 32 (Release)|x64            -> tcc64-32.dll
+                 #   Output to 64 (Release)|x64            -> tcc64-64.dll
+                 #   Output to 32 Linux ABI (Release)|x64  -> tcc64-32-linux.dll
+                 #   Output to 64 Linux ABI (Release)|x64  -> tcc64-64-linux.dll
+                 # Les variantes |Win32 des configs "Linux ABI" produiraient
+                 # tcc32-*-linux.dll, que tcclib.pas ne charge jamais.
+                 C = @('Output to 32 (Release)|Win32', 'Output to 32 (Release)|x64',
+                       'Output to 64 (Release)|x64',
+                       'Output to 32 Linux ABI (Release)|x64', 'Output to 64 Linux ABI (Release)|x64');
+                 O = @('tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll',
+                       'tcc64-32-linux.dll', 'tcc64-64-linux.dll') }
           )
 
           foreach ($j in $jobs) {
@@ -635,10 +649,13 @@ jobs:
               'standalonephase2.dat',
               'vehdebug-x86_64.dll',
               'speedhack-x86_64.dll',
-              'luaclient-x86_64.dll'
+              'luaclient-x86_64.dll',
+              'tutorial-x86_64.exe',
+              'gtutorial-x86_64.exe'
           )
           if ($env:HAVE_PPC386 -eq 'true') {
-              $core += 'cheatengine-i386.exe', 'vehdebug-i386.dll', 'speedhack-i386.dll', 'luaclient-i386.dll'
+              $core += 'cheatengine-i386.exe', 'vehdebug-i386.dll', 'speedhack-i386.dll',
+                       'luaclient-i386.dll', 'tutorial-i386.exe', 'gtutorial-i386.exe'
           }
           if ('${{ inputs.enable_avx }}' -eq 'true') { $core += 'cheatengine-x86_64-SSE4-AVX2.exe' }
 
@@ -647,7 +664,8 @@ jobs:
               $deps += 'DotNetDataCollector32.exe', 'DotNetDataCollector64.exe', 'CSCompiler.dll',
                        'autorun\dlls\DotNetInterface.dll',
                        'autorun\dlls\MonoDataCollector32.dll', 'autorun\dlls\MonoDataCollector64.dll',
-                       'tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll'
+                       'tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll',
+                       'tcc64-32-linux.dll', 'tcc64-64-linux.dll'
           }
           if ('${{ inputs.build_dbkernel }}' -eq 'true') { $deps += 'dbk32.sys', 'dbk64.sys' }
 
@@ -764,7 +782,9 @@ jobs:
               @('DotNetInterface (JIT)', 'DotNetInterface2.csproj', @('autorun\dlls\DotNetInterface.dll')),
               @('MonoDataCollector', 'MonoDataCollector.sln', @('autorun\dlls\MonoDataCollector32.dll', 'autorun\dlls\MonoDataCollector64.dll')),
               @('CSCompiler', 'CSCompiler.sln', @('CSCompiler.dll')),
-              @('tcclib', 'tcc.sln', @('tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll')),
+              @('tcclib', 'tcc.sln', @('tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll', 'tcc64-32-linux.dll', 'tcc64-64-linux.dll')),
+              @('Tutorial', 'tutorial.lpi', @('tutorial-i386.exe', 'tutorial-x86_64.exe')),
+              @('Tutorial graphique', 'graphical/project1.lpi', @('gtutorial-i386.exe', 'gtutorial-x86_64.exe')),
               @('VEH debugger', 'vehdebug.lpi', @('vehdebug-i386.dll', 'vehdebug-x86_64.dll')),
               @('Speedhack', 'speedhack.lpi', @('speedhack-i386.dll', 'speedhack-x86_64.dll')),
               @('luaclient', 'luaclient.lpi', @('luaclient-i386.dll', 'luaclient-x86_64.dll')),
