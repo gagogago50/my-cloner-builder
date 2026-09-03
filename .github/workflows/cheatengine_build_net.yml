@@ -591,9 +591,30 @@ jobs:
           if ('${{ inputs.build_dbkernel }}' -eq 'true') {
               $dbk = Join-Path $env:GITHUB_WORKSPACE 'DBKKernel\DBKKernel.sln'
               if (Test-Path $dbk) {
-                  foreach ($plat in @('x64', 'Win32')) {
-                      Write-Host "::group::DBKKernel [Release|$plat]"
-                      & msbuild $dbk -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat 2>&1
+                  # Deux pieges verifies dans DBKKernel.sln / .vcxproj :
+                  #
+                  # 1) La solution ne declare PAS de plateforme "Win32". Elle
+                  #    declare "x86", qui est ensuite mappee sur la config
+                  #    projet "Release|Win32" :
+                  #      Release|x86 = Release|x86
+                  #      {43A80578-...}.Release|x86.ActiveCfg = Release|Win32
+                  #    Passer -p:Platform=Win32 a msbuild sur le .sln echoue
+                  #    donc (MSB4126 : solution configuration invalide).
+                  #
+                  # 2) La configuration "Release" porte un PostBuildEvent qui
+                  #    appelle signtool.exe avec
+                  #      release\sig\GlobalSign Root CA.crt
+                  #    Ce certificat n'est pas dans le depot, la compilation
+                  #    echouerait en post-build. On utilise "Release without
+                  #    sig", qui produit exactement les memes binaires
+                  #    (TargetName DBK32 / DBK64, OutDir ..\Cheat Engine\bin\)
+                  #    sans definir TOBESIGNED. C'est aussi plus coherent :
+                  #    TOBESIGNED active SecurityCheck(), une auto-verification
+                  #    de signature qui refuserait de fonctionner sur un
+                  #    pilote non signe.
+                  foreach ($plat in @('x64', 'x86')) {
+                      Write-Host "::group::DBKKernel [Release without sig|$plat]"
+                      & msbuild $dbk -nologo -verbosity:minimal -m -p:"Configuration=Release without sig" -p:Platform=$plat 2>&1
                       Write-Host '::endgroup::'
                   }
                   $results['DBKKernel'] = 'compile'
@@ -667,7 +688,7 @@ jobs:
                        'tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll',
                        'tcc64-32-linux.dll', 'tcc64-64-linux.dll'
           }
-          if ('${{ inputs.build_dbkernel }}' -eq 'true') { $deps += 'dbk32.sys', 'dbk64.sys' }
+          if ('${{ inputs.build_dbkernel }}' -eq 'true') { $deps += 'DBK32.sys', 'DBK64.sys' }
 
           function Test-List {
               param([string[]]$Files, [string]$Label)
@@ -788,7 +809,7 @@ jobs:
               @('VEH debugger', 'vehdebug.lpi', @('vehdebug-i386.dll', 'vehdebug-x86_64.dll')),
               @('Speedhack', 'speedhack.lpi', @('speedhack-i386.dll', 'speedhack-x86_64.dll')),
               @('luaclient', 'luaclient.lpi', @('luaclient-i386.dll', 'luaclient-x86_64.dll')),
-              @('DBK kernel driver', 'DBKKernel.sln', @('dbk32.sys', 'dbk64.sys')),
+              @('DBK kernel driver', 'DBKKernel.sln', @('DBK32.sys', 'DBK64.sys')),
               @('Hooks D3D', 'binaires du depot', @('ced3d9hook.dll', 'ced3d9hook64.dll')),
               @('CEJVMTI (Java)', 'binaires du depot', @('autorun\dlls\32\CEJVMTI.dll', 'autorun\dlls\64\CEJVMTI.dll'))
           )
