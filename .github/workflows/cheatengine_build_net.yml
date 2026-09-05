@@ -449,6 +449,19 @@ jobs:
                 # DBKKernel.vcxproj declare Windows7 pour les 6 configs Win32/x64
                 # (et Windows10 pour ARM/ARM64). On aligne tout sur Windows10.
                 $new = $new -replace '<TargetVersion>Windows7</TargetVersion>', '<TargetVersion>Windows10</TargetVersion>'
+                # On retire aussi les items <Inf>. La validation INF du WDK
+                # 10.0.26100 (introduite vers mai 2025) echoue sur ce depot :
+                #   DBK64.inf(5-5): error 1324: [Version] section should
+                #     specify PnpLockdown=1 ...
+                #   DBK32.inf : error 1000: INF 'DBK32.inf' could not be found
+                #     (alors qu'il existe et est ExcludedFromBuild en x64)
+                # DBK64.inf est de toute facon un gabarit non finalise :
+                #   DriverVer= ; TODO: set DriverVer in stampinf property pages
+                # Nous ne voulons que le .sys, pas le paquet d'installation.
+                # Verifie : il ne reste apres coup que les proprietes Inf2Cat*,
+                # aucun item <Inf>, et le XML reste valide.
+                $infPat = '[ \t]*<Inf\b[^>]*/>[ \t]*\r?\n|[ \t]*<Inf\b[^>]*>.*?</Inf>[ \t]*\r?\n'
+                $new = [regex]::Replace($new, $infPat, '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
             }
             if (-not $isDriver) {
                 $new = $new -replace '<WindowsTargetPlatformVersion>\d[^<]*</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
@@ -756,6 +769,15 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw 'Telechargement du DirectX SDK impossible' }
               $p = Start-Process $exe -ArgumentList '/U', '/quiet', '/norestart' -Wait -PassThru
               Write-Host "DirectX SDK : code $($p.ExitCode)"
+              # Un code 0 ne suffit pas : l'installeur DXSDK_Jun10 echoue
+              # frequemment en SxS (erreur S1023) quand les redistribuables
+              # VC++ 2010 deja presents sont plus recents, et sort neanmoins
+              # en 0. C'est ce qui s'est produit : l'etape a annonce code 0
+              # puis les 4 projets ont echoue en C1083 sur d3dx9/10/11.h.
+              # On verifie donc la presence reelle des en-tetes.
+              if (-not (Test-Path "$dx\Include\d3dx9.h")) {
+                  Write-Warning "DirectX SDK : code $($p.ExitCode) mais $dx\Include\d3dx9.h est absent. Hooks D3D non compiles ; les 8 DLL precompilees de bin/ seront utilisees."
+              }
           }
           # Le SxS error S1023 de l'installeur est connu et sans consequence ici.
           $sln = Join-Path $env:CE_DIR 'Direct x mess\Direct x mess.sln'
