@@ -441,6 +441,15 @@ jobs:
             #    touches du tout : leur chemin d'inclusion "km" depend de la
             #    resolution exacte du WDK, pas du SDK generaliste.
             $isDriver = $raw -match '<PlatformToolset>WindowsKernelModeDriver'
+            if ($isDriver) {
+                # Le WDK 10.0.26100 installe sur windows-2022 ne supporte plus
+                # Windows 7 comme OS cible :
+                #   WindowsDriver.common.targets(274,5): error :
+                #     'Windows7' is not a supported OS Version
+                # DBKKernel.vcxproj declare Windows7 pour les 6 configs Win32/x64
+                # (et Windows10 pour ARM/ARM64). On aligne tout sur Windows10.
+                $new = $new -replace '<TargetVersion>Windows7</TargetVersion>', '<TargetVersion>Windows10</TargetVersion>'
+            }
             if (-not $isDriver) {
                 $new = $new -replace '<WindowsTargetPlatformVersion>\d[^<]*</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
             }
@@ -520,10 +529,21 @@ jobs:
               if (-not (Test-Path $proj)) { Write-Warning "absent : $($e.P)"; continue }
               foreach ($m in $e.M) {
                   Write-Host "::group::$($e.P) [$m]"
-                  & lazbuild --build-mode="$m" --no-write-project --max-process-count=4 $proj 2>&1
+                  $outL = & lazbuild --build-mode="$m" --no-write-project --max-process-count=4 $proj 2>&1 |
+                      ForEach-Object { "$_" }
                   $code = $LASTEXITCODE
-                  Write-Host "::endgroup::"
-                  if ($code -eq 0) { $ok += "$($e.P) [$m]" } else { $ko += "$($e.P) [$m]" }
+                  $outL | ForEach-Object { Write-Host $_ }
+                  Write-Host '::endgroup::'
+                  if ($code -eq 0) { $ok += "$($e.P) [$m]" }
+                  else {
+                      $ko += "$($e.P) [$m]"
+                      # Meme raison que pour msbuild : la sortie est repliee dans le
+                      # groupe, donc un echec de lazbuild n'etait pas lisible. C'est
+                      # ce qui masquait les sous-projets a l origine des binaires
+                      # manquants signales par Verify expected outputs.
+                      Write-Host "::error title=$($e.P) [$m]::lazbuild a echoue (code $code)"
+                      $outL | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" }
+                  }
               }
           }
           Write-Host ""
@@ -671,7 +691,16 @@ jobs:
                   #    de signature qui refuserait de fonctionner sur un
                   #    pilote non signe.
                   $dbkOk = $true
-                  foreach ($plat in @('x64', 'x86')) {
+                  # x64 SEULEMENT. Le WDK 22H2 et suivants bloquent explicitement
+                  # x86 pour les pilotes noyau :
+                  #   WindowsDriver.common.targets(271,5): error :
+                  #     'Win32' is not a valid architecture for Kernel mode
+                  #     drivers or UMDF drivers
+                  # Le seul contournement connu consiste a patcher
+                  # WindowsDriver.Common.targets (remplacer 'x86' par 'xx86' dans
+                  # le controle) : on ne modifie pas les cibles Microsoft dans un
+                  # build CI. DBK32.sys est donc hors de portee ici.
+                  foreach ($plat in @('x64')) {
                       Write-Host "::group::DBKKernel [Release without sig|$plat]"
                       $outK = & msbuild $dbk -nologo -verbosity:minimal -m -p:"Configuration=Release without sig" -p:Platform=$plat 2>&1 |
                           ForEach-Object { "$_" }
@@ -744,8 +773,12 @@ jobs:
           foreach ($plat in @('Win32', 'x64')) {
               Write-Host "::group::Direct x mess [Release|$plat]"
               $outDX = & msbuild $sln -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat `
-                  -p:IncludePath="$dx\Include;`$(IncludePath)" `
-                  -p:LibraryPath="$dx\Lib\$plat;`$(LibraryPath)" 2>&1 |
+                  # MSBuild interprete ";" comme separateur de liste : passe tel
+                  # quel il declenchait MSB1006 "Property is not valid".
+                  # L'echappement canonique d'un point-virgule dans une valeur de
+                  # propriete msbuild est %3B.
+                  -p:IncludePath="$dx\Include%3B`$(IncludePath)" `
+                  -p:LibraryPath="$dx\Lib\$plat%3B`$(LibraryPath)" 2>&1 |
                   ForEach-Object { "$_" }
               $codeDX = $LASTEXITCODE
               $outDX | ForEach-Object { Write-Host $_ }
@@ -781,7 +814,6 @@ jobs:
 
           $core = @(
               'cheatengine-x86_64.exe',
-              'Cheat Engine.exe',
               'ceregreset.exe',
               'cepack.exe',
               'standalonephase2.dat',
@@ -802,10 +834,14 @@ jobs:
               $deps += 'DotNetDataCollector32.exe', 'DotNetDataCollector64.exe', 'CSCompiler.dll',
                        'autorun\dlls\DotNetInterface.dll',
                        'autorun\dlls\MonoDataCollector32.dll', 'autorun\dlls\MonoDataCollector64.dll',
-                       'tcc32-32.dll', 'tcc64-32.dll', 'tcc64-64.dll',
+                       'tcc64-32.dll', 'tcc64-64.dll',
                        'tcc64-32-linux.dll', 'tcc64-64-linux.dll'
+                       # tcc32-32.dll n'est charge que sous {$ifdef cpu32} (tcclib.pas:1233),
+                       # donc uniquement par un Cheat Engine 32 bits.
+                       if ($env:HAVE_PPC386 -eq 'true') { $deps += 'tcc32-32.dll' }
           }
-          if ('${{ inputs.build_dbkernel }}' -eq 'true') { $deps += 'DBK32.sys', 'DBK64.sys' }
+          # DBK32.sys exclu : le WDK 22H2+ refuse x86 pour les pilotes noyau.
+          if ('${{ inputs.build_dbkernel }}' -eq 'true') { $deps += 'DBK64.sys' }
 
           function Test-List {
               param([string[]]$Files, [string]$Label)
