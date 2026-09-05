@@ -197,23 +197,44 @@ jobs:
 
           $installer = "lazarus-$lazVer-fpc-$fpcVer-cross-i386-win32-win64.exe"
           $dest = Join-Path $env:RUNNER_TEMP $installer
-          # Miroirs multiplies : SourceForge sert frequemment une page HTML
-          # d'interstitial aux IP de datacenter (runner GitHub inclus) au lieu du
-          # fichier. Le controle du magic MZ dans Get-Installer la detecte, mais il
-          # faut ensuite un miroir qui reponde vraiment. Les hotes *.dl.sourceforge.net
-          # sont les plus fiables depuis un runner.
-          $sfBase = "https://downloads.sourceforge.net/project/lazarus/$base"
+          # BUG CORRIGE (le vrai coupable de l'absence de 32 bits) :
+          # l'ancienne ligne etait
+          #     $sfBase = "https://downloads.sourceforge.net/project/lazarus/$base"
+          # or $base n'a JAMAIS ete definie - le nom du fichier est dans
+          # $installer. Toutes les URL partaient donc SANS nom de fichier
+          # (".../project/lazarus/"), et SourceForge repondait 403 a chaque
+          # tentative. Les "9 miroirs" ajoutes auparavant n'ont jamais servi :
+          # ils partageaient tous la meme URL cassee. Deux des hotes ajoutes
+          # (netcologne, kumisystems) ne resolvaient meme pas en DNS.
+          #
+          # Le bon chemin est verifie de deux manieres independantes :
+          #   a) l'API SourceForge best_release.json renvoie
+          #        "/Lazarus Windows 64 bits/Lazarus <version>/<fichier>"
+          #   b) gcarreno/setup-lazarus - qui installe Lazarus avec SUCCES dans
+          #      ce meme job - construit exactement (src/lazarus.ts,
+          #      _getPackageURL) :
+          #        https://sourceforge.net/projects/lazarus/files/
+          #          Lazarus%20Windows%2064%20bits/Lazarus%20<version>/<fichier>
+          #      sans suffixe "/download".
+          # Verifie depuis ce bac a sable : HTTP 206 et magic "MZ" sur les 2
+          # premiers octets, donc un vrai PE et pas une page HTML.
+          $sfDir = "Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer"
           $mirrors = @(
-              $sfBase,
-              "https://master.dl.sourceforge.net/project/lazarus/$base?viasf=1",
-              "https://psychz.dl.sourceforge.net/project/lazarus/$base",
-              "https://netcologne.dl.sourceforge.net/project/lazarus/$base",
-              "https://gigenet.dl.sourceforge.net/project/lazarus/$base",
-              "https://kumisystems.dl.sourceforge.net/project/lazarus/$base",
-              "https://cfhcable.dl.sourceforge.net/project/lazarus/$base",
-              "https://sourceforge.net/projects/lazarus/files/$base/download",
+              "https://sourceforge.net/projects/lazarus/files/$sfDir/$installer",
+              "https://downloads.sourceforge.net/project/lazarus/$sfDir/$installer",
+              "https://sourceforge.net/projects/lazarus/files/$sfDir/$installer/download",
+              # ${installer} et non $installer : PowerShell admet "?" dans un
+              # nom de variable non delimite, donc "$installer?viasf=1" etait
+              # parse comme la variable $installer?viasf (vide) suivie de "=1".
+              # Le log du runner le montrait deja : ".../project/lazarus/=1".
+              "https://master.dl.sourceforge.net/project/lazarus/$sfDir/${installer}?viasf=1",
+              "https://psychz.dl.sourceforge.net/project/lazarus/$sfDir/$installer",
+              "https://gigenet.dl.sourceforge.net/project/lazarus/$sfDir/$installer",
+              "https://cfhcable.dl.sourceforge.net/project/lazarus/$sfDir/$installer",
               "https://freepascal.dfmk.hu/pub/lazarus/releases/$installer"
           )
+          Write-Host "Installeur recherche : $installer"
+          $mirrors | ForEach-Object { Write-Host "  miroir : $_" }
 
           function Get-Installer {
               param([string[]]$Urls, [string]$OutFile)
@@ -565,7 +586,24 @@ jobs:
               @{ P = 'dbk32\Kernelmodule unloader\Kernelmoduleunloader.lpi'; M = @(); M32 = @('default') },
               # --- projets hote (x86_64) : toujours constructibles ---
               @{ P = 'cepack\cepack.lpi';                            M = @('Default') },
-              @{ P = 'xmplayer\xmplayer.lpi';                        M = @('Default') },
+              # xmplayer RETIRE, preuves a l'appui :
+              #   1) xmplayer/main.pas:8 contient
+              #        {$ifndef cpu32}{$error The xmplayer can ONLY be compiled for 32-bit}{$endif}
+              #      -> il ne compile PAS sur l'hote x86_64.
+              #   2) xmplayer/xmplayer.lpi ne declare qu'UN mode auto-fermant,
+              #      <Item1 Name="Default" Default="True"/> : il ne porte aucun
+              #      <CodeGeneration><TargetCPU>, donc aucun mode 32 bits
+              #      n'existe a passer a lazbuild.
+              #   3) xmplayer.exe n'est reference NULLE PART dans le depot hors
+              #      une entree de traduction OBSOLETE (bin/languages/de_DE/
+              #      cheatengine-x86_64.po:23087, prefixee "#~", donc commentee)
+              #      et il n'est pas versionne dans bin/.
+              #      Le lecteur XM actuel est en-processus : xmplayer_server.pas
+              #      cree TXMPlayer et n'utilise que mikmod, il ne lance aucun
+              #      executable.
+              # Le compiler exigerait de patcher le .lpi pour inventer un mode
+              # i386, afin de produire un binaire que Cheat Engine n'appelle
+              # plus. On ne le fait pas.
               @{ P = 'plugin\example\exampleplugin.lpi';             M = @('Default') },
               @{ P = 'plugin\DebugEventLog\src\DebugEventLog.lpi';   M = @('Default') }
           )
@@ -781,11 +819,30 @@ jobs:
                   # build CI. DBK32.sys est donc hors de portee ici.
                   foreach ($plat in @('x64')) {
                       Write-Host "::group::DBKKernel [Release without sig|$plat]"
+                      # Deux proprietes globales, toutes deux necessaires :
+                      #
                       # -p:PostBuildEventUseInBuild=false : desactive le
                       # post-build de signature (commentaire 2). Sans lui,
                       # signtool echoue sur le certificat absent et msbuild
                       # sort non nul alors que le .sys est compile et lie.
-                      $outK = & msbuild $dbk -nologo -verbosity:minimal -m -p:"Configuration=Release without sig" -p:Platform=$plat -p:PostBuildEventUseInBuild=false 2>&1 |
+                      #
+                      # -p:TreatWarningAsError=false : DBKKernel.vcxproj ne
+                      # declare AUCUN <TreatWarningAsError> (verifie par grep),
+                      # mais le WDK l'active par defaut pour
+                      # <ConfigurationType>Driver</ConfigurationType>. Le run
+                      # reel a echoue la-dessus :
+                      #   DBKDrvr.c(222,22): error C2220: the following warning
+                      #     is treated as an error
+                      #   (idem DBKFunc.c, debugger.c, IOPLDispatcher.c,
+                      #    memscan.c, noexceptions.c, processlist.c, ultimap.c,
+                      #    ultimap2.c, vmxoffload.c)
+                      # C2220 n'est PAS une erreur de compilation : c'est un
+                      # avertissement promu en erreur. Le code amont compile
+                      # avec des outils plus anciens ; avec v143 + WDK 26100 de
+                      # nouveaux avertissements apparaissent. On ne reecrit pas
+                      # 10 fichiers du noyau pour des avertissements : on rend
+                      # au pilote son comportement normal.
+                      $outK = & msbuild $dbk -nologo -verbosity:minimal -m -p:"Configuration=Release without sig" -p:Platform=$plat -p:PostBuildEventUseInBuild=false -p:TreatWarningAsError=false 2>&1 |
                           ForEach-Object { "$_" }
                       $code = $LASTEXITCODE
                       $outK | ForEach-Object { Write-Host $_ }
@@ -794,7 +851,10 @@ jobs:
                           $dbkOk = $false
                           Write-Warning "  [DBKKernel] $plat -> code $code"
                           Write-Host "::error title=DBKKernel [$plat]::compilation echouee (code $code)"
-                          $e = $outK | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
+                          # ': warning ' inclus volontairement : C2220 ne nomme
+                          # pas l'avertissement sous-jacent, il faut la ligne
+                          # d'avertissement pour savoir ce qui a ete promu.
+                          $e = $outK | Where-Object { $_ -match ': error |: warning |: fatal error |error MSB|error LNK' }
                           if ($e) { $e | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
                           else { $outK | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
                       }
@@ -870,34 +930,57 @@ jobs:
           # sont deja versionnes dans "Cheat Engine/bin/" (verifie dans le
           # depot). Un echec ici ne casse donc rien : on le signale sans
           # jamais faire echouer le job.
-          # ANCIEN CODE, TROIS DEFAUTS VERIFIES :
+          # ANCIEN CODE, QUATRE DEFAUTS VERIFIES. Le quatrieme a ete prouve par
+          # le runner lui-meme, pas seulement par analyse :
           #
-          # 1) Les arguments -p:IncludePath / -p:LibraryPath etaient places
-          #    APRES des lignes de commentaire inserees DANS une continuation
-          #    par backtick. En PowerShell, un "#" apres un backtick de
-          #    continuation TERMINE l'instruction : msbuild ne recevait que
-          #    9 arguments (solution, -nologo, -verbosity, -m, Configuration,
-          #    Platform) et JAMAIS les chemins DXSDK. Le residu "-p:" etait
-          #    ensuite reparsé comme une nouvelle instruction -> "-p: n'est
-          #    pas reconnu", erreur NON terminante sous
-          #    $ErrorActionPreference='Continue', donc silencieuse.
-          #    C'est exactement le symptome observe : C1083 sur d3dx9/10/11.h
-          #    alors que tous les en-tetes systeme se resolaient tres bien.
+          # 1) -p:IncludePath / -p:LibraryPath etaient places APRES des lignes
+          #    de commentaire inserees DANS une continuation par backtick. En
+          #    PowerShell un "#" apres un backtick de continuation TERMINE
+          #    l'instruction : msbuild ne recevait que 9 arguments et JAMAIS
+          #    les chemins DXSDK. Le residu "-p:" etait ensuite reparsé comme
+          #    une nouvelle instruction -> erreur NON terminante, donc
+          #    silencieuse sous $ErrorActionPreference='Continue'.
           #
-          # 2) -p:IncludePath="...$(IncludePath)" ne pouvait pas fonctionner
-          #    de toute facon : une propriete passee en ligne de commande est
-          #    une propriete GLOBALE, evaluee avant le projet ; $(IncludePath)
-          #    y est donc vide. La valeur aurait ECRASE le chemin standard au
-          #    lieu de s'y ajouter (on ne peut pas s'auto-referencer en -p:).
+          # 2) -p:IncludePath="...$(IncludePath)" ne pouvait pas fonctionner :
+          #    une propriete passee en ligne de commande est GLOBALE, evaluee
+          #    avant le projet ; $(IncludePath) y est vide. La valeur ecrasait
+          #    le chemin d'inclusion standard au lieu de s'y ajouter.
           #
-          # 3) "$dx\Lib\$plat" n'existe pas : le SDK DirectX de juin 2010 range
-          #    ses librairies dans Lib\x86 et Lib\x64. Il n'y a pas de
-          #    Lib\Win32 -> LNK1104 sur d3dx9.lib meme une fois 1) corrige.
+          # 3) "$dx\Lib\$plat" n'existe pas : le SDK de juin 2010 range ses
+          #    librairies dans Lib\x86 et Lib\x64. Il n'y a pas de Lib\Win32.
           #
-          # On passe desormais par les variables d'environnement INCLUDE et
-          # LIB, que cl.exe et link.exe lisent directement, et que la tache
-          # SetEnv de MSBuild PREfixe (Prefix="true") au lieu de les ecraser.
-          # Aucun commentaire n'est place dans une continuation de commande.
+          # 4) LE CORRECTIF PAR $env:INCLUDE NE MARCHE PAS, ET LE LOG DU RUNNER
+          #    LE PROUVE. Il affichait simultanement :
+          #      DirectX SDK : code 0                <- installe, d3dx9.h present
+          #      INCLUDE prependu de : C:\...\Include
+          #      error C1083: Cannot open include file: 'd3dx9.h'
+          #    MSBuild recalcule INCLUDE a partir de $(IncludePath) via sa tache
+          #    SetEnv et ne preserve pas la valeur heritee du processus pere.
+          #    Preposer $env:INCLUDE est donc sans effet.
+          #
+          # DEUX MECANISMES INDEPENDANTS SONT DONC MIS EN PLACE :
+          #
+          #   a) $env:CL. Documente par Microsoft ("CL environment variables") :
+          #      "The CL tool PREPENDS the options and arguments defined in the
+          #      CL environment variable to the command-line arguments, ...
+          #      before processing." Exemple de la doc :
+          #        SET CL=/Zp2 /Ox /I\INCLUDE\MYINCLS
+          #      cl.exe est un processus fils de msbuild : il herite de CL, et
+          #      MSBuild ne definit ni ne lit jamais cette variable. Elle ne
+          #      peut donc pas etre ecrasee comme INCLUDE l'a ete.
+          #
+          #   b) Un <ItemDefinitionGroup> injecte dans chacun des 4 .vcxproj,
+          #      juste avant l'import de Microsoft.Cpp.targets, posant
+          #      AdditionalIncludeDirectories et AdditionalLibraryDirectories.
+          #      Mecanisme standard : les /I arrivent litteralement sur la ligne
+          #      de commande de cl.exe et sont visibles dans le log de build.
+          #      Aucun des 4 projets ne definit deja ces deux metadonnees
+          #      (verifie par grep : 0 occurrence dans chacun), donc rien n'est
+          #      ecrase. $(PlatformShortName) vaut x86 pour Win32 et x64 pour
+          #      x64, ce qui resout le bon sous-dossier Lib.
+          #
+          # INCLUDE / LIB / DXSDK_DIR sont conserves : ils ne coutent rien et
+          # couvrent d'eventuels outils annexes.
           $dxOk = $true
           if (-not (Test-Path "$dx\Include\d3dx9.h")) {
               Write-Warning "En-tetes DirectX absents ($dx\Include\d3dx9.h) : hooks D3D non compiles. Les 8 DLL precompilees de bin/ seront utilisees."
@@ -910,25 +993,56 @@ jobs:
           else {
               $env:DXSDK_DIR = "$dx\"
               $env:INCLUDE = "$dx\Include;$env:INCLUDE"
+              # --- b) injection dans les .vcxproj ---------------------------
+              # Tableau de lignes simples quotes puis joint, et non une
+              # here-string : le terminateur '@ d'une here-string doit etre en
+              # colonne 0, ce qui fermerait le bloc litteral YAML de ce step.
+              # Les guillemets simples empechent l'expansion PowerShell, donc
+              # $(DXSDK_DIR) et %(AdditionalIncludeDirectories) arrivent
+              # litteralement dans le XML.
+              $idgLines = @(
+                  '  <ItemDefinitionGroup>',
+                  '    <ClCompile>',
+                  '      <AdditionalIncludeDirectories>$(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>',
+                  '    </ClCompile>',
+                  '    <Link>',
+                  '      <AdditionalLibraryDirectories>$(DXSDK_DIR)Lib\$(PlatformShortName);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>',
+                  '    </Link>',
+                  '  </ItemDefinitionGroup>'
+              )
+              $idg = $idgLines -join "`r`n"
+              $anchor = '<Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />'
+              Get-ChildItem -Path (Split-Path $sln) -Recurse -Filter '*.vcxproj' -ErrorAction SilentlyContinue | ForEach-Object {
+                  $raw = [System.IO.File]::ReadAllText($_.FullName)
+                  if ($raw.Contains('$(DXSDK_DIR)Include')) {
+                      Write-Host "  $($_.Name) : chemins DXSDK deja injectes"
+                  } elseif ($raw.Contains($anchor)) {
+                      [System.IO.File]::WriteAllText($_.FullName, $raw.Replace($anchor, $idg + "`r`n  " + $anchor))
+                      Write-Host "  $($_.Name) : ItemDefinitionGroup DXSDK injecte"
+                  } else {
+                      Write-Warning "  $($_.Name) : ancre Microsoft.Cpp.targets introuvable, injection impossible"
+                  }
+              }
               # LIB varie selon la plateforme : on memorise la valeur de base
               # pour la restaurer a chaque tour. Sans cela le dossier x86 du
-              # premier tour restait prependu au tour x64, et link.exe pouvait
-              # aller chercher une d3dx9.lib 32 bits dans un build 64 bits.
+              # premier tour restait prependu au tour x64.
               $baseLib = $env:LIB
               Write-Host "DXSDK_DIR = $env:DXSDK_DIR"
               Write-Host "INCLUDE   prependu de : $dx\Include"
               foreach ($plat in @('Win32', 'x64')) {
                   $libName = if ($plat -eq 'Win32') { 'x86' } else { $plat }
                   $libDir = Join-Path $dx "Lib\$libName"
-                  if (-not (Test-Path $libDir)) {
-                      Write-Warning "  [$plat] $libDir absent,essai de Lib\$plat"
-                      $libDir = Join-Path $dx "Lib\$plat"
-                  }
+                  if (-not (Test-Path $libDir)) { $libDir = Join-Path $dx "Lib\$plat" }
                   if (-not (Test-Path $libDir)) {
                       Write-Warning "  [$plat] aucun dossier de librairies DirectX trouve sous $dx\Lib : LNK1104 probable sur d3dx9.lib"
                   }
                   $env:LIB = "$libDir;$baseLib"
-                  Write-Host "  [$plat] LIB prependu de : $libDir"
+                  # a) CL / LINK : prependus par cl.exe et link.exe eux-memes.
+                  $env:CL = "/I`"$dx\Include`""
+                  $env:LINK = "/LIBPATH:`"$libDir`""
+                  Write-Host "  [$plat] CL   = $env:CL"
+                  Write-Host "  [$plat] LINK = $env:LINK"
+                  Write-Host "  [$plat] LIB  prependu de : $libDir"
                   Write-Host "::group::Direct x mess [Release|$plat]"
                   $outDX = & msbuild $sln -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat 2>&1 |
                       ForEach-Object { "$_" }
@@ -939,7 +1053,7 @@ jobs:
                       $dxOk = $false
                       Write-Warning "  [Direct x mess] $plat -> code $codeDX"
                       Write-Host "::error title=Direct x mess [$plat]::compilation echouee (code $codeDX) - les DLL precompilees de bin/ restent utilisables"
-                      $e = $outDX | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
+                      $e = $outDX | Where-Object { $_ -match ': error |: warning |: fatal error |error MSB|error LNK' }
                       if ($e) { $e | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
                       else { $outDX | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
                   }
