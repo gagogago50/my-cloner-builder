@@ -181,7 +181,15 @@ jobs:
       # sans lui, tous les modes 32 bits echouent (speedhack-i386, vehdebug-i386,
       # cheatengine-i386...).
       - name: Install i386-win32 cross-compiler
-        continue-on-error: true
+        # PAS de "continue-on-error: true". Il y etait, et il rendait le garde
+        # require_i386 strictement inoperant : le "throw" du bloc d'echec
+        # faisait bien echouer CE step, mais GitHub Actions continuait le job
+        # comme si de rien n'etait. C'est exactement ce que montrait le resume
+        # du dernier run - "cross-i386 false" et un job alle jusqu'au bout -
+        # alors que require_i386 etait a true par defaut.
+        # Sans cette ligne, require_i386=true arrete reellement le job quand le
+        # cross-compiler est introuvable, comme demande ; require_i386=false
+        # donne un build 64 bits seul avec un avertissement.
         shell: pwsh
         run: |
           $lazDir = $env:LAZARUS_DIR
@@ -817,6 +825,50 @@ jobs:
                   # WindowsDriver.Common.targets (remplacer 'x86' par 'xx86' dans
                   # le controle) : on ne modifie pas les cibles Microsoft dans un
                   # build CI. DBK32.sys est donc hors de portee ici.
+                  # C2220 : le -p:TreatWarningAsError=false ajoute au tour
+                  # precedent s'est AVERE INSUFFISANT. Le runner a renvoye les
+                  # 10 memes "the following warning is treated as an error".
+                  # Raison : TreatWarningAsError est une METADONNEE d'item
+                  # (ClCompile), pas une propriete MSBuild. Le WDK la pose dans
+                  # un ItemDefinitionGroup de ses .props ; une propriete globale
+                  # passee en -p: ne la remplace pas.
+                  #
+                  # Deux correctifs cumules :
+                  #
+                  #   1) $env:_CL_ = '/WX-'. Documente par Microsoft ("CL
+                  #      environment variables") : cl.exe "PREPENDS the options
+                  #      and arguments defined in the CL environment variable
+                  #      ..., and APPENDS the options and arguments defined in
+                  #      _CL_, before processing". C'est donc _CL_ qu'il faut,
+                  #      pas CL : /WX- doit arriver APRES le /WX du projet pour
+                  #      l'emporter, car chez cl.exe c'est la derniere
+                  #      occurrence d'un switch qui gagne.
+                  #
+                  #   2) <TreatWarningAsError>false</TreatWarningAsError> dans un
+                  #      ItemDefinitionGroup injecte en DERNIER dans le .vcxproj
+                  #      (juste avant l'import de Microsoft.Cpp.targets), donc
+                  #      apres ceux du WDK et apres ceux du projet.
+                  $env:_CL_ = '/WX-'
+                  $dbkProj = Join-Path (Split-Path $dbk) 'DBKKernel.vcxproj'
+                  $dbkAnchor = '<Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />'
+                  $dbkNoWx = @(
+                      '  <ItemDefinitionGroup>',
+                      '    <ClCompile>',
+                      '      <TreatWarningAsError>false</TreatWarningAsError>',
+                      '    </ClCompile>',
+                      '  </ItemDefinitionGroup>'
+                  ) -join "`r`n"
+                  if (Test-Path $dbkProj) {
+                      $dbkRaw = [System.IO.File]::ReadAllText($dbkProj)
+                      if ($dbkRaw.Contains('<TreatWarningAsError>false</TreatWarningAsError>')) {
+                          Write-Host 'DBKKernel.vcxproj : TreatWarningAsError=false deja present'
+                      } elseif ($dbkRaw.Contains($dbkAnchor)) {
+                          [System.IO.File]::WriteAllText($dbkProj, $dbkRaw.Replace($dbkAnchor, $dbkNoWx + "`r`n  " + $dbkAnchor))
+                          Write-Host 'DBKKernel.vcxproj : TreatWarningAsError=false injecte'
+                      } else {
+                          Write-Warning 'DBKKernel.vcxproj : ancre Microsoft.Cpp.targets introuvable, injection impossible'
+                      }
+                  }
                   foreach ($plat in @('x64')) {
                       Write-Host "::group::DBKKernel [Release without sig|$plat]"
                       # Deux proprietes globales, toutes deux necessaires :
@@ -826,9 +878,11 @@ jobs:
                       # signtool echoue sur le certificat absent et msbuild
                       # sort non nul alors que le .sys est compile et lie.
                       #
-                      # -p:TreatWarningAsError=false : DBKKernel.vcxproj ne
-                      # declare AUCUN <TreatWarningAsError> (verifie par grep),
-                      # mais le WDK l'active par defaut pour
+                      # -p:TreatWarningAsError=false : conserve bien qu'INSUFFISANT
+                      # seul (voir plus haut) - il ne coute rien et couvre le cas
+                      # ou une future version du WDK repasserait par une propriete.
+                      # DBKKernel.vcxproj ne declare AUCUN <TreatWarningAsError>
+                      # (verifie par grep), mais le WDK l'active par defaut pour
                       # <ConfigurationType>Driver</ConfigurationType>. Le run
                       # reel a echoue la-dessus :
                       #   DBKDrvr.c(222,22): error C2220: the following warning
@@ -992,21 +1046,60 @@ jobs:
           }
           else {
               $env:DXSDK_DIR = "$dx\"
-              $env:INCLUDE = "$dx\Include;$env:INCLUDE"
               # --- b) injection dans les .vcxproj ---------------------------
-              # Tableau de lignes simples quotes puis joint, et non une
-              # here-string : le terminateur '@ d'une here-string doit etre en
-              # colonne 0, ce qui fermerait le bloc litteral YAML de ce step.
-              # Les guillemets simples empechent l'expansion PowerShell, donc
-              # $(DXSDK_DIR) et %(AdditionalIncludeDirectories) arrivent
-              # litteralement dans le XML.
+              # PIEGE TROUVE PAR LE RUNNER AU TOUR SUIVANT : exposer TOUT
+              # "$dx\Include" fait ECRAN aux en-tetes du Windows SDK. Le SDK
+              # DirectX de juin 2010 contient ses propres d3d9.h / d3d10.h /
+              # d3d11.h / d3dcompiler.h, et un /I est TOUJOURS cherche avant
+              # INCLUDE. Le vieux d3d11.h du DXSDK gagnait donc, et il ignore
+              # D3D_FEATURE_LEVEL_11_1 (ajoute au SDK Windows 8). D'ou, sur le
+              # runner :
+              #   DXHookBase.cpp(1061): 'D3D_FEATURE_LEVEL_11_1': undeclared identifier
+              #   DXHookBase.cpp(1061): case expression not constant
+              # (les deux erreurs viennent de la meme ligne : un "case" sur un
+              #  identifiant non declare n'est pas une constante.)
+              #
+              # Inventaire EXHAUSTIF des #include <...> des 4 projets :
+              #   d3d9.h d3d10.h d3d11.h d3dcompiler.h  <- Windows SDK, a ne PAS masquer
+              #   d3dx9.h d3dx10.h d3dx11.h xnamath.h   <- exclusifs au DXSDK
+              #   windows.h ocidl.h stdio.h map          <- systeme
+              # AdditionalDependencies : d3dx9.lib, d3dx10.lib, d3dx11.lib,
+              # toutes exclusives au DXSDK.
+              #
+              # On ne copie donc QUE d3dx* et xnamath* dans un dossier dedie :
+              # plus aucun en-tete du SDK ne peut etre masque, et d3dx9.h comme
+              # xnamath.h restent disponibles. xnamath.h inclut des .inl, d'ou
+              # le filtre par nom et non par extension.
+              $minInc = Join-Path $env:RUNNER_TEMP 'dxsdk-min\include'
+              New-Item -ItemType Directory -Force -Path $minInc | Out-Null
+              Get-ChildItem -Path "$dx\Include" -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like 'd3dx*' -or $_.Name -like 'xnamath*' } |
+                  ForEach-Object { Copy-Item $_.FullName -Destination $minInc -Force }
+              $nHdr = @(Get-ChildItem -Path $minInc -File -ErrorAction SilentlyContinue).Count
+              Write-Host "En-tetes d3dx*/xnamath* copies dans $minInc : $nHdr"
+              if ($nHdr -eq 0) { Write-Warning "  aucun en-tete copie : C1083 probable sur d3dx9.h" }
+              foreach ($h in @('d3dx9.h', 'd3dx10.h', 'd3dx11.h', 'xnamath.h')) {
+                  if (-not (Test-Path (Join-Path $minInc $h))) { Write-Warning "  $h absent du dossier minimal" }
+              }
+              # Verifie : ni d3d11.h ni d3dcompiler.h ne doivent s'y trouver,
+              # sinon on retombe dans le masquage.
+              foreach ($h in @('d3d9.h', 'd3d10.h', 'd3d11.h', 'd3dcompiler.h')) {
+                  if (Test-Path (Join-Path $minInc $h)) { Write-Warning "  $h present alors qu'il doit venir du Windows SDK" }
+              }
+              $env:DXSDK_MIN_INC = $minInc
+              # APPENDE, et non prependu : si le dossier complet du DXSDK etait
+              # place en tete de INCLUDE, son vieux d3d11.h serait trouve avant
+              # celui du Windows SDK et D3D_FEATURE_LEVEL_11_1 redevenirait
+              # inconnu. MSBuild recalcule de toute facon INCLUDE depuis
+              # $(IncludePath) ; cette ligne ne couvre que les outils annexes.
+              $env:INCLUDE = "$env:INCLUDE;$minInc"
               $idgLines = @(
                   '  <ItemDefinitionGroup>',
                   '    <ClCompile>',
-                  '      <AdditionalIncludeDirectories>$(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>',
+                  '      <AdditionalIncludeDirectories>$(DXSDK_MIN_INC);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>',
                   '    </ClCompile>',
                   '    <Link>',
-                  '      <AdditionalLibraryDirectories>$(DXSDK_DIR)Lib\$(PlatformShortName);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>',
+                  '      <AdditionalLibraryDirectories>$(DXSDK_MIN_LIB);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>',
                   '    </Link>',
                   '  </ItemDefinitionGroup>'
               )
@@ -1014,7 +1107,7 @@ jobs:
               $anchor = '<Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />'
               Get-ChildItem -Path (Split-Path $sln) -Recurse -Filter '*.vcxproj' -ErrorAction SilentlyContinue | ForEach-Object {
                   $raw = [System.IO.File]::ReadAllText($_.FullName)
-                  if ($raw.Contains('$(DXSDK_DIR)Include')) {
+                  if ($raw.Contains('$(DXSDK_MIN_INC)') -or $raw.Contains('$(DXSDK_DIR)Include')) {
                       Write-Host "  $($_.Name) : chemins DXSDK deja injectes"
                   } elseif ($raw.Contains($anchor)) {
                       [System.IO.File]::WriteAllText($_.FullName, $raw.Replace($anchor, $idg + "`r`n  " + $anchor))
@@ -1023,26 +1116,29 @@ jobs:
                       Write-Warning "  $($_.Name) : ancre Microsoft.Cpp.targets introuvable, injection impossible"
                   }
               }
-              # LIB varie selon la plateforme : on memorise la valeur de base
-              # pour la restaurer a chaque tour. Sans cela le dossier x86 du
-              # premier tour restait prependu au tour x64.
               $baseLib = $env:LIB
               Write-Host "DXSDK_DIR = $env:DXSDK_DIR"
-              Write-Host "INCLUDE   prependu de : $dx\Include"
+              Write-Host "INCLUDE   (complet, non utilise pour l'injection) prependu de : $dx\Include"
               foreach ($plat in @('Win32', 'x64')) {
                   $libName = if ($plat -eq 'Win32') { 'x86' } else { $plat }
-                  $libDir = Join-Path $dx "Lib\$libName"
-                  if (-not (Test-Path $libDir)) { $libDir = Join-Path $dx "Lib\$plat" }
-                  if (-not (Test-Path $libDir)) {
-                      Write-Warning "  [$plat] aucun dossier de librairies DirectX trouve sous $dx\Lib : LNK1104 probable sur d3dx9.lib"
+                  $srcLib = Join-Path $dx "Lib\$libName"
+                  if (-not (Test-Path $srcLib)) { $srcLib = Join-Path $dx "Lib\$plat" }
+                  # Meme principe que pour les en-tetes : uniquement d3dx*.lib.
+                  $minLib = Join-Path $env:RUNNER_TEMP "dxsdk-min\lib\$libName"
+                  New-Item -ItemType Directory -Force -Path $minLib | Out-Null
+                  if (Test-Path $srcLib) {
+                      Get-ChildItem -Path $srcLib -Filter 'd3dx*.lib' -File -ErrorAction SilentlyContinue |
+                          ForEach-Object { Copy-Item $_.FullName -Destination $minLib -Force }
+                  } else {
+                      Write-Warning "  [$plat] $srcLib introuvable : LNK1104 probable sur d3dx9.lib"
                   }
-                  $env:LIB = "$libDir;$baseLib"
-                  # a) CL / LINK : prependus par cl.exe et link.exe eux-memes.
-                  $env:CL = "/I`"$dx\Include`""
-                  $env:LINK = "/LIBPATH:`"$libDir`""
+                  $env:DXSDK_MIN_LIB = $minLib
+                  $env:LIB = "$minLib;$baseLib"
+                  # CL / LINK : prependus par cl.exe et link.exe eux-memes.
+                  $env:CL = "/I`"$minInc`""
+                  $env:LINK = "/LIBPATH:`"$minLib`""
                   Write-Host "  [$plat] CL   = $env:CL"
                   Write-Host "  [$plat] LINK = $env:LINK"
-                  Write-Host "  [$plat] LIB  prependu de : $libDir"
                   Write-Host "::group::Direct x mess [Release|$plat]"
                   $outDX = & msbuild $sln -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat 2>&1 |
                       ForEach-Object { "$_" }
@@ -1256,21 +1352,39 @@ jobs:
               @('VEH debugger', 'vehdebug.lpi', @('vehdebug-i386.dll', 'vehdebug-x86_64.dll')),
               @('Speedhack', 'speedhack.lpi', @('speedhack-i386.dll', 'speedhack-x86_64.dll')),
               @('luaclient', 'luaclient.lpi', @('luaclient-i386.dll', 'luaclient-x86_64.dll')),
-              @('DBK kernel driver', 'DBKKernel.sln', @('DBK32.sys', 'DBK64.sys')),
+              @('DBK kernel driver', 'DBKKernel.sln', @('DBK64.sys')),
               @('Hooks D3D', 'binaires du depot', @('ced3d9hook.dll', 'ced3d9hook64.dll')),
               @('CEJVMTI (Java)', 'binaires du depot', @('autorun\dlls\32\CEJVMTI.dll', 'autorun\dlls\64\CEJVMTI.dll'))
           )
+          # Artefacts exclusivement 32 bits. Sans cross-compiler ils sont
+          # VOLONTAIREMENT sautes par l'etape "Build Lazarus sub-projects" et
+          # par tcc : les compter dans le denominateur produisait des
+          # "PARTIEL 1/2" a repetition, qui sont des faux positifs et non des
+          # echecs. Attention au piege de nommage : tcc64-32.dll est un build
+          # HOTE 64 bits visant l'ABI 32 bits, il n'est PAS dans cette liste ;
+          # seul tcc32-32.dll l'est (charge sous {$ifdef cpu32}, tcclib.pas:1233).
+          $i386Only = @('tcc32-32.dll', 'tutorial-i386.exe', 'gtutorial-i386.exe',
+                        'vehdebug-i386.dll', 'speedhack-i386.dll', 'luaclient-i386.dll')
           foreach ($r in $rows) {
+              $attendus = @($r[2])
+              if ($env:HAVE_PPC386 -ne 'true') {
+                  $attendus = @($attendus | Where-Object { $i386Only -notcontains $_ })
+              }
+              # DBK32.sys retire de la liste attendue : le WDK 22H2+ refuse x86
+              # pour les pilotes noyau (WindowsDriver.common.targets(271,5)), le
+              # seul contournement consisterait a patcher les cibles Microsoft.
               $ok = 0
-              foreach ($f in $r[2]) { if (Test-Path (Join-Path $bin $f)) { $ok++ } }
+              foreach ($f in $attendus) { if (Test-Path (Join-Path $bin $f)) { $ok++ } }
               # Composants derriere un input : on distingue "non demande" de "echec".
               $requested = $true
               if ($r[0] -eq 'DBK kernel driver' -and '${{ inputs.build_dbkernel }}' -ne 'true') { $requested = $false }
               if ($r[0] -eq 'Hooks D3D' -and '${{ inputs.build_directx }}' -ne 'true') { $requested = $false }
-              $state = if ($ok -eq $r[2].Count) { "OK $ok/$($r[2].Count)" }
-                       elseif (-not $requested)  { 'non demande' }
-                       elseif ($ok -gt 0)        { "PARTIEL $ok/$($r[2].Count)" }
-                       else                      { "ABSENT 0/$($r[2].Count)" }
+              $n = $attendus.Count
+              $state = if ($n -eq 0)           { 'non applicable' }
+                       elseif ($ok -eq $n)     { "OK $ok/$n" }
+                       elseif (-not $requested) { 'non demande' }
+                       elseif ($ok -gt 0)      { "PARTIEL $ok/$n" }
+                       else                    { "ABSENT 0/$n" }
               "| ``$($r[0])`` | $($r[1]) | $state |" | Out-File -FilePath $s -Append -Encoding utf8
           }
 
