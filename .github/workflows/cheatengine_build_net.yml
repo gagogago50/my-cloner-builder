@@ -800,6 +800,62 @@ jobs:
           $results[$j.N] = if ($buildOk) { 'compile' } else { 'partiel' }
           }
 
+
+          # ---- tcc32-32.dll : INACCESSIBLE via la solution ----
+          #
+          # tcc.sln REMAPPE la plateforme (verifie dans le fichier) :
+          #   {E356254D-...}.Output to 32 (Release)|Win32.ActiveCfg = Output to 32 (Release)|x64
+          #   {E356254D-...}.Output to 32 (Release)|Win32.Build.0   = Output to 32 (Release)|x64
+          # Demander "Output to 32 (Release)|Win32" a msbuild SUR LE .SLN compile
+          # donc la config x64 du projet et produit tcc64-32.dll, pas
+          # tcc32-32.dll. Et msbuild sort en 0 : rien ne signalait l'ecart, le
+          # fichier manquait simplement a la verification finale.
+          #
+          # Le PROJET, lui, declare bien la config (verifie dans
+          # tcc\tcc.vcxproj) :
+          #   Output to 32 (Release)|Win32
+          #     TargetName = tcc$(PlatformArchitecture)-32   (32 pour Win32)
+          #     OutDir     = ..\..\..\..\bin\
+          #   -> tcc32-32.dll dans Cheat Engine\bin\
+          #
+          # Ce n'est PAS optionnel des qu'un Cheat Engine 32 bits est construit.
+          # tcclib.pas:1232-1235 :
+          #   {$ifdef cpu32}
+          #   module:=LoadLibrary('tcc32-32.dll'); //generates 32-bit code
+          #   ... notworkingreason:='tcc32-32.dll can not be found';
+          #
+          # D'ou ce build DIRECT sur le .vcxproj, qui contourne le mapping de la
+          # solution. tcc.vcxproj est en v141, deja retargete en v143 par l'etape
+          # dediee (elle parcourt "Cheat Engine" recursivement).
+          if ($env:HAVE_PPC386 -eq 'true') {
+              $tccProj = Join-Path $env:GITHUB_WORKSPACE 'Cheat Engine\tcclib\win32\tcc\tcc\tcc.vcxproj'
+              if (-not (Test-Path $tccProj)) {
+                  Write-Warning "tcc.vcxproj introuvable : $tccProj"
+              } else {
+                  Write-Host '::group::tcclib [Output to 32 (Release)|Win32 - via tcc.vcxproj]'
+                  $outT = & msbuild $tccProj -nologo -verbosity:minimal -m `
+                      -p:Configuration="Output to 32 (Release)" -p:Platform=Win32 2>&1 |
+                      ForEach-Object { "$_" }
+                  $codeT = $LASTEXITCODE
+                  $outT | ForEach-Object { Write-Host $_ }
+                  Write-Host '::endgroup::'
+                  if ($codeT -ne 0) {
+                      Write-Warning "  [tcclib] tcc32-32.dll -> code $codeT"
+                      Write-Host "::error title=tcclib [tcc32-32.dll]::compilation echouee (code $codeT)"
+                      $errsT = $outT | Where-Object { $_ -match ': error |: warning |: fatal error |error MSB|error LNK' }
+                      if ($errsT) { $errsT | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
+                      else { $outT | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
+                      $results['tcclib'] = 'partiel'
+                  } elseif (Test-Path (Join-Path $env:BIN_DIR 'tcc32-32.dll')) {
+                      Write-Host 'tcc32-32.dll present dans bin/'
+                  } else {
+                      # msbuild peut sortir en 0 sans rien produire : on verifie
+                      # le fichier, pas seulement le code de sortie.
+                      Write-Warning 'tcc32-32.dll : msbuild en 0 mais fichier absent de bin/'
+                      $results['tcclib'] = 'partiel'
+                  }
+              }
+          }
           # DotNetInterface : on construit DotNetInterface2.csproj (net40), PAS
           # DotNetInterface.csproj (netstandard2.0) dont l'OutputPath est absolu
           # et pointe sur D:\git\cheat-engine\... -> il ecrirait hors du workspace.
