@@ -418,16 +418,32 @@ jobs:
                                'v140_xp', 'v140', 'v141_xp', 'v141', 'v142')) {
                 $new = $new -replace "<PlatformToolset>$old</PlatformToolset>", '<PlatformToolset>v143</PlatformToolset>'
             }
-            # SDK : TOUTES les valeurs, pas seulement 8.x. Valeurs relevees :
-            #   3x 8.1, 1x 7.0, 1x 10.0.17763.0, 2x $(LatestTargetPlatformVersion)
-            # Le 7.0 etait le vrai coupable de l'echec de MonoDataCollector :
-            # le toolset etait bien reecrit en v143, mais le SDK 7.0 restait
-            # pointe alors qu'il n'est pas installe sur l'image.
-            # $(LatestTargetPlatformVersion) n'est defini nulle part dans le
-            # depot (verifie : aucune definition dans .props/.targets/.vcxproj),
-            # donc DBKKernel et ultimap2 heritaient d'une version vide.
+            # SDK : on ne reecrit que les valeurs LITTERALES (celles qui commencent
+            # par un chiffre) : 3x 8.1, 1x 7.0, 1x 10.0.17763.0. Le 7.0 etait le vrai
+            # coupable de l'echec de MonoDataCollector : le toolset passait bien en
+            # v143 mais le projet pointait encore sur un SDK 7.0 absent de l'image.
             # "10.0" demande a MSBuild le plus recent SDK 10.x installe.
-            $new = $new -replace '<WindowsTargetPlatformVersion>[^<]*</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
+            #
+            # DEUX EXCLUSIONS, toutes deux apprises d'un echec reel :
+            #
+            # a) Les references de propriete "$(...)" ne sont JAMAIS reecrites.
+            #    $(LatestTargetPlatformVersion) EST defini : par le WDK lui-meme,
+            #    dans "Windows Kits\10\build\WindowsDriver.Default.props"
+            #      <LatestTargetPlatformVersion>$(WindowsTargetPlatformVersion)</...>
+            #    C'est le mecanisme recommande par Microsoft pour resoudre le SDK
+            #    installe. Une version precedente de ce workflow le remplacait par
+            #    "10.0" au motif qu'aucune definition n'existait dans le depot :
+            #    c'etait faux, le grep ne voyait que le depot, pas les props du WDK.
+            #    Resultat : ntifs.h (qui vit dans Include\<version>\km) n'etait plus
+            #    trouve, et DBKKernel echouait en error C1083 sur 15 fichiers.
+            #
+            # b) Les projets pilote (toolset WindowsKernelModeDriver*) ne sont pas
+            #    touches du tout : leur chemin d'inclusion "km" depend de la
+            #    resolution exacte du WDK, pas du SDK generaliste.
+            $isDriver = $raw -match '<PlatformToolset>WindowsKernelModeDriver'
+            if (-not $isDriver) {
+                $new = $new -replace '<WindowsTargetPlatformVersion>\d[^<]*</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
+            }
                   if ($new -ne $raw) {
                       [System.IO.File]::WriteAllText($_.FullName, $new)
                       $retargeted += $_.Name
@@ -700,7 +716,10 @@ jobs:
         if: ${{ inputs.build_directx }}
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          # 'Continue' et pas 'Stop' : avec 'Stop', chaque ligne que msbuild
+          # ecrit sur stderr et que "2>&1" convertit en ErrorRecord fait
+          # lever une exception, ce qui tue l'etape au premier avertissement.
+          $ErrorActionPreference = 'Continue'
           $dx = 'C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)'
           if (-not (Test-Path "$dx\Include\d3dx9.h")) {
               $exe = Join-Path $env:RUNNER_TEMP 'DXSDK_Jun10.exe'
@@ -711,13 +730,42 @@ jobs:
           }
           # Le SxS error S1023 de l'installeur est connu et sans consequence ici.
           $sln = Join-Path $env:CE_DIR 'Direct x mess\Direct x mess.sln'
+          # Cette etape est REELLEMENT optionnelle : les 8 artefacts
+          #   CED3D9Hook{,64}.dll CED3D10Hook{,64}.dll
+          #   CED3D11Hook{,64}.dll d3dhook{,64}.dll
+          # sont deja versionnes dans "Cheat Engine/bin/" (verifie dans le
+          # depot). Un echec ici ne casse donc rien : on le signale sans
+          # jamais faire echouer le job.
+          $dxOk = $true
+          if (-not (Test-Path $sln)) {
+              Write-Warning "Solution introuvable : $sln - les DLL precompilees de bin/ seront utilisees"
+          }
+          else {
           foreach ($plat in @('Win32', 'x64')) {
               Write-Host "::group::Direct x mess [Release|$plat]"
-              & msbuild $sln -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat `
+              $outDX = & msbuild $sln -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat `
                   -p:IncludePath="$dx\Include;`$(IncludePath)" `
-                  -p:LibraryPath="$dx\Lib\$plat;`$(LibraryPath)" 2>&1
+                  -p:LibraryPath="$dx\Lib\$plat;`$(LibraryPath)" 2>&1 |
+                  ForEach-Object { "$_" }
+              $codeDX = $LASTEXITCODE
+              $outDX | ForEach-Object { Write-Host $_ }
               Write-Host '::endgroup::'
+              if ($codeDX -ne 0) {
+                  $dxOk = $false
+                  Write-Warning "  [Direct x mess] $plat -> code $codeDX"
+                  Write-Host "::error title=Direct x mess [$plat]::compilation echouee (code $codeDX) - les DLL precompilees de bin/ restent utilisables"
+                  $e = $outDX | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
+                  if ($e) { $e | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
+                  else { $outDX | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
+              }
           }
+          }
+          if ($dxOk) { Write-Host 'Hooks D3D : OK' }
+          else { Write-Host 'Hooks D3D : echec non bloquant (artefacts precompiles presents dans bin/)' }
+          # Meme raison que pour l'etape des dependances natives : sans cet
+          # "exit 0", le wrapper pwsh remonte le $LASTEXITCODE du dernier
+          # msbuild et fait echouer l'etape.
+          exit 0
 
       # -----------------------------------------------------------------
       # 8. Verification : le filet qui manquait
