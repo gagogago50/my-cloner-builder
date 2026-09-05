@@ -834,20 +834,40 @@ jobs:
           $bin = $env:BIN_DIR
           if (-not (Test-Path $bin)) { throw "Dossier bin introuvable : $bin" }
 
+          # Trois niveaux, classes d'apres ce que le code fait reellement
+          # (verifie par grep dans le depot, pas suppose) :
+          #
+          # core        = ce que Cheat Engine charge ou injecte pour tourner.
+          #               vehdebug / speedhack / luaclient sont injectes ou
+          #               charges a l'execution. Manquant -> echec du build.
+          #
+          # auxiliaires = outils annexes, jamais bloquants :
+          #   ceregreset          0 reference hors bin/ ; utilitaire autonome
+          #   standalonephase2.dat CE le decompacte lui-meme depuis
+          #                       standalonephase2.cepack s'il est absent
+          #   tutorial / gtutorial lances a la demande depuis le menu ;
+          #                       Cheat Engine fonctionne sans
+          #   cepack.exe          l'outil de PAQUETAGE (cote distribution) ;
+          #                       CE ne fait que decompacter les .cepack
+          #
+          # deps        = dependances natives, pilotees par fail_on_missing_deps.
           $core = @(
               'cheatengine-x86_64.exe',
-              'ceregreset.exe',
-              'cepack.exe',
-              'standalonephase2.dat',
               'vehdebug-x86_64.dll',
               'speedhack-x86_64.dll',
-              'luaclient-x86_64.dll',
+              'luaclient-x86_64.dll'
+          )
+          $aux = @(
+              'cepack.exe',
+              'ceregreset.exe',
+              'standalonephase2.dat',
               'tutorial-x86_64.exe',
               'gtutorial-x86_64.exe'
           )
           if ($env:HAVE_PPC386 -eq 'true') {
               $core += 'cheatengine-i386.exe', 'vehdebug-i386.dll', 'speedhack-i386.dll',
-                       'luaclient-i386.dll', 'tutorial-i386.exe', 'gtutorial-i386.exe'
+                       'luaclient-i386.dll'
+              $aux  += 'tutorial-i386.exe', 'gtutorial-i386.exe'
           }
           if ('${{ inputs.enable_avx }}' -eq 'true') { $core += 'cheatengine-x86_64-SSE4-AVX2.exe' }
 
@@ -878,11 +898,12 @@ jobs:
               return , @($ok, $ko)
           }
 
-          $rCore = Test-List -Files $core -Label 'Binaires principaux'
+          $rCore = Test-List -Files $core -Label 'Binaires principaux (bloquant)'
           $rDeps = Test-List -Files $deps -Label 'Dependances'
+          $rAux  = Test-List -Files $aux  -Label 'Auxiliaires (non bloquant)'
 
-          $missingCore = $rCore[1]; $missingDeps = $rDeps[1]
-          $allMissing = @($missingCore) + @($missingDeps)
+          $missingCore = $rCore[1]; $missingDeps = $rDeps[1]; $missingAux = $rAux[1]
+          $allMissing = @($missingCore) + @($missingDeps) + @($missingAux)
           ($allMissing | Out-String) | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'missing.txt') -Encoding utf8
 
           if ($missingCore.Count -gt 0) {
@@ -893,6 +914,13 @@ jobs:
           }
           if ($missingDeps.Count -gt 0) {
               Write-Warning "Dependances manquantes (non bloquant) : $($missingDeps -join ', ')"
+          }
+          if ($missingAux.Count -gt 0) {
+              Write-Warning "Auxiliaires manquants (non bloquant, Cheat Engine fonctionne sans) : $($missingAux -join ', ')"
+          }
+          if ($missingCore.Count -eq 0) {
+              Write-Host ""
+              Write-Host "Cheat Engine est complet : binaire principal et bibliotheques injectees presentes."
           }
 
       # -----------------------------------------------------------------
