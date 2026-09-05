@@ -405,12 +405,29 @@ jobs:
           foreach ($root in $targets) {
               if (-not (Test-Path $root)) { continue }
               Get-ChildItem -Path $root -Recurse -Filter '*.vcxproj' -ErrorAction SilentlyContinue | ForEach-Object {
-                  $raw = [System.IO.File]::ReadAllText($_.FullName)
-                  $new = $raw
-                  foreach ($old in @('v120_xp', 'v141_xp', 'v120', 'v140', 'v141', 'v142')) {
-                      $new = $new -replace "<PlatformToolset>$old</PlatformToolset>", '<PlatformToolset>v143</PlatformToolset>'
-                  }
-                  $new = $new -replace '<WindowsTargetPlatformVersion>8\.[01]</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
+            $raw = [System.IO.File]::ReadAllText($_.FullName)
+            $new = $raw
+            # Toolsets : liste complete relevee dans le depot
+            #   29x v141, 20x v120, 9x v141_xp, 3x v140_xp, 1x v143
+            # Aucun de v100/v110/v120/v140*/v141* n'est installe sur
+            # windows-2022, qui ne fournit que v143 (+ v142). Les variantes
+            # _xp doivent figurer AVANT leur base dans la liste, sinon le
+            # motif <PlatformToolset>v140</PlatformToolset> ne matche jamais
+            # v140_xp (la balise fermante est attendue juste apres).
+            foreach ($old in @('v100', 'v110_xp', 'v110', 'v120_xp', 'v120',
+                               'v140_xp', 'v140', 'v141_xp', 'v141', 'v142')) {
+                $new = $new -replace "<PlatformToolset>$old</PlatformToolset>", '<PlatformToolset>v143</PlatformToolset>'
+            }
+            # SDK : TOUTES les valeurs, pas seulement 8.x. Valeurs relevees :
+            #   3x 8.1, 1x 7.0, 1x 10.0.17763.0, 2x $(LatestTargetPlatformVersion)
+            # Le 7.0 etait le vrai coupable de l'echec de MonoDataCollector :
+            # le toolset etait bien reecrit en v143, mais le SDK 7.0 restait
+            # pointe alors qu'il n'est pas installe sur l'image.
+            # $(LatestTargetPlatformVersion) n'est defini nulle part dans le
+            # depot (verifie : aucune definition dans .props/.targets/.vcxproj),
+            # donc DBKKernel et ultimap2 heritaient d'une version vide.
+            # "10.0" demande a MSBuild le plus recent SDK 10.x installe.
+            $new = $new -replace '<WindowsTargetPlatformVersion>[^<]*</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
                   if ($new -ne $raw) {
                       [System.IO.File]::WriteAllText($_.FullName, $new)
                       $retargeted += $_.Name
@@ -563,17 +580,33 @@ jobs:
                   Write-Warning "[$($j.N)] solution introuvable : $sln"
                   $results[$j.N] = 'absent'; continue
               }
-              $buildOk = $true
-              foreach ($cfg in $j.C) {
-                  $conf, $plat = $cfg -split '\|', 2
-                  Write-Host "::group::$($j.N) [$cfg]"
-                  & msbuild $sln -nologo -verbosity:minimal -m `
-                      -p:Configuration="$conf" -p:Platform="$plat" 2>&1
-                  $code = $LASTEXITCODE
-                  Write-Host "::endgroup::"
-                  if ($code -ne 0) { Write-Warning "  [$($j.N)] $cfg -> code $code"; $buildOk = $false }
+          $buildOk = $true
+          foreach ($cfg in $j.C) {
+              $conf, $plat = $cfg -split '\|', 2
+              Write-Host "::group::$($j.N) [$cfg]"
+              # Sortie capturee au lieu d'etre envoyee directement au log : tout ce
+              # qui est ecrit entre ::group:: et ::endgroup:: est REPLIE par defaut
+              # dans l'UI GitHub. C'est pour ca qu'un echec de compilation
+              # n'affichait que "code 1" sans la moindre ligne d'erreur msbuild.
+              $out = & msbuild $sln -nologo -verbosity:minimal -m `
+                  -p:Configuration="$conf" -p:Platform="$plat" 2>&1 |
+                  ForEach-Object { "$_" }
+              $code = $LASTEXITCODE
+              $out | ForEach-Object { Write-Host $_ }
+              Write-Host '::endgroup::'
+              if ($code -ne 0) {
+                  $buildOk = $false
+                  Write-Warning "  [$($j.N)] $cfg -> code $code"
+                  # On rejoue les erreurs HORS du groupe : elles deviennent visibles
+                  # sans avoir a deplier quoi que ce soit, et remontent comme
+                  # annotations rouges dans l'UI.
+                  Write-Host "::error title=$($j.N) [$cfg]::compilation echouee (code $code)"
+                  $errs = $out | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
+                  if ($errs) { $errs | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
+                  else { $out | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
               }
-              $results[$j.N] = if ($buildOk) { 'compile' } else { 'partiel' }
+          }
+          $results[$j.N] = if ($buildOk) { 'compile' } else { 'partiel' }
           }
 
           # DotNetInterface : on construit DotNetInterface2.csproj (net40), PAS
@@ -582,10 +615,19 @@ jobs:
           $di = Join-Path $env:GITHUB_WORKSPACE 'Cheat Engine\DotNetInvasiveDataCollector\DotNetInterface2\DotNetInterface2.csproj'
           if (Test-Path $di) {
               Write-Host '::group::DotNetInterface [Release]'
-              & msbuild $di -nologo -verbosity:minimal -m -p:Configuration=Release `
-                  -p:TargetFrameworkRootPath='C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework' 2>&1
+              $outDI = & msbuild $di -nologo -verbosity:minimal -m -p:Configuration=Release `
+                  -p:TargetFrameworkRootPath='C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework' 2>&1 |
+                  ForEach-Object { "$_" }
+              $codeDI = $LASTEXITCODE
+              $outDI | ForEach-Object { Write-Host $_ }
               Write-Host '::endgroup::'
-              $results['DotNetInterface'] = if ($LASTEXITCODE -eq 0) { 'compile' } else { 'echec' }
+              $results['DotNetInterface'] = if ($codeDI -eq 0) { 'compile' } else { 'echec' }
+              if ($codeDI -ne 0) {
+                  Write-Host "::error title=DotNetInterface [Release]::compilation echouee (code $codeDI)"
+                  $e = $outDI | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
+                  if ($e) { $e | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
+                  else { $outDI | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
+              }
           }
 
           if ('${{ inputs.build_dbkernel }}' -eq 'true') {
@@ -612,17 +654,44 @@ jobs:
                   #    TOBESIGNED active SecurityCheck(), une auto-verification
                   #    de signature qui refuserait de fonctionner sur un
                   #    pilote non signe.
+                  $dbkOk = $true
                   foreach ($plat in @('x64', 'x86')) {
                       Write-Host "::group::DBKKernel [Release without sig|$plat]"
-                      & msbuild $dbk -nologo -verbosity:minimal -m -p:"Configuration=Release without sig" -p:Platform=$plat 2>&1
+                      $outK = & msbuild $dbk -nologo -verbosity:minimal -m -p:"Configuration=Release without sig" -p:Platform=$plat 2>&1 |
+                          ForEach-Object { "$_" }
+                      $code = $LASTEXITCODE
+                      $outK | ForEach-Object { Write-Host $_ }
                       Write-Host '::endgroup::'
+                      if ($code -ne 0) {
+                          $dbkOk = $false
+                          Write-Warning "  [DBKKernel] $plat -> code $code"
+                          Write-Host "::error title=DBKKernel [$plat]::compilation echouee (code $code)"
+                          $e = $outK | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
+                          if ($e) { $e | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
+                          else { $outK | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
+                      }
                   }
-                  $results['DBKKernel'] = 'compile'
+                  # Avant : 'compile' etait pose sans condition, ce qui masquait
+                  # un echec reel. Le code de sortie du dernier msbuild restait
+                  # dans $LASTEXITCODE et faisait echouer toute l'etape.
+                  $results['DBKKernel'] = if ($dbkOk) { 'compile' } else { 'partiel' }
               }
           }
 
           $results.GetEnumerator() | ForEach-Object { Write-Host ("{0,-22} {1}" -f $_.Key, $_.Value) }
           ($results | Out-String) | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'native_deps.txt') -Encoding utf8
+
+          # Une dependance qui ne compile pas est un AVERTISSEMENT, pas une
+          # erreur fatale : la gate reelle est l'etape "Verify expected
+          # outputs", pilotee par inputs.fail_on_missing_deps.
+          # Sans ce "exit 0" explicite, le wrapper pwsh de GitHub Actions
+          # termine le script par "if (Test-Path variable:\LASTEXITCODE) { exit
+          # $LASTEXITCODE }" : le code du dernier msbuild appele remontait donc
+          # comme code de sortie de l'etape, meme quand tout le reste avait
+          # reussi. C'est exactement ce qui produisait
+          # "Process completed with exit code 1" apres un MonoDataCollector
+          # simplement marque "partiel".
+          exit 0
 
       # Hooks D3D : d3dx9.h / d3dx10.h / d3dx11.h n'existent QUE dans le
       # DirectX SDK June 2010 (retires du Windows SDK). Optionnel : les DLL
