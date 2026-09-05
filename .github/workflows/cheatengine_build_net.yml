@@ -41,6 +41,11 @@ on:
         required: false
         default: true
         type: boolean
+      require_i386:
+        description: 'Exiger le cross-compiler i386-win32 (donc les builds 32 bits). Echoue si aucun miroir ne repond.'
+        required: false
+        default: true
+        type: boolean
       build_native_deps:
         description: "Dependances C++/.NET (DotNetDataCollector, Mono, CSCompiler, tcc...)"
         required: false
@@ -192,9 +197,21 @@ jobs:
 
           $installer = "lazarus-$lazVer-fpc-$fpcVer-cross-i386-win32-win64.exe"
           $dest = Join-Path $env:RUNNER_TEMP $installer
+          # Miroirs multiplies : SourceForge sert frequemment une page HTML
+          # d'interstitial aux IP de datacenter (runner GitHub inclus) au lieu du
+          # fichier. Le controle du magic MZ dans Get-Installer la detecte, mais il
+          # faut ensuite un miroir qui reponde vraiment. Les hotes *.dl.sourceforge.net
+          # sont les plus fiables depuis un runner.
+          $sfBase = "https://downloads.sourceforge.net/project/lazarus/$base"
           $mirrors = @(
-              "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$installer",
-              "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2064%20bits/Lazarus%20$lazVer/$installer/download",
+              $sfBase,
+              "https://master.dl.sourceforge.net/project/lazarus/$base?viasf=1",
+              "https://psychz.dl.sourceforge.net/project/lazarus/$base",
+              "https://netcologne.dl.sourceforge.net/project/lazarus/$base",
+              "https://gigenet.dl.sourceforge.net/project/lazarus/$base",
+              "https://kumisystems.dl.sourceforge.net/project/lazarus/$base",
+              "https://cfhcable.dl.sourceforge.net/project/lazarus/$base",
+              "https://sourceforge.net/projects/lazarus/files/$base/download",
               "https://freepascal.dfmk.hu/pub/lazarus/releases/$installer"
           )
 
@@ -229,7 +246,16 @@ jobs:
           }
 
           if (-not (Get-Installer -Urls $mirrors -OutFile $dest)) {
-              Write-Warning 'Cross-compiler i386 indisponible : les cibles 32 bits seront absentes.'
+              # Avant : "exit 0" silencieux. HAVE_PPC386 n'etait alors jamais
+              # ecrit dans GITHUB_ENV, le resume affichait "cross-i386" VIDE
+              # (ni true ni false), et toutes les cibles 32 bits etaient
+              # sautees sans qu'aucune etape n'echoue. C'etait exactement le
+              # symptome observe.
+              'HAVE_PPC386=false' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              if ('${{ inputs.require_i386 }}' -eq 'true') {
+                  throw "Cross-compiler i386-win32 introuvable sur $($mirrors.Count) miroirs. Les cibles 32 bits sont demandees (require_i386=true) : echec volontaire. Relancez le job, ou passez require_i386=false pour un build 64 bits seul."
+              }
+              Write-Warning 'Cross-compiler i386 indisponible : build 64 bits seul (require_i386=false).'
               exit 0
           }
 
