@@ -516,22 +516,30 @@ jobs:
         shell: pwsh
         run: |
           # Projet | modes exacts | produit par le mode
+          # M   = modes constructibles sans cross-compiler (hote x86_64).
+          # M32 = modes 32 bits : ne sont tentes QUE si HAVE_PPC386 est vrai.
+          #       Sans cette garde, lazbuild echouait en code 2 sur chacune
+          #       des 10 cibles 32 bits quand le cross-compiler etait absent.
+          # Les projets dont le TargetCPU par defaut est i386 dans le .lpi
+          # (verifie un par un) n'ont AUCUN mode hote : tout va dans M32.
           $projects = @(
-              @{ P = 'VEHDebug\vehdebug.lpi';                        M = @('release 32', 'release 64') },
-              @{ P = 'speedhack\speedhack.lpi';                      M = @('32-bit', '64-bit') },
-              @{ P = 'luaclient\luaclient.lpi';                      M = @('Release 32', 'Release 64') },
-              @{ P = 'allochook\allochook.lpi';                      M = @('32', '64') },
-              @{ P = 'winhook\winhook.lpi';                          M = @('Release 32', 'Release 64') },
-              @{ P = 'Tutorial\tutorial.lpi';                        M = @('release 32-Bit', 'release 64-Bit') },
+              @{ P = 'VEHDebug\vehdebug.lpi';                        M = @('release 64'); M32 = @('release 32') },
+              @{ P = 'speedhack\speedhack.lpi';                      M = @('64-bit');     M32 = @('32-bit') },
+              @{ P = 'luaclient\luaclient.lpi';                      M = @('Release 64'); M32 = @('Release 32') },
+              @{ P = 'allochook\allochook.lpi';                      M = @('64');         M32 = @('32') },
+              @{ P = 'winhook\winhook.lpi';                          M = @('Release 64'); M32 = @('Release 32') },
+              @{ P = 'Tutorial\tutorial.lpi';                        M = @('release 64-Bit'); M32 = @('release 32-Bit') },
               # gtutorial-*.exe est lance par MainUnit.pas et Unit10.pas
-              @{ P = 'Tutorial\graphical\project1.lpi';              M = @('Release 32', 'Release 64') },
-              @{ P = 'launcher\cheatengine.lpi';                     M = @('release', 'release rtmod') },
-              @{ P = 'ceregreset\ceregreset.lpi';                    M = @('Release', 'Release runtime mod') },
-              @{ P = 'windowsrepair\windowsrepair.lpi';              M = @('Release') },
+              @{ P = 'Tutorial\graphical\project1.lpi';              M = @('Release 64'); M32 = @('Release 32') },
+              # --- projets entierement i386 (TargetCPU par defaut = i386) ---
+              @{ P = 'launcher\cheatengine.lpi';                     M = @(); M32 = @('release', 'release rtmod') },
+              @{ P = 'ceregreset\ceregreset.lpi';                    M = @(); M32 = @('Release', 'Release runtime mod') },
+              @{ P = 'windowsrepair\windowsrepair.lpi';              M = @(); M32 = @('Release') },
+              @{ P = 'sfx\level2\standalonephase2.lpi';              M = @(); M32 = @('Release') },
+              @{ P = 'dbk32\Kernelmodule unloader\Kernelmoduleunloader.lpi'; M = @(); M32 = @('default') },
+              # --- projets hote (x86_64) : toujours constructibles ---
               @{ P = 'cepack\cepack.lpi';                            M = @('Default') },
-              @{ P = 'sfx\level2\standalonephase2.lpi';              M = @('Release') },
               @{ P = 'xmplayer\xmplayer.lpi';                        M = @('Default') },
-              @{ P = 'dbk32\Kernelmodule unloader\Kernelmoduleunloader.lpi'; M = @('default') },
               @{ P = 'plugin\example\exampleplugin.lpi';             M = @('Default') },
               @{ P = 'plugin\DebugEventLog\src\DebugEventLog.lpi';   M = @('Default') }
           )
@@ -540,7 +548,10 @@ jobs:
           foreach ($e in $projects) {
               $proj = Join-Path $env:CE_DIR $e.P
               if (-not (Test-Path $proj)) { Write-Warning "absent : $($e.P)"; continue }
-              foreach ($m in $e.M) {
+              $modes = @($e.M)
+              if ($env:HAVE_PPC386 -eq 'true') { $modes += @($e.M32) }
+              elseif ($e.M32) { Write-Host "  32 bits ignores (pas de cross-compiler) : $($e.P)" }
+              foreach ($m in $modes) {
                   Write-Host "::group::$($e.P) [$m]"
                   $outL = & lazbuild --build-mode="$m" --no-write-project --max-process-count=4 $proj 2>&1 |
                       ForEach-Object { "$_" }
@@ -559,6 +570,19 @@ jobs:
                   }
               }
           }
+          # project1.lpi declare <Filename Value="gtutorial-$(TargetCPU)"/>
+          # SANS prefixe de dossier : contrairement aux autres sous-projets
+          # (qui ecrivent dans ..\bin\), il pose son executable dans son
+          # propre repertoire. Verifie dans le .lpi. Sans cette copie,
+          # gtutorial-x86_64.exe n'arriverait jamais dans bin/ alors meme
+          # que la compilation reussit.
+          $gtut = Join-Path $env:CE_DIR 'Tutorial\graphical'
+          Get-ChildItem -Path $gtut -Filter 'gtutorial-*' -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                  Copy-Item $_.FullName -Destination (Join-Path $env:BIN_DIR $_.Name) -Force
+                  Write-Host "  copie vers bin : $($_.Name)"
+              }
+
           Write-Host ""
           Write-Host "Sous-projets OK   : $($ok.Count)"
           $ok | ForEach-Object { Write-Host "  + $_" }
