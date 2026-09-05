@@ -742,17 +742,33 @@ jobs:
                   #    Passer -p:Platform=Win32 a msbuild sur le .sln echoue
                   #    donc (MSB4126 : solution configuration invalide).
                   #
-                  # 2) La configuration "Release" porte un PostBuildEvent qui
-                  #    appelle signtool.exe avec
-                  #      release\sig\GlobalSign Root CA.crt
-                  #    Ce certificat n'est pas dans le depot, la compilation
-                  #    echouerait en post-build. On utilise "Release without
-                  #    sig", qui produit exactement les memes binaires
-                  #    (TargetName DBK32 / DBK64, OutDir ..\Cheat Engine\bin\)
-                  #    sans definir TOBESIGNED. C'est aussi plus coherent :
-                  #    TOBESIGNED active SecurityCheck(), une auto-verification
-                  #    de signature qui refuserait de fonctionner sur un
-                  #    pilote non signe.
+                  # 2) LE POST-BUILD DE SIGNATURE EST PRESENT DANS LES DEUX
+                  #    CONFIGURATIONS x64. Une version anterieure de ce
+                  #    commentaire affirmait que "Release without sig" ne
+                  #    signait pas : C'ETAIT FAUX. Verifie dans
+                  #    DBKKernel.vcxproj : "Release|x64" ET
+                  #    "Release without sig|x64" portent toutes deux un
+                  #    <PostBuildEvent> qui appelle
+                  #      "$(WDKBinRoot_x64)\signtool.exe" sign /a /ac
+                  #        "$(TargetDir)..\release\sig\GlobalSign Root CA.crt"
+                  #    et aucun .crt n'existe dans le depot (le dossier
+                  #    release/ est absent, dbk64.ddf aussi).
+                  #    Aggravant : le PropertyGroup "Release without sig|x64"
+                  #    pose
+                  #      <PostBuildEventUseInBuild>true</PostBuildEventUseInBuild>
+                  #    ce qui execute ce post-build PENDANT le build. signtool
+                  #    echoue, msbuild sort non nul, et DBK64.sys n'arrivait
+                  #    jamais dans bin/ - alors que le .sys, lui, etait
+                  #    compile et lie.
+                  #    Correctif : -p:PostBuildEventUseInBuild=false. C'est
+                  #    une propriete GLOBALE, elle prime sur le PropertyGroup
+                  #    du projet, et on ne modifie pas la source amont.
+                  #    On garde "Release without sig" pour le reste : elle ne
+                  #    definit pas TOBESIGNED, et TOBESIGNED active
+                  #    SecurityCheck(), une auto-verification de signature qui
+                  #    refuserait de tourner sur un pilote non signe.
+                  #    Le pilote reste non signe : il ne se chargera que sur
+                  #    un systeme en mode test (bcdedit /set testsigning on).
                   $dbkOk = $true
                   # x64 SEULEMENT. Le WDK 22H2 et suivants bloquent explicitement
                   # x86 pour les pilotes noyau :
@@ -765,7 +781,11 @@ jobs:
                   # build CI. DBK32.sys est donc hors de portee ici.
                   foreach ($plat in @('x64')) {
                       Write-Host "::group::DBKKernel [Release without sig|$plat]"
-                      $outK = & msbuild $dbk -nologo -verbosity:minimal -m -p:"Configuration=Release without sig" -p:Platform=$plat 2>&1 |
+                      # -p:PostBuildEventUseInBuild=false : desactive le
+                      # post-build de signature (commentaire 2). Sans lui,
+                      # signtool echoue sur le certificat absent et msbuild
+                      # sort non nul alors que le .sys est compile et lie.
+                      $outK = & msbuild $dbk -nologo -verbosity:minimal -m -p:"Configuration=Release without sig" -p:Platform=$plat -p:PostBuildEventUseInBuild=false 2>&1 |
                           ForEach-Object { "$_" }
                       $code = $LASTEXITCODE
                       $outK | ForEach-Object { Write-Host $_ }
@@ -777,6 +797,19 @@ jobs:
                           $e = $outK | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
                           if ($e) { $e | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
                           else { $outK | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
+                      }
+                  }
+                  # Filet : OutDir vaut "..\Cheat Engine\bin\". Si le WDK
+                  # deposait neanmoins le .sys ailleurs, on irait le chercher
+                  # plutot que de laisser "Verify expected outputs" echouer
+                  # sur un pilote qui a pourtant ete compile.
+                  if (-not (Test-Path (Join-Path $env:BIN_DIR 'DBK64.sys'))) {
+                      $found = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter 'DBK64.sys' -ErrorAction SilentlyContinue |
+                          Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                      if ($found) {
+                          Copy-Item $found.FullName -Destination (Join-Path $env:BIN_DIR 'DBK64.sys') -Force
+                          Write-Host "DBK64.sys retrouve dans $($found.FullName) et copie dans bin/"
+                          $dbkOk = $true
                       }
                   }
                   # Avant : 'compile' etait pose sans condition, ce qui masquait
@@ -837,33 +870,80 @@ jobs:
           # sont deja versionnes dans "Cheat Engine/bin/" (verifie dans le
           # depot). Un echec ici ne casse donc rien : on le signale sans
           # jamais faire echouer le job.
+          # ANCIEN CODE, TROIS DEFAUTS VERIFIES :
+          #
+          # 1) Les arguments -p:IncludePath / -p:LibraryPath etaient places
+          #    APRES des lignes de commentaire inserees DANS une continuation
+          #    par backtick. En PowerShell, un "#" apres un backtick de
+          #    continuation TERMINE l'instruction : msbuild ne recevait que
+          #    9 arguments (solution, -nologo, -verbosity, -m, Configuration,
+          #    Platform) et JAMAIS les chemins DXSDK. Le residu "-p:" etait
+          #    ensuite reparsé comme une nouvelle instruction -> "-p: n'est
+          #    pas reconnu", erreur NON terminante sous
+          #    $ErrorActionPreference='Continue', donc silencieuse.
+          #    C'est exactement le symptome observe : C1083 sur d3dx9/10/11.h
+          #    alors que tous les en-tetes systeme se resolaient tres bien.
+          #
+          # 2) -p:IncludePath="...$(IncludePath)" ne pouvait pas fonctionner
+          #    de toute facon : une propriete passee en ligne de commande est
+          #    une propriete GLOBALE, evaluee avant le projet ; $(IncludePath)
+          #    y est donc vide. La valeur aurait ECRASE le chemin standard au
+          #    lieu de s'y ajouter (on ne peut pas s'auto-referencer en -p:).
+          #
+          # 3) "$dx\Lib\$plat" n'existe pas : le SDK DirectX de juin 2010 range
+          #    ses librairies dans Lib\x86 et Lib\x64. Il n'y a pas de
+          #    Lib\Win32 -> LNK1104 sur d3dx9.lib meme une fois 1) corrige.
+          #
+          # On passe desormais par les variables d'environnement INCLUDE et
+          # LIB, que cl.exe et link.exe lisent directement, et que la tache
+          # SetEnv de MSBuild PREfixe (Prefix="true") au lieu de les ecraser.
+          # Aucun commentaire n'est place dans une continuation de commande.
           $dxOk = $true
-          if (-not (Test-Path $sln)) {
+          if (-not (Test-Path "$dx\Include\d3dx9.h")) {
+              Write-Warning "En-tetes DirectX absents ($dx\Include\d3dx9.h) : hooks D3D non compiles. Les 8 DLL precompilees de bin/ seront utilisees."
+              $dxOk = $false
+          }
+          elseif (-not (Test-Path $sln)) {
               Write-Warning "Solution introuvable : $sln - les DLL precompilees de bin/ seront utilisees"
+              $dxOk = $false
           }
           else {
-          foreach ($plat in @('Win32', 'x64')) {
-              Write-Host "::group::Direct x mess [Release|$plat]"
-              $outDX = & msbuild $sln -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat `
-                  # MSBuild interprete ";" comme separateur de liste : passe tel
-                  # quel il declenchait MSB1006 "Property is not valid".
-                  # L'echappement canonique d'un point-virgule dans une valeur de
-                  # propriete msbuild est %3B.
-                  -p:IncludePath="$dx\Include%3B`$(IncludePath)" `
-                  -p:LibraryPath="$dx\Lib\$plat%3B`$(LibraryPath)" 2>&1 |
-                  ForEach-Object { "$_" }
-              $codeDX = $LASTEXITCODE
-              $outDX | ForEach-Object { Write-Host $_ }
-              Write-Host '::endgroup::'
-              if ($codeDX -ne 0) {
-                  $dxOk = $false
-                  Write-Warning "  [Direct x mess] $plat -> code $codeDX"
-                  Write-Host "::error title=Direct x mess [$plat]::compilation echouee (code $codeDX) - les DLL precompilees de bin/ restent utilisables"
-                  $e = $outDX | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
-                  if ($e) { $e | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
-                  else { $outDX | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
+              $env:DXSDK_DIR = "$dx\"
+              $env:INCLUDE = "$dx\Include;$env:INCLUDE"
+              # LIB varie selon la plateforme : on memorise la valeur de base
+              # pour la restaurer a chaque tour. Sans cela le dossier x86 du
+              # premier tour restait prependu au tour x64, et link.exe pouvait
+              # aller chercher une d3dx9.lib 32 bits dans un build 64 bits.
+              $baseLib = $env:LIB
+              Write-Host "DXSDK_DIR = $env:DXSDK_DIR"
+              Write-Host "INCLUDE   prependu de : $dx\Include"
+              foreach ($plat in @('Win32', 'x64')) {
+                  $libName = if ($plat -eq 'Win32') { 'x86' } else { $plat }
+                  $libDir = Join-Path $dx "Lib\$libName"
+                  if (-not (Test-Path $libDir)) {
+                      Write-Warning "  [$plat] $libDir absent,essai de Lib\$plat"
+                      $libDir = Join-Path $dx "Lib\$plat"
+                  }
+                  if (-not (Test-Path $libDir)) {
+                      Write-Warning "  [$plat] aucun dossier de librairies DirectX trouve sous $dx\Lib : LNK1104 probable sur d3dx9.lib"
+                  }
+                  $env:LIB = "$libDir;$baseLib"
+                  Write-Host "  [$plat] LIB prependu de : $libDir"
+                  Write-Host "::group::Direct x mess [Release|$plat]"
+                  $outDX = & msbuild $sln -nologo -verbosity:minimal -m -p:Configuration=Release -p:Platform=$plat 2>&1 |
+                      ForEach-Object { "$_" }
+                  $codeDX = $LASTEXITCODE
+                  $outDX | ForEach-Object { Write-Host $_ }
+                  Write-Host '::endgroup::'
+                  if ($codeDX -ne 0) {
+                      $dxOk = $false
+                      Write-Warning "  [Direct x mess] $plat -> code $codeDX"
+                      Write-Host "::error title=Direct x mess [$plat]::compilation echouee (code $codeDX) - les DLL precompilees de bin/ restent utilisables"
+                      $e = $outDX | Where-Object { $_ -match ': error |: fatal error |error MSB|error LNK' }
+                      if ($e) { $e | Select-Object -Last 40 | ForEach-Object { Write-Host "    $_" } }
+                      else { $outDX | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" } }
+                  }
               }
-          }
           }
           if ($dxOk) { Write-Host 'Hooks D3D : OK' }
           else { Write-Host 'Hooks D3D : echec non bloquant (artefacts precompiles presents dans bin/)' }
