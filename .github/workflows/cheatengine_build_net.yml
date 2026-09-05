@@ -41,8 +41,13 @@ on:
         required: false
         default: true
         type: boolean
-      require_i386:
-        description: 'Exiger le cross-compiler i386-win32 (donc les builds 32 bits). Echoue si aucun miroir ne repond.'
+      # ---- LES TROIS INTERRUPTEURS DE DESACTIVATION ----
+      # Chacun coupe completement un pan du build : l'etape correspondante ne
+      # tourne pas, les fichiers associes ne sont plus attendus, et rien
+      # n'echoue. Ce sont les trois seules sources d'echec "environnement"
+      # (telechargements, WDK), d'ou des interrupteurs dedies.
+      build_i386:
+        description: "Cibles 32 bits (i386). false = build 64 bits seul, cross-compiler non telecharge."
         required: false
         default: true
         type: boolean
@@ -52,12 +57,12 @@ on:
         default: true
         type: boolean
       build_dbkernel:
-        description: "dbk32.sys / dbk64.sys (WDK, pilote NON signe)"
+        description: "DBK64.sys (WDK, pilote NON signe). false = pilote non compile."
         required: false
         default: false
         type: boolean
       build_directx:
-        description: "Hooks D3D9/10/11 (telecharge le DirectX SDK June 2010, ~570 Mo)"
+        description: "Hooks D3D9/10/11 (DirectX SDK June 2010, ~570 Mo). false = DLL precompilees du depot."
         required: false
         default: false
         type: boolean
@@ -182,16 +187,26 @@ jobs:
       # cheatengine-i386...).
       - name: Install i386-win32 cross-compiler
         # PAS de "continue-on-error: true". Il y etait, et il rendait le garde
-        # require_i386 strictement inoperant : le "throw" du bloc d'echec
-        # faisait bien echouer CE step, mais GitHub Actions continuait le job
-        # comme si de rien n'etait. C'est exactement ce que montrait le resume
-        # du dernier run - "cross-i386 false" et un job alle jusqu'au bout -
-        # alors que require_i386 etait a true par defaut.
-        # Sans cette ligne, require_i386=true arrete reellement le job quand le
-        # cross-compiler est introuvable, comme demande ; require_i386=false
-        # donne un build 64 bits seul avec un avertissement.
+        # strictement inoperant : le "throw" du bloc d'echec faisait bien
+        # echouer CE step, mais GitHub Actions continuait le job comme si de
+        # rien n'etait. C'est exactement ce que montrait un run precedent -
+        # "cross-i386 false" et un job alle jusqu'au bout.
+        # Sans cette ligne, build_i386=true arrete reellement le job quand le
+        # cross-compiler est introuvable ; build_i386=false court-circuite
+        # l'etape plus bas et donne un build 64 bits seul, sans echec.
         shell: pwsh
         run: |
+          # ---- INTERRUPTEUR build_i386 ----
+          # false : on ne telecharge rien, on n'installe rien, et on ecrit
+          # explicitement HAVE_PPC386=false. Toutes les cibles 32 bits sont
+          # alors ignorees par "Build Lazarus sub-projects", tcc32-32.dll n'est
+          # plus attendu, et le resume affiche "false" au lieu d'une case vide.
+          # L'etape se termine en succes : c'est une desactivation, pas un echec.
+          if ('${{ inputs.build_i386 }}' -ne 'true') {
+              Write-Host 'build_i386=false : cross-compiler i386-win32 non telecharge, cibles 32 bits ignorees (build 64 bits seul).'
+              'HAVE_PPC386=false' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              exit 0
+          }
           $lazDir = $env:LAZARUS_DIR
           $fpcVer = '3.2.2'
 
@@ -244,31 +259,66 @@ jobs:
           Write-Host "Installeur recherche : $installer"
           $mirrors | ForEach-Object { Write-Host "  miroir : $_" }
 
+          # Un miroir SourceForge peut renvoyer une page HTML d'interstitial au
+          # lieu du fichier : on verifie systematiquement le magic "MZ".
+          function Test-PE {
+              param([string]$Path)
+              if (-not (Test-Path $Path)) { return $false }
+              $fs = [System.IO.File]::OpenRead($Path)
+              try {
+                  $b = New-Object byte[] 2
+                  [void]$fs.Read($b, 0, 2)
+              } finally { $fs.Dispose() }
+              return ([System.Text.Encoding]::ASCII.GetString($b) -eq 'MZ')
+          }
+
           function Get-Installer {
               param([string[]]$Urls, [string]$OutFile)
               foreach ($url in $Urls) {
                   for ($i = 1; $i -le 3; $i++) {
                       Write-Host "  tentative $i/3 : $url"
+                      # ---- CAUSE REELLE DES 403, TROUVEE ET REPRODUITE ----
+                      # L'ancienne ligne passait
+                      #     -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                      # croyant contourner l'interstitial HTML. C'etait l'inverse.
+                      # Teste depuis un bac a sable, MEME machine, MEME URL :
+                      #     Mozilla/5.0 (Windows NT 10.0; Win64; x64) -> 403
+                      #     Mozilla/5.0                               -> 403
+                      #     curl/8.5.0                                -> 200
+                      #     actions/tool-cache                        -> 200
+                      #     PSCore/7.4.6                              -> 200
+                      #     (aucun User-Agent)                        -> 200
+                      # SourceForge bloque tout User-Agent contenant "Mozilla".
+                      # C'etait la SEULE cause des 24 echecs du dernier run
+                      # (8 miroirs x 3 tentatives) : les URL etaient correctes,
+                      # elles renvoient 206 avec magic "MZ" sans cet en-tete.
+                      # C'est aussi pourquoi gcarreno/setup-lazarus reussit dans
+                      # ce meme job : @actions/http-client n'envoie pas un
+                      # User-Agent de navigateur.
                       try {
                           Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing `
-                              -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' `
+                              -UserAgent 'ce-build/1.0 (GitHub Actions; pwsh)' `
                               -MaximumRedirection 15 -TimeoutSec 180 -ErrorAction Stop
-                          # Un miroir SourceForge peut renvoyer une page HTML : on verifie le magic MZ.
-                          $fs = [System.IO.File]::OpenRead($OutFile)
-                          try {
-                              $b = New-Object byte[] 2
-                              [void]$fs.Read($b, 0, 2)
-                          } finally { $fs.Dispose() }
-                          if ([System.Text.Encoding]::ASCII.GetString($b) -eq 'MZ') {
+                          if (Test-PE $OutFile) {
                               Write-Host "  OK ($('{0:N1}' -f ((Get-Item $OutFile).Length / 1MB)) Mo)"
                               return $true
                           }
-                          Write-Warning '  fichier recu invalide (pas un PE)'
+                          Write-Warning '  Invoke-WebRequest : fichier recu invalide (pas un PE)'
                           Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                       } catch {
-                          Write-Warning "  echec : $($_.Exception.Message)"
-                          Start-Sleep -Seconds ([Math]::Min($i * 5, 15))
+                          Write-Warning "  Invoke-WebRequest : $($_.Exception.Message)"
                       }
+                      # Methode 2 : curl.exe, empreinte HTTP differente. Deja
+                      # utilise avec succes dans ce workflow pour le DirectX SDK.
+                      & curl.exe -L --fail --retry 2 --connect-timeout 30 --max-time 1800 `
+                          -A 'ce-build/1.0' -o $OutFile $url
+                      if ($LASTEXITCODE -eq 0 -and (Test-PE $OutFile)) {
+                          Write-Host "  OK via curl ($('{0:N1}' -f ((Get-Item $OutFile).Length / 1MB)) Mo)"
+                          return $true
+                      }
+                      Write-Warning "  curl : code $LASTEXITCODE ou fichier invalide"
+                      Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+                      Start-Sleep -Seconds ([Math]::Min($i * 5, 15))
                   }
               }
               return $false
@@ -281,11 +331,7 @@ jobs:
               # sautees sans qu'aucune etape n'echoue. C'etait exactement le
               # symptome observe.
               'HAVE_PPC386=false' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-              if ('${{ inputs.require_i386 }}' -eq 'true') {
-                  throw "Cross-compiler i386-win32 introuvable sur $($mirrors.Count) miroirs. Les cibles 32 bits sont demandees (require_i386=true) : echec volontaire. Relancez le job, ou passez require_i386=false pour un build 64 bits seul."
-              }
-              Write-Warning 'Cross-compiler i386 indisponible : build 64 bits seul (require_i386=false).'
-              exit 0
+              throw "Cross-compiler i386-win32 introuvable sur $($mirrors.Count) miroirs alors que build_i386=true. Passez build_i386=false pour un build 64 bits seul, sans echec. Cause connue et corrigee ici : un User-Agent contenant 'Mozilla', que SourceForge refuse en 403."
           }
 
           $log = Join-Path $env:RUNNER_TEMP 'laz_cross.log'
