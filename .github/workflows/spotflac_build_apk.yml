@@ -73,55 +73,55 @@ jobs:
           fi
           echo "No prebuilt APK/AAR/SO in the cloned tree."
 
-      - name: Disable auto-update and prebuilt APK installer
-        run: |
-          set -euo pipefail
-          python3 << 'PY'
-          from pathlib import Path
+      #- name: Disable auto-update and prebuilt APK installer
+        #run: |
+         # set -euo pipefail
+          #python3 << 'PY'
+         # from pathlib import Path
 
-          def patch(path, old, new, label):
-              p = Path(path)
-              if not p.exists():
-                  raise SystemExit(f"missing {path}")
-              text = p.read_text()
-              if old not in text:
-                  raise SystemExit(f"{label}: pattern not found, aborting")
-              p.write_text(text.replace(old, new, 1))
+          #def patch(path, old, new, label):
+           #   p = Path(path)
+            #  if not p.exists():
+             #     raise SystemExit(f"missing {path}")
+              #text = p.read_text()
+             # if old not in text:
+              #    raise SystemExit(f"{label}: pattern not found, aborting")
+              #p.write_text(text.replace(old, new, 1))
 
-          patch(
-              "lib/services/update_checker.dart",
-              "static Future<UpdateInfo?> checkForUpdate({String channel = 'stable'}) async {",
-              "static Future<UpdateInfo?> checkForUpdate({String channel = 'stable'}) async {\n    return null;",
-              "update_checker.dart",
-          )
-          patch(
-              "lib/services/apk_downloader.dart",
-              "ProgressCallback? onProgress,\n  }) async {",
-              "ProgressCallback? onProgress,\n  }) async {\n    return null;",
-              "apk_downloader.dart",
-          )
-          patch(
-              "lib/models/settings.dart",
-              "this.checkForUpdates = true,",
-              "this.checkForUpdates = false,",
-              "settings.dart",
-          )
-          g = Path("lib/models/settings.g.dart")
-          if g.exists():
-              gt = g.read_text()
-              g.write_text(gt.replace(
-                  "checkForUpdates: json['checkForUpdates'] as bool? ?? true,",
-                  "checkForUpdates: json['checkForUpdates'] as bool? ?? false,",
-                  1,
-              ))
-          patch(
-              "android/app/src/main/AndroidManifest.xml",
-              '<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />',
-              '<!-- REQUEST_INSTALL_PACKAGES removed in source-build -->',
-              "AndroidManifest.xml",
-          )
-          print("Update checker, APK downloader, defaults, and install permission patched.")
-          PY
+          #patch(
+           #   "lib/services/update_checker.dart",
+            #  "static Future<UpdateInfo?> checkForUpdate({String channel = 'stable'}) async {",
+             # "static Future<UpdateInfo?> checkForUpdate({String channel = 'stable'}) async {\n    return null;",
+              #"update_checker.dart",
+          #)
+          #patch(
+           #   "lib/services/apk_downloader.dart",
+            #  "ProgressCallback? onProgress,\n  }) async {",
+             # "ProgressCallback? onProgress,\n  }) async {\n    return null;",
+             # "apk_downloader.dart",
+          #)
+          #patch(
+           #   "lib/models/settings.dart",
+            #  "this.checkForUpdates = true,",
+             # "this.checkForUpdates = false,",
+             # "settings.dart",
+          #)
+          #g = Path("lib/models/settings.g.dart")
+          #if g.exists():
+           #   gt = g.read_text()
+            #  g.write_text(gt.replace(
+             #     "checkForUpdates: json['checkForUpdates'] as bool? ?? true,",
+              #    "checkForUpdates: json['checkForUpdates'] as bool? ?? false,",
+               #   1,
+              #))
+          #patch(
+           #   "android/app/src/main/AndroidManifest.xml",
+           #   '<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />',
+           #   '<!-- REQUEST_INSTALL_PACKAGES removed in source-build -->',
+           #   "AndroidManifest.xml",
+          #)
+          #print("Update checker, APK downloader, defaults, and install permission patched.")
+          #PY
 
       - name: Setup Java
         uses: actions/setup-java@v5
