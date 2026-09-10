@@ -34,3 +34,556 @@
 ##      ANDROID_KEY_ALIAS         = spotiflac
 ##      ANDROID_KEY_PASSWORD      = YOUR_KEY_PASSWORD (same as store password if you kept the default)
 ##
+##    Pick passwords made of letters+digits only: Gradle's key.properties
+##    format needs escaping for backslashes/leading spaces.
+##
+## NOTE: "debug" builds use applicationId com.zarz.spotiflac.debug while
+## release uses com.zarz.spotiflac (same as upstream releases). Switching
+## between them, or installing your release over an upstream-signed one,
+## requires uninstalling the old app first (different signatures).
+##
+## Toolchain mirrors upstream release.yml + ci.yml:
+##   Flutter .fvmrc, Go go_backend/go.mod, Java 25, NDK 29.0.14206865
+## ─────────────────────────────────────────────────────────────────────────
+
+name: Build SpotiFLAC from source
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream git ref (branch, tag, or SHA). Example: main or v4.9.0"
+        required: true
+        default: "main"
+        type: string
+      build_type:
+        description: "APK variant (release = signed with your key)"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+      abis:
+        description: "Android ABIs to build"
+        required: true
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - arm32
+          - arm64,arm32
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    name: Compile APK from upstream source
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup || true
+          df -h
+
+      - name: Checkout upstream source (no fork)
+        uses: actions/checkout@v6
+        with:
+          repository: spotiflacapp/SpotiFLAC-Mobile
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Refuse prebuilt artifacts in the tree
+        run: |
+          set -euo pipefail
+          hits=$(find . -type f \( \
+            -name '*.apk' -o -name '*.aab' -o -name '*.ipa' -o \
+            -name '*.so' -o -name '*.aar' -o -name '*.dex' -o \
+            -name 'gobackend.aar' \
+          \) ! -path './.git/*' || true)
+          if [ -n "$hits" ]; then
+            echo "ERROR: prebuilt binaries present in source tree:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "No prebuilt APK/AAR/SO in the cloned tree."
+
+      - name: Neutralize in-app updater (refactor-proof, best-effort)
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          #!/usr/bin/env python3
+          """Refactor-proof neutralization of SpotiFLAC's in-app updater.
+
+          Design rules:
+            1. NEVER fail the build. Every goal is best-effort: a missing pattern is a
+               warning (and a row in the GitHub step summary), never an error.
+               Set STRICT=1 to make a missing `checkForUpdate` patch fatal.
+            2. Match by intent, not frozen strings: identifier names, line-level bool
+               sweeps, balanced-paren declaration detection. Signatures, parameters,
+               formatting and quotes may all drift without breaking this script.
+            3. Prefer build-time mechanisms over source edits: REQUEST_INSTALL_PACKAGES
+               is stripped by a manifest OVERLAY file (tools:node="remove") that the
+               manifest merger honors at build time -- a brand-new file upstream can
+               never conflict with.
+            4. Multiple independent layers: even if one goal reports MISSING after a
+               big upstream refactor, the others still neutralize the updater.
+          """
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          LIB = Path("lib")
+          rows = []
+
+          BODY_OPEN = re.compile(r"\s*(?:async\s*\*?|sync\s*\*?)?\s*\{")
+
+
+          def report(goal, status, detail=""):
+              rows.append((goal, status, detail))
+              icon = {"PATCHED": "[OK]  ", "SKIPPED": "[SKIP]", "MISSING": "[WARN]"}.get(status, "[?]   ")
+              print(f"{icon} {goal}: {status} {detail}".rstrip(), flush=True)
+
+
+          def iter_dart():
+              if LIB.exists():
+                  yield from sorted(LIB.rglob("*.dart"))
+
+
+          def find_and_short_circuit(ident, stmt, label, require_nullable=True, limit=4):
+              """Insert `stmt` as the first statement of every function named `ident`.
+
+              A match only counts when the balanced parameter list is followed by an
+              (optionally `async`) `{` -- i.e. a declaration with a body. Call sites
+              (`await Foo.ident(...)` etc.) are left untouched. With require_nullable,
+              the return type must end in `?` (e.g. `Future<UpdateInfo?>`); otherwise
+              early-returning null could break compilation, so we skip with a warning.
+              """
+              patched = already = type_blocked = 0
+              marker = "[source-build]"
+              for path in iter_dart():
+                  text = path.read_text(encoding="utf-8")
+                  out = []
+                  last = 0
+                  found = False
+                  for m in re.finditer(r"\b" + re.escape(ident) + r"\s*\(", text):
+                      if patched >= limit:
+                          break
+                      # End of the balanced parameter list (we start just after `(`,
+                      # so the initial depth is 1).
+                      j, depth, n = m.end(), 1, len(text)
+                      while j < n:
+                          c = text[j]
+                          if c == "(":
+                              depth += 1
+                          elif c == ")":
+                              depth -= 1
+                              if depth == 0:
+                                  break
+                          j += 1
+                      if j >= n or text[j] != ")":
+                          continue
+                      body = BODY_OPEN.match(text, j + 1)
+                      if not body:
+                          continue  # call site or bodyless declaration
+                      found = True
+                      insert_at = body.end()
+                      if marker in text[insert_at:insert_at + 160]:
+                          already += 1
+                          continue
+                      if require_nullable:
+                          # Nullable return type: `Future<UpdateInfo?>` / `String?`.
+                          # rstrip ends with `?` (plain) or `?>` (inside generics).
+                          prefix = text[max(0, m.start() - 200):m.start()].rstrip()
+                          if not (prefix.endswith("?") or prefix.endswith("?>")):
+                              type_blocked += 1
+                              print(f"  ! {path}: {ident}() no longer returns a nullable "
+                                    f"type -> left untouched to keep the build compilable",
+                                    flush=True)
+                              continue
+                      line_start = text.rfind("\n", 0, insert_at) + 1
+                      base_indent = re.match(r"[ \t]*", text[line_start:insert_at]).group(0)
+                      out.append(text[last:insert_at])
+                      out.append("\n" + base_indent + "  " + stmt)
+                      last = insert_at
+                      patched += 1
+                  if out:
+                      out.append(text[last:])
+                      path.write_text("".join(out), encoding="utf-8")
+              if patched:
+                  report(label, "PATCHED", f"{patched} declaration(s) short-circuited with `{stmt}`")
+              elif already:
+                  report(label, "SKIPPED", "already patched in a previous run")
+              elif type_blocked:
+                  report(label, "MISSING", f"{ident}() return type is no longer nullable -- review manually")
+              elif found:
+                  report(label, "MISSING", f"{ident}() found but signature unrecognized -- review manually")
+              else:
+                  report(label, "MISSING", f"no function named {ident}() found -- review manually")
+
+
+          FIELD_RE = re.compile(r"\b(checkForUpdates|checkForUpdate|autoUpdate|auto_update|updateCheck)\b")
+          FIELD = r"(checkForUpdates|autoUpdate|auto_update|updateCheck)"
+          # Only *anchored* forms are flipped, all gated on lines that name a field:
+          #   `field = true`      (constructor defaults)      -> `field = false`
+          #   `field: true`       (named arguments)           -> `field: false`
+          #   `... ?? true`       (json_serializable fallback)-> `... ?? false`
+          #   `defaultValue: true`(@JsonKey)                  -> `defaultValue: false`
+          # Comparisons (`== true`), ternaries (`? true :`) and lambdas (`=> true`)
+          # never match these anchored shapes, so real logic is left alone.
+          EQ_RE = re.compile(r"\b" + FIELD + r"(\s*)=\s*true\b")
+          KW_RE = re.compile(r"\b" + FIELD + r"(\s*):\s*true\b")
+          QQ_RE = re.compile(r"\?\?\s*true\b")
+          DV_RE = re.compile(r"\b(defaultValue\s*:\s*)true\b")
+
+
+          def flip_bool_defaults():
+              changed = []
+              fields_seen = False
+              for path in iter_dart():
+                  text = path.read_text(encoding="utf-8")
+                  lines = text.splitlines(keepends=True)
+                  mutated = False
+                  for i, line in enumerate(lines):
+                      if not FIELD_RE.search(line):
+                          continue
+                      fields_seen = True
+                      new = EQ_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}= false", line)
+                      new = KW_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}: false", new)
+                      new = QQ_RE.sub("?? false", new)
+                      new = DV_RE.sub(r"\1false", new)
+                      if new != line:
+                          lines[i] = new
+                          mutated = True
+                  if mutated:
+                      path.write_text("".join(lines), encoding="utf-8")
+                      changed.append(path.name)
+              if changed:
+                  report("settings default checkForUpdates=false", "PATCHED", ", ".join(changed))
+              elif fields_seen:
+                  report("settings default checkForUpdates=false", "SKIPPED",
+                         "field present but no `true` default left (already patched?)")
+              else:
+                  report("settings default checkForUpdates=false", "MISSING",
+                         "no checkForUpdates field found")
+
+
+          def patch_force_threshold():
+              pat = re.compile(r"(forceUpdateThreshold\s*=\s*)(\d+)")
+              done_re = re.compile(r"forceUpdateThreshold\s*=\s*2147483647\b")
+              hits = already = 0
+              for path in iter_dart():
+                  text = path.read_text(encoding="utf-8")
+                  if done_re.search(text):
+                      already += 1
+                      continue
+                  new = pat.sub(lambda m: m.group(1) + "2147483647", text)
+                  if new != text:
+                      path.write_text(new, encoding="utf-8")
+                      hits += 1
+              if hits:
+                  report("forced-update threshold (releasesBehind)", "PATCHED",
+                         f"{hits} file(s), threshold -> INT32_MAX")
+              elif already:
+                  report("forced-update threshold (releasesBehind)", "SKIPPED",
+                         "already INT32_MAX")
+              else:
+                  report("forced-update threshold (releasesBehind)", "MISSING",
+                         "forceUpdateThreshold not found")
+
+
+          PERM_LINE = ('<uses-permission android:name="android.permission.'
+                       'REQUEST_INSTALL_PACKAGES" tools:node="remove" />')
+          OVERLAY = (
+              '<?xml version="1.0" encoding="utf-8"?>\n'
+              '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+              '    xmlns:tools="http://schemas.android.com/tools">\n'
+              f"    {PERM_LINE}\n"
+              "</manifest>\n"
+          )
+
+
+          def strip_install_permission():
+              """Strip REQUEST_INSTALL_PACKAGES via manifest OVERLAY files, never by
+              editing upstream's manifest. The merger applies tools:node="remove" at
+              build time; a package that no longer requests APK installs cannot
+              silently side-load updates even if Dart logic ever regresses."""
+              made = 0
+              for flavor in ("release", "debug"):
+                  target = Path("android/app/src") / flavor / "AndroidManifest.xml"
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  if target.exists():
+                      t = target.read_text(encoding="utf-8")
+                      if ("android.permission.REQUEST_INSTALL_PACKAGES" in t
+                              and 'tools:node="remove"' in t):
+                          continue
+                      if "xmlns:tools" not in t:
+                          t = re.sub(r"<manifest\b",
+                                     '<manifest xmlns:tools="http://schemas.android.com/tools"',
+                                     t, count=1)
+                      t = re.sub(r"(<manifest\b[^>]*>)",
+                                 lambda m: m.group(1) + "\n    " + PERM_LINE, t, count=1)
+                      target.write_text(t, encoding="utf-8")
+                  else:
+                      target.write_text(OVERLAY, encoding="utf-8")
+                  made += 1
+              report("REQUEST_INSTALL_PACKAGES removed (manifest overlay)",
+                     "PATCHED" if made else "SKIPPED",
+                     "android/app/src/{release,debug}/AndroidManifest.xml, merged at build time")
+
+
+          def triage_dump():
+              interesting = [p for p in iter_dart()
+                             if re.search(r"update|upgrade|version", p.name, re.I)]
+              if not interesting:
+                  return
+              print("::group::Update-related files (manual triage list if a goal is MISSING)", flush=True)
+              for p in interesting:
+                  print(f"  {p}", flush=True)
+              print("::endgroup::", flush=True)
+
+
+          def main():
+              print("== SpotiFLAC source build: neutralizing the in-app updater (best-effort) ==", flush=True)
+              find_and_short_circuit(
+                  "checkForUpdate", "return null; // [source-build] updater disabled",
+                  "update check (checkForUpdate)")
+              find_and_short_circuit(
+                  "downloadApk", "return null; // [source-build] APK download disabled",
+                  "APK download (downloadApk)")
+              patch_force_threshold()
+              flip_bool_defaults()
+              strip_install_permission()
+              triage_dump()
+
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as fh:
+                      fh.write("### In-app updater neutralization (source build)\n\n")
+                      fh.write("| Goal | Status | Detail |\n|---|---|---|\n")
+                      for goal, status, detail in rows:
+                          fh.write(f"| {goal} | {status} | {detail} |\n")
+                      fh.write("\n`MISSING` rows are warnings, not failures: the upstream code "
+                               "probably moved. The other layers still apply; check the triage "
+                               "list in the build log.\n")
+
+              if os.environ.get("STRICT", "") == "1":
+                  critical = [r for r in rows if r[1] == "MISSING" and "checkForUpdate" in r[0]]
+                  if critical:
+                      print("::error::STRICT=1: the critical updater patch did not apply", flush=True)
+                      sys.exit(1)
+              print("== Done. Patching is best-effort; the build proceeds regardless. ==", flush=True)
+
+
+          main()
+          PY
+          echo
+          echo "Files touched by the patcher:"
+          git status --short
+
+      - name: Restore signing keystore from secrets
+        if: inputs.build_type == 'release'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASS" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "::error::build_type=release needs repository secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD (see the header of this workflow)."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/spotiflac-release.jks"
+          # Fail fast (before a 30 min build) if keystore/password/alias mismatch.
+          keytool -list -keystore "$RUNNER_TEMP/spotiflac-release.jks" \
+            -storepass "$KEYSTORE_PASS" -alias "$KEY_ALIAS" > /dev/null
+          echo "Keystore decoded; alias '${KEY_ALIAS}' verified. Fingerprint:"
+          keytool -list -v -keystore "$RUNNER_TEMP/spotiflac-release.jks" \
+            -storepass "$KEYSTORE_PASS" -alias "$KEY_ALIAS" \
+            | grep -E 'SHA1:|SHA256:' || true
+
+      - name: Write android/key.properties (auto-detected by upstream build.gradle.kts)
+        if: inputs.build_type == 'release'
+        env:
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEY_PASS="${KEY_PASS:-$KEYSTORE_PASS}"
+          cat > android/key.properties <<EOF
+          storeFile=${RUNNER_TEMP}/spotiflac-release.jks
+          storePassword=${KEYSTORE_PASS}
+          keyAlias=${KEY_ALIAS}
+          keyPassword=${KEY_PASS}
+          EOF
+          echo "android/key.properties written — upstream release buildType now signs with your key."
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go_backend/go.mod
+          cache-dependency-path: go_backend/go.sum
+
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Cache Android NDK
+        uses: actions/cache@v5
+        with:
+          path: /usr/local/lib/android/sdk/ndk/29.0.14206865
+          key: ndk-29.0.14206865
+
+      - name: Install Android SDK & NDK
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:?ANDROID_HOME missing on runner}"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;29.0.14206865" \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Install gomobile
+        working-directory: go_backend
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile
+          gomobile init
+
+      - name: Build Go backend for Android (from source)
+        working-directory: go_backend
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p ../android/app/libs
+          gomobile bind \
+            -target=android/arm,android/arm64 \
+            -androidapi 24 \
+            -o ../android/app/libs/gobackend.aar \
+            .
+          test -f ../android/app/libs/gobackend.aar
+          echo "gomobile AAR built locally (not downloaded)."
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Generate app icons
+        run: dart run flutter_launcher_icons
+
+      - name: Select target platforms
+        id: plats
+        run: |
+          case "${{ inputs.abis }}" in
+            arm64) echo "targets=android-arm64" >> "$GITHUB_OUTPUT" ;;
+            arm32) echo "targets=android-arm" >> "$GITHUB_OUTPUT" ;;
+            *)     echo "targets=android-arm,android-arm64" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build APK (${{ inputs.build_type }})
+        run: |
+          set -euo pipefail
+          GIT_COMMIT="$(git rev-parse --short=8 HEAD 2>/dev/null || echo source)"
+          flutter build apk \
+            --${{ inputs.build_type }} \
+            --split-per-abi \
+            --target-platform "${{ steps.plats.outputs.targets }}" \
+            --dart-define="GIT_COMMIT=$GIT_COMMIT"
+          ls -la build/app/outputs/flutter-apk/
+
+      - name: Verify signature & permissions
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/37.0.0"
+          APK_DIR=build/app/outputs/flutter-apk
+          APKSIGNER="$BT/apksigner"
+          dump_perms() {
+            if [ -x "$BT/aapt2" ]; then
+              "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$1" 2>/dev/null
+            elif [ -x "$BT/aapt" ]; then
+              "$BT/aapt" dump permissions "$1"
+            else
+              echo "::warning::no aapt/aapt2 found — permission check skipped"
+              echo ""
+            fi
+          }
+
+          for apk in "$APK_DIR"/app-*.apk; do
+            [ -e "$apk" ] || continue
+            if dump_perms "$apk" | grep -q REQUEST_INSTALL_PACKAGES; then
+              echo "::error::$(basename "$apk") still requests REQUEST_INSTALL_PACKAGES — updater neutralization failed."
+              exit 1
+            fi
+          done
+          echo "OK: no REQUEST_INSTALL_PACKAGES in any APK."
+
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            for apk in "$APK_DIR"/app-*-release.apk; do
+              [ -e "$apk" ] || continue
+              "$APKSIGNER" verify --print-certs "$apk" | sed 's/^/  /'
+              if "$APKSIGNER" verify --print-certs "$apk" | grep -qi "Debug"; then
+                echo "::error::$(basename "$apk") is DEBUG-signed — key.properties was not picked up by Gradle."
+                exit 1
+              fi
+            done
+            echo "OK: all release APKs are signed with your release key (not debug)."
+          fi
+
+      - name: Rename APKs
+        run: |
+          set -euo pipefail
+          VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d'+' -f1)
+          REF_SAFE=$(echo "${{ inputs.ref }}" | tr '/ ' '__')
+          BT="${{ inputs.build_type }}"
+          cd build/app/outputs/flutter-apk
+          for src in "app-arm64-v8a-${BT}.apk" "app-armeabi-v7a-${BT}.apk"; do
+            [ -f "$src" ] || { echo "::error::missing build output: $src"; exit 1; }
+          done
+          mv "app-arm64-v8a-${BT}.apk"   "SpotiFLAC-${VERSION}-${BT}-${REF_SAFE}-arm64.apk"
+          mv "app-armeabi-v7a-${BT}.apk" "SpotiFLAC-${VERSION}-${BT}-${REF_SAFE}-arm32.apk"
+          sha256sum SpotiFLAC-*.apk > SHA256SUMS.txt
+          ls -la SpotiFLAC-*.apk SHA256SUMS.txt
+          echo "Built ${BT} from source ref=${{ inputs.ref }} version=${VERSION}"
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: spotiflac-source-apk-${{ inputs.build_type }}
+          path: |
+            build/app/outputs/flutter-apk/SpotiFLAC-*.apk
+            build/app/outputs/flutter-apk/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
