@@ -133,6 +133,12 @@ jobs:
           before = '        minSdk = 28\n        targetSdk = 35\n'
           once(gradle, before, before + '        ndk { abiFilters += listOf("arm64-v8a") }\n')
 
+          # Le lint Compose amont plante contre l'API Kotlin du tag épinglé.
+          # Ne pas l'appeler dans la tâche Gradle ci-dessous ; upstream a déjà
+          # checkReleaseBuilds = false, donc assembleRelease ne lance pas lintVital.
+          if '        checkReleaseBuilds = false\n' not in gradle.read_text(encoding='utf-8'):
+              raise SystemExit('Configuration lint amont modifiée : vérifier le build')
+
           # Aucun POST de diagnostic au premier lancement, même avant la lecture de DataStore.
           once(kotlin/'RemoteLog.kt', '@Volatile var telemetryEnabled: Boolean = true', '@Volatile var telemetryEnabled: Boolean = false')
           prefs = kotlin/'data/prefs/UserPreferences.kt'
@@ -184,13 +190,16 @@ jobs:
       - name: Configurer Gradle (aucun secret de signature sur ce runner)
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
 
-      - name: Tests + lint + vrai build RELEASE R8
+      - name: Tests + vrai build RELEASE R8 (lint Compose amont incompatible)
         working-directory: upstream/android-native
         shell: bash
         run: |
           set -euo pipefail
           chmod +x gradlew
-          ./gradlew :app:testDebugUnitTest :app:lintRelease :app:assembleRelease \
+          # Pas de :app:lintRelease : ses détecteurs Compose échouent avec
+          # IncompatibleClassChangeError avant de générer un APK.
+          # La configuration amont checkReleaseBuilds=false neutralise lintVital.
+          ./gradlew :app:testDebugUnitTest :app:assembleRelease \
             --no-configuration-cache --no-daemon --max-workers=2 --console=plain
 
       - name: Vérifier manifeste, ABI et APK intermédiaire (signé debug par Gradle)
