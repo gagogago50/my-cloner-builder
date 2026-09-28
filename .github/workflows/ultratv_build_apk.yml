@@ -1,0 +1,373 @@
+name: Ultra TV - release personnel ARM64 / Android 9
+
+# Dépôt PERSONNEL (privé) : aucun fork ni push de code vers Ultra TV.
+# Après création de ce fichier via l'interface GitHub, tout est déclenché à la main.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag Ultra TV à compiler (vX.Y.Z)"
+        required: true
+        type: string
+        default: "v1.0.30"
+      commit_sha:
+        description: "SHA complet du tag, vérifié par vous avant de signer"
+        required: true
+        type: string
+        default: "1da9ab55ca59edea7c177773398d79138f1478b6"
+      publier_release:
+        description: "Publier aussi un GitHub Release permanent dans VOTRE dépôt"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ultra-personnel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Compiler et tester (AUCUN secret de signature)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      version_code: ${{ steps.source.outputs.version_code }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    env:
+      # Ces valeurs NON secrètes remplacent l'URL/jeton de télémétrie du projet.
+      # La télémétrie est aussi désactivée par défaut par le patch ci-dessous.
+      ULTRA_LOG_URL: https://telemetry.invalid
+      ULTRA_LOG_TOKEN: disabled
+    steps:
+      - name: Valider les entrées avant tout téléchargement
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          EXPECTED_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
+
+      - name: Télécharger le commit exact du projet, sans fork
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: khalilbenaz/ultra-tv
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: upstream
+
+      - name: Vérifier tag, commit, version et distribution Gradle
+        id: source
+        working-directory: upstream
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          EXPECTED_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Tag non autorisé'; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo 'SHA complet requis'; exit 1; }
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          version="$(tr -d '\r\n' < VERSION)"
+          test "v$version" = "$TAG"
+          # Fonctionne pour un tag léger comme pour un tag annoté.
+          refs="$(git ls-remote --tags https://github.com/khalilbenaz/ultra-tv.git "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          tag_sha="$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}')"
+          if [ -z "$tag_sha" ]; then
+            tag_sha="$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}')"
+          fi
+          test -n "$tag_sha" && test "$tag_sha" = "$EXPECTED_SHA" || {
+            echo 'Le tag distant ne désigne PAS le commit demandé' >&2; exit 1;
+          }
+          # Pour les nouveaux tags, auditer tout changement de wrapper avant
+          # d'actualiser cette empreinte : pas de scripts Gradle arbitraires.
+          echo '498495120a03b9a6ab5d155f5de3c8f0d986a449153702fb80fc80e134484f17  android-native/gradle/wrapper/gradle-wrapper.jar' | sha256sum -c -
+          props=android-native/gradle/wrapper/gradle-wrapper.properties
+          grep -Fq 'gradle-8.12-bin.zip' "$props"
+          dist_sha=7a00d51fb93147819aab76024feece20b6b84e420694101f276be952e08bef03
+          if grep -q '^distributionSha256Sum=' "$props"; then
+            grep -Fxq "distributionSha256Sum=$dist_sha" "$props" || exit 1
+          else
+            printf '\ndistributionSha256Sum=%s\n' "$dist_sha" >> "$props"
+          fi
+          VERSION="$version" python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          v = os.environ['VERSION']
+          major, minor, patch = map(int, v.split('.'))
+          assert 0 <= minor < 100 and 0 <= patch < 100, 'VERSION hors schema major*10000+minor*100+patch'
+          code = major * 10000 + minor * 100 + patch
+          assert 0 < code < 2_100_000_000
+          print(f'version={v}')
+          print(f'version_code={code}')
+          print(f'source_sha={os.environ["EXPECTED_SHA"]}')
+          PY
+          echo "Source validée : $TAG → $EXPECTED_SHA"
+
+      - name: Patcher LOCALEMENT pour ARM64, confidentialité et mises à jour privées
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('android-native/app/src/main')
+          kotlin = root / 'kotlin/com/ultratv/tv/nativeapp'
+          def once(path, before, after):
+              p = Path(path)
+              txt = p.read_text(encoding='utf-8')
+              if txt.count(before) != 1:
+                  raise SystemExit(f'Source modifiée : revue nécessaire avant signature : {p}')
+              p.write_text(txt.replace(before, after, 1), encoding='utf-8')
+
+          # La variante reste assembleRelease + R8 et conserve le package amont.
+          gradle = Path('android-native/app/build.gradle.kts')
+          before = '        minSdk = 28\n        targetSdk = 35\n'
+          once(gradle, before, before + '        ndk { abiFilters += listOf("arm64-v8a") }\n')
+
+          # Aucun POST de diagnostic au premier lancement, même avant la lecture de DataStore.
+          once(kotlin/'RemoteLog.kt', '@Volatile var telemetryEnabled: Boolean = true', '@Volatile var telemetryEnabled: Boolean = false')
+          prefs = kotlin/'data/prefs/UserPreferences.kt'
+          once(prefs, 'val telemetryEnabled: Boolean = true,', 'val telemetryEnabled: Boolean = false,')
+          once(prefs, 'telemetryEnabled = p[Keys.telemetry] ?: true,', 'telemetryEnabled = p[Keys.telemetry] ?: false,')
+          once(kotlin/'ui/settings/SettingsViewModel.kt',
+               'const val DEFAULT_WORKER_URL = "https://ultratv-config.khalilbenaz.workers.dev"',
+               'const val DEFAULT_WORKER_URL = "https://your-worker.invalid"')
+
+          # Une clé personnelle ne peut pas installer les APK officiels par-dessus.
+          # Neutraliser la recherche automatique ET manuelle des releases signées par autrui.
+          updater = kotlin/'update/UpdateChecker.kt'
+          source = updater.read_text(encoding='utf-8')
+          start = '    suspend fun checkForUpdate(): UpdateInfo? = withContext(Dispatchers.IO) {\n'
+          end = '\n    /**\n     * Encodes a "x.y.z" versionName'
+          if source.count(start) != 1 or source.count(end) != 1:
+              raise SystemExit('UpdateChecker a changé ; revue de sécurité nécessaire')
+          i = source.index(start)
+          j = source.index(end, i)
+          updater.write_text(source[:i] +
+              '    // Private signing key: never offer upstream APKs signed by another key.\n'
+              '    suspend fun checkForUpdate(): UpdateInfo? = null\n' +
+              source[j:], encoding='utf-8')
+          once(root/'AndroidManifest.xml',
+               '    <!-- Auto-update: download + install newer APK from GitHub Releases. -->\n'
+               '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n',
+               '')
+          print('Patches locaux vérifiés : arm64, télémétrie OFF, cloud neutre, updater OFF.')
+          PY
+          git diff --check
+          git diff --stat
+
+      - name: Installer Java 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Installer le SDK de compilation et ses outils (API 35)
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?Android SDK absent sur le runner GitHub}"
+          sdkmanager="$(command -v sdkmanager || true)"
+          if [ -z "$sdkmanager" ]; then sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"; fi
+          test -x "$sdkmanager"
+          "$sdkmanager" --install 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Configurer Gradle (aucun secret de signature sur ce runner)
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Tests + lint + vrai build RELEASE R8
+        working-directory: upstream/android-native
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest :app:lintRelease :app:assembleRelease \
+            --no-configuration-cache --no-daemon --max-workers=2 --console=plain
+
+      - name: Vérifier manifeste, ABI et APK intermédiaire (signé debug par Gradle)
+        shell: bash
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+          VERSION_CODE: ${{ steps.source.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          apk=upstream/android-native/app/build/outputs/apk/release/app-release.apk
+          test -s "$apk"
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          test -x "$tools/aapt2" && test -x "$tools/apksigner"
+          badging="$($tools/aapt2 dump badging "$apk")"
+          printf '%s\n' "$badging" | grep -E '^(package:|sdkVersion:|targetSdkVersion:|native-code:)'
+          grep -Fq "package: name='com.ultratv.tv.nativeapp.debug' versionCode='$VERSION_CODE' versionName='$VERSION'" <<< "$badging"
+          grep -Fq "sdkVersion:'28'" <<< "$badging"
+          python3 - "$apk" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              abis = {n.split('/')[1] for n in z.namelist() if n.startswith('lib/') and n.endswith('.so')}
+              assert abis == {'arm64-v8a'}, f'ABI inattendues : {abis}'
+              print('ABI vérifiée : arm64-v8a uniquement.')
+          PY
+          "$tools/apksigner" verify --min-sdk-version 28 "$apk"
+          mkdir -p stage
+          cp "$apk" stage/release-pre-sign.apk
+          sha256sum stage/release-pre-sign.apk | awk '{print $1}' > stage/release-pre-sign.apk.sha256
+          echo 'Intermédiaire signé avec une clé DEBUG ; ne pas installer !'
+
+      - name: Transmettre seulement le binaire intermédiaire, jamais une clé
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ultra-INTERMEDIAIRE-DEBUG-NE-PAS-INSTALLER-${{ steps.source.outputs.version }}
+          path: stage/*
+          if-no-files-found: error
+          retention-days: 1
+
+  signer:
+    name: Re-signer avec VOTRE clé (runner neuf, aucun code amont)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Récupérer l'APK intermédiaire (aucun checkout du projet)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ultra-INTERMEDIAIRE-DEBUG-NE-PAS-INSTALLER-${{ needs.build.outputs.version }}
+          path: stage
+
+      - name: Installer Java 17 (apksigner)
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Installer les outils Android officiels, sans cloner le code amont
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?Android SDK absent sur le runner GitHub}"
+          sdkmanager="$(command -v sdkmanager || true)"
+          if [ -z "$sdkmanager" ]; then sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"; fi
+          test -x "$sdkmanager"
+          "$sdkmanager" --install 'build-tools;35.0.0'
+          test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt2"
+
+      - name: Signer et vérifier pour Android 9 avec le secret UNIQUEMENT ici
+        shell: bash
+        env:
+          ULTRA_SIGNING_BUNDLE: ${{ secrets.ULTRA_SIGNING_BUNDLE }}
+          VERSION: ${{ needs.build.outputs.version }}
+          VERSION_CODE: ${{ needs.build.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          test -n "${ULTRA_SIGNING_BUNDLE:-}" || { echo 'Secret ULTRA_SIGNING_BUNDLE absent' >&2; exit 1; }
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, re, subprocess
+          tmp = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ultra-personal-signing.p12'
+          src = pathlib.Path('stage/release-pre-sign.apk')
+          wanted = pathlib.Path('stage/release-pre-sign.apk.sha256').read_text().strip()
+          if not re.fullmatch(r'[a-f0-9]{64}', wanted) or hashlib.sha256(src.read_bytes()).hexdigest() != wanted:
+              raise SystemExit('Intermédiaire absent ou SHA-256 non conforme')
+          try:
+              data = json.loads(os.environ['ULTRA_SIGNING_BUNDLE'])
+              if not isinstance(data, dict) or data.get('alias') != 'ultra-personal':
+                  raise ValueError('alias requis : ultra-personal')
+              pwd = data['password']
+              if not isinstance(pwd, str) or len(pwd) < 12:
+                  raise ValueError('mot de passe PKCS12 manquant ou trop court')
+              blob = base64.b64decode(data['keystore_b64'], validate=True)
+              if not 200 < len(blob) < 40_000:
+                  raise ValueError('fichier PKCS12 incorrect')
+              fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, 'wb') as f:
+                  f.write(blob)
+              # Jamais de mot de passe dans les arguments des commandes ni dans les logs.
+              os.environ['ULTRA_PRIVATE_PASS'] = pwd
+              os.environ.pop('ULTRA_SIGNING_BUNDLE', None)
+              tools = pathlib.Path(os.environ['ANDROID_HOME']) / 'build-tools/35.0.0'
+              outdir = pathlib.Path('signed')
+              outdir.mkdir(exist_ok=True)
+              version = os.environ['VERSION']
+              if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+                  raise ValueError('version invalide')
+              apk = outdir / f'UltraTV-prive-v{version}-ARM64-Android9.apk'
+              subprocess.run([str(tools/'zipalign'), '-c', '4', str(src)], check=True)
+              subprocess.run([
+                  str(tools/'apksigner'), 'sign',
+                  '--ks', str(tmp), '--ks-type', 'PKCS12', '--ks-key-alias', data['alias'],
+                  '--ks-pass', 'env:ULTRA_PRIVATE_PASS', '--key-pass', 'env:ULTRA_PRIVATE_PASS',
+                  '--min-sdk-version', '28',
+                  '--v1-signing-enabled', 'false', '--v2-signing-enabled', 'true',
+                  '--v3-signing-enabled', 'true', '--v4-signing-enabled', 'false',
+                  '--out', str(apk), str(src),
+              ], check=True)
+              print('APK signé avec la clé personnelle, sans lignée de signature officielle.')
+          except (ValueError, KeyError) as e:
+              # Ne jamais afficher le JSON du secret ni son mot de passe.
+              raise SystemExit('Secret PKCS12 invalide : contrôler sa création / alias') from None
+          finally:
+              if tmp.exists():
+                  tmp.unlink()
+          PY
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          apk=(signed/*.apk)
+          test "${#apk[@]}" -eq 1 && test -s "${apk[0]}"
+          "$tools/apksigner" verify --min-sdk-version 28 --verbose --print-certs "${apk[0]}"
+          "$tools/zipalign" -c 4 "${apk[0]}"
+          badging="$($tools/aapt2 dump badging "${apk[0]}")"
+          grep -Fq "package: name='com.ultratv.tv.nativeapp.debug' versionCode='$VERSION_CODE' versionName='$VERSION'" <<< "$badging"
+          grep -Fq "sdkVersion:'28'" <<< "$badging"
+          (cd signed && sha256sum ./*.apk > SHA256SUMS.txt)
+          echo 'APK RELEASE personnel signé + empreinte SHA-256 prêts.'
+
+      - name: Conserver l'APK signé dans les artefacts GitHub Actions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: UltraTV-SIGNE-ARM64-Android9-${{ needs.build.outputs.version }}
+          path: signed/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publier:
+    name: GitHub Release permanent dans MON dépôt (facultatif)
+    if: ${{ inputs.publier_release }}
+    needs: [build, signer]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Télécharger UNIQUEMENT l'APK final signé et SHA256SUMS
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: UltraTV-SIGNE-ARM64-Android9-${{ needs.build.outputs.version }}
+          path: signed
+
+      - name: Publier une release dans mon dépôt sans push du projet Ultra TV
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          apk=(signed/*.apk)
+          test "${#apk[@]}" -eq 1 && test -s "${apk[0]}"
+          (cd signed && sha256sum -c SHA256SUMS.txt)
+          tag="prive-ultra-v${VERSION}-${SOURCE_SHA:0:8}-run${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" "${apk[0]}" signed/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Ultra TV privé v${VERSION} - ARM64 Android 9" \
+            --notes "Code amont : khalilbenaz/ultra-tv@$SOURCE_SHA. Clé personnelle, ARM64, télémétrie désactivée par défaut, cloud neutre et updater officiel désactivé. La VOD Stalker dépend du portail ; version non testée sur Galaxy S8."
