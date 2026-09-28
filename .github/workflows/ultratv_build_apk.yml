@@ -213,10 +213,18 @@ jobs:
           test -s "$apk"
           tools="$ANDROID_HOME/build-tools/35.0.0"
           test -x "$tools/aapt2" && test -x "$tools/apksigner"
-          badging="$($tools/aapt2 dump badging "$apk")"
-          printf '%s\n' "$badging" | grep -E '^(package:|sdkVersion:|targetSdkVersion:|native-code:)'
+          badging="$("$tools/aapt2" dump badging "$apk")"
+          printf '%s\n' "$badging" | grep -E '^(package:|targetSdkVersion:|native-code:)'
           grep -Fq "package: name='com.ultratv.tv.nativeapp.debug' versionCode='$VERSION_CODE' versionName='$VERSION'" <<< "$badging"
-          grep -Fq "sdkVersion:'28'" <<< "$badging"
+          # AAPT2 35 omet parfois sdkVersion dans 'dump badging', alors que
+          # <uses-sdk android:minSdkVersion="28"> est présent dans l'APK.
+          # Vérifier le MANIFESTE compilé, sans supprimer le contrôle Android 9.
+          manifest_xml="$("$tools/aapt2" dump xmltree "$apk" --file AndroidManifest.xml)"
+          grep -Fq 'E: uses-sdk ' <<< "$manifest_xml"
+          grep -Eq '^[[:space:]]+A: http://schemas.android.com/apk/res/android:minSdkVersion\(0x0101020c\)=28$' <<< "$manifest_xml" || {
+            echo 'Échec : minSdkVersion 28 absent du manifeste compilé' >&2; exit 1;
+          }
+          echo 'Manifest Android vérifié : minSdkVersion=28.'
           python3 - "$apk" <<'PY'
           import sys, zipfile
           with zipfile.ZipFile(sys.argv[1]) as z:
@@ -333,9 +341,16 @@ jobs:
           test "${#apk[@]}" -eq 1 && test -s "${apk[0]}"
           "$tools/apksigner" verify --min-sdk-version 28 --verbose --print-certs "${apk[0]}"
           "$tools/zipalign" -c 4 "${apk[0]}"
-          badging="$($tools/aapt2 dump badging "${apk[0]}")"
+          badging="$("$tools/aapt2" dump badging "${apk[0]}")"
           grep -Fq "package: name='com.ultratv.tv.nativeapp.debug' versionCode='$VERSION_CODE' versionName='$VERSION'" <<< "$badging"
-          grep -Fq "sdkVersion:'28'" <<< "$badging"
+          # Même test du vrai manifeste après re-signature : pas de confiance
+          # dans le champ sdkVersion parfois omis par AAPT2 35 dump badging.
+          manifest_xml="$("$tools/aapt2" dump xmltree "${apk[0]}" --file AndroidManifest.xml)"
+          grep -Fq 'E: uses-sdk ' <<< "$manifest_xml"
+          grep -Eq '^[[:space:]]+A: http://schemas.android.com/apk/res/android:minSdkVersion\(0x0101020c\)=28$' <<< "$manifest_xml" || {
+            echo 'Échec : minSdkVersion 28 absent du manifeste signé' >&2; exit 1;
+          }
+          echo 'Manifeste signé vérifié : minSdkVersion=28.'
           (cd signed && sha256sum ./*.apk > SHA256SUMS.txt)
           echo 'APK RELEASE personnel signé + empreinte SHA-256 prêts.'
 
