@@ -283,8 +283,8 @@ jobs:
               if not isinstance(data, dict) or data.get('alias') != 'ultra-personal':
                   raise ValueError('alias requis : ultra-personal')
               pwd = data['password']
-              if not isinstance(pwd, str) or len(pwd) < 12:
-                  raise ValueError('mot de passe PKCS12 manquant ou trop court')
+              if not isinstance(pwd, str) or len(pwd) < 6:
+                  raise ValueError('mot de passe PKCS12 manquant ou inférieur à 6 caractères')
               blob = base64.b64decode(data['keystore_b64'], validate=True)
               if not 200 < len(blob) < 40_000:
                   raise ValueError('fichier PKCS12 incorrect')
