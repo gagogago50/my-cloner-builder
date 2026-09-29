@@ -289,22 +289,36 @@ jobs:
           set -euo pipefail
           test -n "${ULTRA_SIGNING_BUNDLE:-}" || { echo 'Secret ULTRA_SIGNING_BUNDLE absent' >&2; exit 1; }
           python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib, re, subprocess
+          import base64, binascii, hashlib, json, os, pathlib, re, subprocess
           tmp = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ultra-personal-signing.p12'
           src = pathlib.Path('stage/release-pre-sign.apk')
           wanted = pathlib.Path('stage/release-pre-sign.apk.sha256').read_text().strip()
           if not re.fullmatch(r'[a-f0-9]{64}', wanted) or hashlib.sha256(src.read_bytes()).hexdigest() != wanted:
               raise SystemExit('Intermédiaire absent ou SHA-256 non conforme')
+          version = os.environ['VERSION']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+              raise SystemExit('Version build invalide ; vérifier le job build')
           try:
-              data = json.loads(os.environ['ULTRA_SIGNING_BUNDLE'])
-              if not isinstance(data, dict) or data.get('alias') != 'ultra-personal':
-                  raise ValueError('alias requis : ultra-personal')
-              pwd = data['password']
+              try:
+                  data = json.loads(os.environ['ULTRA_SIGNING_BUNDLE'])
+              except ValueError:
+                  raise SystemExit('Secret ULTRA_SIGNING_BUNDLE : JSON invalide. Coller le contenu complet de ultra-signing-bundle.json, sans balises ni chemin de fichier.') from None
+              if not isinstance(data, dict):
+                  raise SystemExit('Secret ULTRA_SIGNING_BUNDLE : objet JSON requis, pas une chaîne ni le base64 seul.')
+              if data.get('alias') != 'ultra-personal':
+                  raise SystemExit('Secret ULTRA_SIGNING_BUNDLE : champ alias requis : ultra-personal (ne pas publier sa valeur).')
+              pwd = data.get('password')
               if not isinstance(pwd, str) or len(pwd) < 6:
-                  raise ValueError('mot de passe PKCS12 manquant ou inférieur à 6 caractères')
-              blob = base64.b64decode(data['keystore_b64'], validate=True)
+                  raise SystemExit('Secret ULTRA_SIGNING_BUNDLE : password doit être un texte de 6 caractères minimum (6 chiffres acceptés).')
+              raw_b64 = data.get('keystore_b64')
+              if not isinstance(raw_b64, str):
+                  raise SystemExit('Secret ULTRA_SIGNING_BUNDLE : champ keystore_b64 texte manquant.')
+              try:
+                  blob = base64.b64decode(raw_b64, validate=True)
+              except (binascii.Error, ValueError):
+                  raise SystemExit('Secret ULTRA_SIGNING_BUNDLE : keystore_b64 non valide ; recréer le JSON depuis le .p12, sans retour de ligne dans le base64.') from None
               if not 200 < len(blob) < 40_000:
-                  raise ValueError('fichier PKCS12 incorrect')
+                  raise SystemExit('Secret ULTRA_SIGNING_BUNDLE : keystore_b64 ne décode pas un .p12 de taille attendue (200 à 40000 octets).')
               fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
               with os.fdopen(fd, 'wb') as f:
                   f.write(blob)
@@ -314,9 +328,6 @@ jobs:
               tools = pathlib.Path(os.environ['ANDROID_HOME']) / 'build-tools/35.0.0'
               outdir = pathlib.Path('signed')
               outdir.mkdir(exist_ok=True)
-              version = os.environ['VERSION']
-              if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
-                  raise ValueError('version invalide')
               apk = outdir / f'UltraTV-prive-v{version}-ARM64-Android9.apk'
               subprocess.run([str(tools/'zipalign'), '-c', '4', str(src)], check=True)
               subprocess.run([
@@ -329,9 +340,6 @@ jobs:
                   '--out', str(apk), str(src),
               ], check=True)
               print('APK signé avec la clé personnelle, sans lignée de signature officielle.')
-          except (ValueError, KeyError) as e:
-              # Ne jamais afficher le JSON du secret ni son mot de passe.
-              raise SystemExit('Secret PKCS12 invalide : contrôler sa création / alias') from None
           finally:
               if tmp.exists():
                   tmp.unlink()
