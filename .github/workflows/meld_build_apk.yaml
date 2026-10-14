@@ -1,0 +1,437 @@
+# =============================================================================
+#  Build Meld (FrancescoGrazioso/Meld) depuis VOTRE dépôt, sans fork.
+#  Cible : Galaxy S8 · Android 9 (API 28) · arm64-v8a → l'APK "universal" du
+#  projet (minSdk 26, arm64-v8a inclus) fonctionne tel quel.
+#
+#  Inspiré de .github/workflows/build.yml + release.yml de Meld, durci :
+#   • actions épinglées par SHA (pas de mise à jour silencieuse d'une action)
+#   • signature faite directement avec apksigner (aucune action tierce ne voit
+#     votre keystore), clé lue dans VOS secrets :
+#       ANDROID_KEYSTORE_BASE64 · ANDROID_KEYSTORE_PASSWORD
+#       ANDROID_KEY_ALIAS       · ANDROID_KEY_PASSWORD
+#   • "hardening" appliqué aux sources AVANT compilation (input hardening=true) :
+#       H1 allowBackup=false            (fini l'extraction des jetons via adb backup)
+#       H2 cleartext interdit           (sauf input allow_cleartext=true, pour un
+#                                        serveur Listen Together local en ws://)
+#       H3 UPDATER_AVAILABLE=false      (pas de vérif. de mise à jour vers les APK
+#                                        officiels, incompatibles avec votre signature)
+#       H4 miroir Maven Aliyun retiré   (chaîne d'approvisionnement : Google,
+#                                        Maven Central, JitPack uniquement)
+#       H5 CRASH_REPORT_TOKEN vide      (CrashReporter désactivé : rien n'est envoyé
+#                                        aux issues GitHub du projet)
+#   • vérifications sur l'APK final : aucun jeton GitHub/API embarqué, allowBackup,
+#     debuggable, minSdk ≤ 28, arm64-v8a présent, inventaire des hôtes réseau.
+#
+#  Secrets optionnels : LASTFM_API_KEY / LASTFM_SECRET (scrobbling Last.fm).
+#  Sans secrets de signature : clé jetable + avertissement (ou échec si
+#  require_signing_secrets=true, ce que fait meld-release.yml).
+# =============================================================================
+name: Build Meld (Galaxy S8 / Android 9)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branche, tag ou commit de FrancescoGrazioso/Meld à compiler (ex. main, v0.9.2)"
+        required: false
+        default: "main"
+        type: string
+      variant:
+        description: "Variante : foss (recommandée, sans Google Cast) · gms (Google Cast) · izzy (sans updater)"
+        required: false
+        default: "foss"
+        type: choice
+        options:
+          - foss
+          - gms
+          - izzy
+      hardening:
+        description: "Appliquer les correctifs H1–H4 (allowBackup, cleartext, updater, miroir Aliyun)"
+        required: false
+        default: true
+        type: boolean
+      allow_cleartext:
+        description: "Garder le trafic HTTP/ws en clair (uniquement si vous utilisez un serveur Listen Together local)"
+        required: false
+        default: false
+        type: boolean
+      require_signing_secrets:
+        description: "Échouer si les secrets ANDROID_KEYSTORE_* sont absents (au lieu d'une clé jetable)"
+        required: false
+        default: false
+        type: boolean
+      app_name:
+        description: "Nom affiché de l'application"
+        required: false
+        default: "Meld"
+        type: string
+      application_id:
+        description: "Application ID (garder com.meld.app pour les liens meld://)"
+        required: false
+        default: "com.meld.app"
+        type: string
+
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        default: "main"
+        type: string
+      variant:
+        required: false
+        default: "foss"
+        type: string
+      hardening:
+        required: false
+        default: true
+        type: boolean
+      allow_cleartext:
+        required: false
+        default: false
+        type: boolean
+      require_signing_secrets:
+        required: false
+        default: false
+        type: boolean
+      app_name:
+        required: false
+        default: "Meld"
+        type: string
+      application_id:
+        required: false
+        default: "com.meld.app"
+        type: string
+    outputs:
+      artifact_name:
+        description: "Nom de l'artefact contenant l'APK signé (+ .sha256)"
+        value: ${{ jobs.build.outputs.artifact_name }}
+      apk_name:
+        description: "Nom du fichier APK"
+        value: ${{ jobs.build.outputs.apk_name }}
+      meld_sha:
+        description: "Commit Meld compilé"
+        value: ${{ jobs.build.outputs.meld_sha }}
+      meld_version:
+        description: "versionName lu dans app/build.gradle.kts"
+        value: ${{ jobs.build.outputs.meld_version }}
+      hardening_applied:
+        description: "Liste des correctifs appliqués"
+        value: ${{ jobs.build.outputs.hardening_applied }}
+      cert_sha256:
+        description: "Empreinte SHA-256 du certificat de signature"
+        value: ${{ jobs.build.outputs.cert_sha256 }}
+
+  push:
+    paths:
+      - ".github/workflows/meld-build.yml"
+
+  # Décommentez pour un build hebdomadaire automatique de la branche main :
+  # schedule:
+  #   - cron: "30 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  MELD_REPO: FrancescoGrazioso/Meld
+  MELD_REF: ${{ inputs.ref || 'main' }}
+  VARIANT: ${{ inputs.variant || 'foss' }}
+  APP_NAME: ${{ inputs.app_name || 'Meld' }}
+  APP_ID: ${{ inputs.application_id || 'com.meld.app' }}
+  # Booléens : format() évite les pièges de coercition ('' / null / false) → défauts sûrs.
+  HARDENING: ${{ format('{0}', inputs.hardening) == 'false' && 'false' || 'true' }}
+  ALLOW_CLEARTEXT: ${{ format('{0}', inputs.allow_cleartext) == 'true' && 'true' || 'false' }}
+  REQUIRE_SIGNING: ${{ format('{0}', inputs.require_signing_secrets) == 'true' && 'true' || 'false' }}
+  # Android 9 = API 28 : le build échoue tôt si l'amont relève minSdk au-dessus.
+  TARGET_DEVICE_API: "28"
+  BUILD_TOOLS_VERSION: "35.0.0"
+
+jobs:
+  build:
+    name: Build ${{ inputs.variant || 'foss' }} release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # `secrets` n'est pas utilisable dans `if:` d'un step → projeté en env.
+      HAS_SIGNING_SECRETS: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+    outputs:
+      artifact_name: ${{ steps.apk.outputs.artifact_name }}
+      apk_name: ${{ steps.apk.outputs.apk_name }}
+      meld_sha: ${{ steps.meta.outputs.sha }}
+      meld_version: ${{ steps.meta.outputs.version }}
+      hardening_applied: ${{ steps.harden.outputs.applied }}
+      cert_sha256: ${{ steps.apk.outputs.cert_sha256 }}
+
+    steps:
+      - name: Checkout de ce dépôt (workflow + patches optionnels)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: self
+          persist-credentials: false
+
+      - name: Checkout des sources Meld (sans fork)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ env.MELD_REPO }}
+          ref: ${{ env.MELD_REF }}
+          path: meld
+          submodules: false # le sous-module "notes" ne contient que de la doc
+          persist-credentials: false
+
+      - name: Secrets de signature présents ?
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$HAS_SIGNING_SECRETS" = "true" ]; then
+            echo "Signature : keystore des secrets ANDROID_KEYSTORE_*"
+          elif [ "$REQUIRE_SIGNING" = "true" ]; then
+            echo "::error::Secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD manquants (require_signing_secrets=true)."
+            exit 1
+          else
+            echo "::warning title=Clé de signature temporaire::Secrets ANDROID_KEYSTORE_* absents : l'APK sera signé avec une clé jetable (désinstaller avant de réinstaller)."
+          fi
+
+      - name: Métadonnées du build (commit Meld, version, variante)
+        id: meta
+        working-directory: meld
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          VERSION="$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+          MIN_SDK="$(sed -n 's/^[[:space:]]*minSdk = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -n 1)"
+          V="${VARIANT}"
+          VARIANT_NAME="$(tr '[:lower:]' '[:upper:]' <<< "${V:0:1}")${V:1}"
+          case "$V" in foss|gms|izzy) ;; *) echo "::error::Variante inconnue : $V (foss|gms|izzy)"; exit 1;; esac
+          if [ -z "$MIN_SDK" ] || [ "$MIN_SDK" -gt "$TARGET_DEVICE_API" ]; then
+            echo "::error::minSdk=$MIN_SDK > API $TARGET_DEVICE_API : cette révision de Meld ne supporte plus Android 9 (Galaxy S8). Choisissez une réf plus ancienne (input 'ref')."
+            exit 1
+          fi
+          {
+            echo "sha=$SHA"
+            echo "short=${SHA:0:7}"
+            echo "version=${VERSION:-unknown}"
+            echo "min_sdk=$MIN_SDK"
+            echo "variant_name=$VARIANT_NAME"
+          } >> "$GITHUB_OUTPUT"
+          echo "Meld $VERSION @ ${SHA:0:7} · variante $V · minSdk $MIN_SDK (cible API $TARGET_DEVICE_API OK)"
+
+      - name: Hardening des sources (H1–H4)
+        id: harden
+        working-directory: meld
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPLIED=()
+          fail() { echo "::error::$1 — l'amont a changé : mettez à jour ce step ou relancez avec hardening=false"; exit 1; }
+
+          if [ "$HARDENING" != "true" ]; then
+            echo "::warning::hardening=false : sources Meld compilées telles quelles (allowBackup=true, cleartext autorisé, updater actif, miroir Aliyun)."
+            echo "applied=aucun (hardening=false)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # H1 — allowBackup=false : les cookies/jetons Spotify & YouTube (DataStore) ne sont plus
+          #      extractibles par `adb backup` (Android 9 n'a pas de restriction par défaut).
+          F=app/src/main/AndroidManifest.xml
+          sed -i 's/android:allowBackup="true"/android:allowBackup="false"/' "$F"
+          grep -q 'android:allowBackup="false"' "$F" || fail "H1 allowBackup introuvable dans $F"
+          APPLIED+=("H1 allowBackup=false")
+
+          # H2 — plus de trafic en clair (retour au défaut Android 9+). Toutes les URL de Meld sont
+          #      https/wss ; seul un serveur Listen Together local en ws:// serait affecté.
+          F=app/src/main/res/xml/network_security_config.xml
+          if [ "$ALLOW_CLEARTEXT" = "true" ]; then
+            echo "H2 ignoré (allow_cleartext=true)"
+          else
+            sed -i 's/cleartextTrafficPermitted="true"/cleartextTrafficPermitted="false"/' "$F"
+            grep -q 'cleartextTrafficPermitted="false"' "$F" || fail "H2 cleartextTrafficPermitted introuvable dans $F"
+            APPLIED+=("H2 cleartext interdit")
+          fi
+
+          # H3 — pas de vérification de mise à jour au démarrage (MainActivity teste
+          #      BuildConfig.UPDATER_AVAILABLE) : votre build ne peut pas être "mis à jour" par un APK
+          #      officiel (signature différente), et l'app n'interroge plus api.github.com à chaque lancement.
+          F=app/build.gradle.kts
+          sed -i 's/buildConfigField("Boolean", "UPDATER_AVAILABLE", "true")/buildConfigField("Boolean", "UPDATER_AVAILABLE", "false")/' "$F"
+          grep -q '"UPDATER_AVAILABLE", "false"' "$F" || fail "H3 UPDATER_AVAILABLE introuvable dans $F"
+          if grep -q '"UPDATER_AVAILABLE", "true"' "$F"; then fail "H3 UPDATER_AVAILABLE encore à true dans $F"; fi
+          APPLIED+=("H3 updater désactivé")
+
+          # H4 — dépendances résolues uniquement via Google / Maven Central / JitPack
+          #      (le miroir Aliyun, hérité de Metrolist, n'est qu'un proxy non vérifié).
+          for F in settings.gradle.kts build.gradle.kts; do
+            sed -i '/maven\.aliyun\.com/d' "$F"
+            if grep -qi 'aliyun' "$F"; then fail "H4 miroir Aliyun toujours présent dans $F"; fi
+          done
+          APPLIED+=("H4 miroir Aliyun retiré")
+
+          echo "Diff appliqué :"
+          git --no-pager diff --stat
+          git --no-pager diff
+          printf -v JOINED '%s, ' "${APPLIED[@]}"
+          echo "applied=${JOINED%, }" >> "$GITHUB_OUTPUT"
+
+      - name: Patches locaux optionnels (self/patches/*.patch)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(self/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then echo "Aucun patch local."; exit 0; fi
+          for p in "${patches[@]}"; do
+            echo "Application de $p"
+            git -C meld apply --verbose --3way "$GITHUB_WORKSPACE/$p"
+          done
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+        with:
+          cache-cleanup: on-success
+
+      - name: Build Release APK (non signé)
+        working-directory: meld
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --console=plain assemble${{ steps.meta.outputs.variant_name }}Release --warning-mode summary
+        env:
+          METROLIST_APPLICATION_ID: ${{ env.APP_ID }}
+          METROLIST_APP_NAME: ${{ env.APP_NAME }}
+          METROLIST_BUILD_COMMIT: ${{ steps.meta.outputs.sha }}
+          PULL_REQUEST: "false"
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          # H5 — vides = CrashReporter désactivé (CrashReporter.isEnabledSafe) : aucun PAT dans l'APK,
+          #      aucun rapport envoyé aux issues GitHub du projet.
+          CRASH_REPORT_TOKEN: ""
+          CRASH_REPORT_REPO: ""
+
+      - name: Signature (zipalign + apksigner, keystore des secrets ou clé jetable)
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+          if [ ! -x "$BT/apksigner" ]; then BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"; fi
+          echo "build-tools : $BT"
+          DIR="meld/app/build/outputs/apk/$VARIANT/release"
+          UNSIGNED="$(find "$DIR" -maxdepth 1 -name '*.apk' ! -name '*-signed.apk' | head -n 1)"
+          if [ -z "$UNSIGNED" ]; then echo "::error::Aucun APK dans $DIR"; ls -R "$DIR" || true; exit 1; fi
+
+          KS="$RUNNER_TEMP/release.keystore"
+          cleanup() { rm -f "$KS" "$RUNNER_TEMP/aligned.apk"; }
+          trap cleanup EXIT
+          if [ "$HAS_SIGNING_SECRETS" = "true" ]; then
+            printf '%s' "$KS_B64" | tr -d '\n\r ' | base64 -d > "$KS"
+            [ -s "$KS" ] || { echo "::error::ANDROID_KEYSTORE_BASE64 ne se décode pas (base64 invalide ?)"; exit 1; }
+          else
+            KS_ALIAS="meld"; KS_PASS="$(openssl rand -hex 24)"; KEY_PASS="$KS_PASS"
+            keytool -genkeypair -v -keystore "$KS" -storetype PKCS12 -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=Meld self-build (throwaway), O=self-build" >/dev/null
+          fi
+
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$KS" --ks-key-alias "$KS_ALIAS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+            --v4-signing-enabled false \
+            --out "${UNSIGNED%.apk}-signed.apk" "$RUNNER_TEMP/aligned.apk"
+          echo "APK signé : ${UNSIGNED%.apk}-signed.apk"
+
+      - name: Vérifications de sécurité sur l'APK final
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+          if [ ! -x "$BT/apksigner" ]; then BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"; fi
+          DIR="meld/app/build/outputs/apk/$VARIANT/release"
+          SIGNED="$(find "$DIR" -maxdepth 1 -name '*-signed.apk' | head -n 1)"
+          if [ -z "$SIGNED" ]; then echo "::error::Aucun APK signé trouvé"; ls -R "$DIR" || true; exit 1; fi
+          ERRORS=0
+
+          echo "== Signature =="
+          "$BT/apksigner" verify --verbose --print-certs --min-sdk-version "$TARGET_DEVICE_API" "$SIGNED" | tee cert.txt
+          CERT_SHA256="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' cert.txt | head -n 1)"
+
+          echo "== Manifeste =="
+          "$BT/aapt2" dump badging "$SIGNED" > badging.txt
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$SIGNED" > manifest.txt
+          SDK="$(sed -n -E "s/^(minSdkVersion|sdkVersion):'([0-9]+)'.*/\2/p" badging.txt | head -n 1)"
+          PKG="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" badging.txt | head -n 1)"
+          echo "package=$PKG minSdk=$SDK"
+          if [ -z "$SDK" ] || [ "$SDK" -gt "$TARGET_DEVICE_API" ]; then echo "::error::minSdk $SDK > $TARGET_DEVICE_API : incompatible Android 9"; ERRORS=$((ERRORS+1)); fi
+          if ! grep -q "native-code:.*'arm64-v8a'" badging.txt; then echo "::error::arm64-v8a absent de l'APK"; ERRORS=$((ERRORS+1)); fi
+          if grep -Eq 'debuggable\(0x0101000f\)=(true|\(type 0x12\)0xffffffff)' manifest.txt; then echo "::error::APK debuggable"; ERRORS=$((ERRORS+1)); fi
+          if grep -Eq 'allowBackup\(0x01010280\)=(true|\(type 0x12\)0xffffffff)' manifest.txt; then
+            if [ "$HARDENING" = "true" ]; then echo "::error::allowBackup=true malgré H1"; ERRORS=$((ERRORS+1)); else echo "::warning::allowBackup=true (hardening=false)"; fi
+          fi
+          grep "^uses-permission" badging.txt | sed "s/.*name='\([^']*\)'.*/  perm: \1/" | tee perms.txt
+
+          echo "== Secrets embarqués ? (DEX) =="
+          mkdir -p "$RUNNER_TEMP/dex"
+          unzip -o -q "$SIGNED" 'classes*.dex' -d "$RUNNER_TEMP/dex"
+          if LC_ALL=C grep -a -h -o -E '(github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{32,})' "$RUNNER_TEMP"/dex/*.dex | sort -u | sed 's/\(.\{12\}\).*/\1…/' | tee secrets.txt | grep -q .; then
+            echo "::error::Jeton/secret trouvé dans le code compilé (ci-dessus, tronqué) : H5 n'a pas fonctionné"; ERRORS=$((ERRORS+1))
+          else
+            echo "Aucun jeton GitHub/API dans les DEX ✔"
+          fi
+
+          echo "== Hôtes réseau embarqués =="
+          LC_ALL=C grep -a -h -o -E '(https?|wss?)://[A-Za-z0-9._-]+' "$RUNNER_TEMP"/dex/*.dex \
+            | sed -E 's#^[^:]+://##' | grep -Ev '^(schemas\.android\.com|www\.w3\.org|xml\.org|xmlpull\.org|xml\.apache\.org|apache\.org|java\.sun\.com|ns\.adobe\.com|purl\.org|schemas\.microsoft\.com|localhost|default\.url|aomedia\.org|developer\.android\.com|issuetracker\.google\.com|g\.co|goo\.gle|ktor\.io|www\.slf4j\.org|youtrack\.jetbrains\.com|github\.com|www\.reddit\.com|discord\.gg|developer\.apple\.com|cdn|x|yt3)$' \
+            | sort -u > hosts.txt || true
+          wc -l < hosts.txt | xargs echo "hôtes distincts :"
+          cat hosts.txt
+
+          [ "$ERRORS" -eq 0 ] || { echo "::error::$ERRORS vérification(s) en échec"; exit 1; }
+
+          APK_NAME="Meld-${{ steps.meta.outputs.version }}-${VARIANT}-${{ steps.meta.outputs.short }}.apk"
+          ARTIFACT_NAME="${APK_NAME%.apk}"
+          mkdir -p artifacts
+          cp "$SIGNED" "artifacts/$APK_NAME"
+          (cd artifacts && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          {
+            echo "apk_name=$APK_NAME"
+            echo "artifact_name=$ARTIFACT_NAME"
+            echo "cert_sha256=$CERT_SHA256"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Meld ${{ steps.meta.outputs.version }} · \`$VARIANT\` · commit \`${{ steps.meta.outputs.short }}\`"
+            echo ""
+            echo "- Source : https://github.com/${MELD_REPO}/commit/${{ steps.meta.outputs.sha }} (réf \`${MELD_REF}\`)"
+            echo "- Cible : Android 9 (API ${TARGET_DEVICE_API}) · minSdk ${SDK} · arm64-v8a ✔ · package \`${PKG}\`"
+            echo "- Hardening : ${{ steps.harden.outputs.applied }} + H5 CrashReporter désactivé"
+            echo "- Signature : $([ "$HAS_SIGNING_SECRETS" = "true" ] && echo 'keystore des secrets ANDROID_KEYSTORE_*' || echo '**clé jetable (test uniquement)**') · cert SHA-256 \`${CERT_SHA256}\`"
+            echo "- SHA-256 APK : \`$(cut -d' ' -f1 "artifacts/$APK_NAME.sha256")\`"
+            echo "- Secrets embarqués : aucun ✔ · Permissions :"
+            echo '```'
+            cat perms.txt
+            echo '```'
+            echo "<details><summary>Hôtes réseau présents dans le code ($(wc -l < hosts.txt))</summary>"
+            echo ""
+            echo '```'
+            cat hosts.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload de l'APK signé
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.apk.outputs.artifact_name }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
