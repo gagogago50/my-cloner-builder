@@ -1,0 +1,442 @@
+# =============================================================================
+#  Build OpenTV Mobile (opentv-mobile/opentv-mobile) depuis VOTRE dépôt, sans fork.
+#  Cible : Galaxy S8 · Android 9 (API 28) · arm64-v8a → l'APK unique du projet
+#  (minSdk 23, pur Kotlin + libs AndroidX arm64) fonctionne tel quel.
+#
+#  Même recette que meld-build.yml :
+#   • actions épinglées par SHA (pas de mise à jour silencieuse d'une action)
+#   • signature faite directement avec apksigner (aucune action tierce ne voit
+#     votre keystore), clé lue dans VOS secrets :
+#       ANDROID_KEYSTORE_BASE64 · ANDROID_KEYSTORE_PASSWORD
+#       ANDROID_KEY_ALIAS       · ANDROID_KEY_PASSWORD
+#   • "hardening" appliqué aux sources AVANT compilation (input hardening=true) :
+#       H1 allowBackup=false          (identifiants Xtream/Stalker et mot de passe NAS
+#                                      plus extractibles par `adb backup`)
+#       H2 mises à jour automatiques  (plus de requête vers api.github.com toutes les 6 h
+#          désactivées                 au démarrage ; input updater=manual garde le bouton
+#                                      "Rechercher des mises à jour", updater=off supprime
+#                                      aussi ce bouton côté réseau et la permission
+#                                      REQUEST_INSTALL_PACKAGES)
+#       H3 guides TV tiers non        (l'appli n'activait seule un XMLTV depuis
+#          auto-activés                epgshare01.online / GitHub si la playlist contenait
+#                                      ≥ 5 chaînes UK|/US|/CA|/AU| ; ils restent
+#                                      activables à la main dans les réglages)
+#       H4 cleartext                  (laissé AUTORISÉ par défaut : la plupart des panels
+#                                      IPTV sont en http:// ; allow_cleartext=false pour
+#                                      forcer HTTPS si votre fournisseur le permet)
+#   • vérifications sur l'APK final : signature, minSdk ≤ 28, debuggable, allowBackup,
+#     cleartext, permissions, aucun jeton/secret dans les DEX, inventaire des hôtes
+#     réseau comparé à la liste attendue (avertissement si un hôte inconnu apparaît).
+#
+#  Sans secrets de signature : clé jetable + avertissement (ou échec si
+#  require_signing_secrets=true, ce que fait opentv-release.yml).
+#  Votre APK a une signature différente de l'APK officiel : désinstallez
+#  l'officiel avant d'installer le vôtre (même applicationId app.opentvmobile).
+# =============================================================================
+name: Build OpenTV Mobile (Galaxy S8 / Android 9)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branche, tag ou commit de opentv-mobile/opentv-mobile à compiler (ex. v1.0.0, main)"
+        required: false
+        default: "v1.0.0"
+        type: string
+      hardening:
+        description: "Appliquer les correctifs H1–H4 (allowBackup, mises à jour auto, EPG tiers auto, cleartext)"
+        required: false
+        default: true
+        type: boolean
+      updater:
+        description: "manual = plus de vérification automatique, bouton manuel conservé · off = aucune requête de mise à jour, permission d'installation retirée"
+        required: false
+        default: "manual"
+        type: choice
+        options:
+          - manual
+          - off
+      allow_cleartext:
+        description: "Garder le trafic HTTP en clair (nécessaire pour la plupart des panels IPTV ; false = HTTPS obligatoire)"
+        required: false
+        default: true
+        type: boolean
+      require_signing_secrets:
+        description: "Échouer si les secrets ANDROID_KEYSTORE_* sont absents (au lieu d'une clé jetable)"
+        required: false
+        default: false
+        type: boolean
+
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        default: "v1.0.0"
+        type: string
+      hardening:
+        required: false
+        default: true
+        type: boolean
+      updater:
+        required: false
+        default: "manual"
+        type: string
+      allow_cleartext:
+        required: false
+        default: true
+        type: boolean
+      require_signing_secrets:
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      artifact_name:
+        description: "Nom de l'artefact contenant l'APK signé (+ .sha256)"
+        value: ${{ jobs.build.outputs.artifact_name }}
+      apk_name:
+        description: "Nom du fichier APK"
+        value: ${{ jobs.build.outputs.apk_name }}
+      src_sha:
+        description: "Commit OpenTV Mobile compilé"
+        value: ${{ jobs.build.outputs.src_sha }}
+      src_version:
+        description: "versionName lu dans app/build.gradle.kts"
+        value: ${{ jobs.build.outputs.src_version }}
+      hardening_applied:
+        description: "Liste des correctifs appliqués"
+        value: ${{ jobs.build.outputs.hardening_applied }}
+      cert_sha256:
+        description: "Empreinte SHA-256 du certificat de signature"
+        value: ${{ jobs.build.outputs.cert_sha256 }}
+
+  push:
+    paths:
+      - ".github/workflows/opentv-build.yml"
+
+permissions:
+  contents: read
+
+env:
+  SRC_REPO: opentv-mobile/opentv-mobile
+  SRC_REF: ${{ inputs.ref || 'v1.0.0' }}
+  # Booléens/choix : format() évite les pièges de coercition ('' / null / false) → défauts sûrs.
+  HARDENING: ${{ format('{0}', inputs.hardening) == 'false' && 'false' || 'true' }}
+  UPDATER: ${{ format('{0}', inputs.updater) == 'off' && 'off' || 'manual' }}
+  ALLOW_CLEARTEXT: ${{ format('{0}', inputs.allow_cleartext) == 'false' && 'false' || 'true' }}
+  REQUIRE_SIGNING: ${{ format('{0}', inputs.require_signing_secrets) == 'true' && 'true' || 'false' }}
+  # Android 9 = API 28 : le build échoue tôt si l'amont relève minSdk au-dessus.
+  TARGET_DEVICE_API: "28"
+  BUILD_TOOLS_VERSION: "35.0.0"
+
+jobs:
+  build:
+    name: Build release (updater=${{ inputs.updater || 'manual' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # `secrets` n'est pas utilisable dans `if:` d'un step → projeté en env.
+      HAS_SIGNING_SECRETS: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+    outputs:
+      artifact_name: ${{ steps.apk.outputs.artifact_name }}
+      apk_name: ${{ steps.apk.outputs.apk_name }}
+      src_sha: ${{ steps.meta.outputs.sha }}
+      src_version: ${{ steps.meta.outputs.version }}
+      hardening_applied: ${{ steps.harden.outputs.applied }}
+      cert_sha256: ${{ steps.apk.outputs.cert_sha256 }}
+
+    steps:
+      - name: Checkout de ce dépôt (workflow + patches optionnels)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: self
+          persist-credentials: false
+
+      - name: Checkout des sources OpenTV Mobile (sans fork)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+          path: opentv
+          persist-credentials: false
+
+      - name: Secrets de signature présents ?
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$HAS_SIGNING_SECRETS" = "true" ]; then
+            echo "Signature : keystore des secrets ANDROID_KEYSTORE_*"
+          elif [ "$REQUIRE_SIGNING" = "true" ]; then
+            echo "::error::Secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD manquants (require_signing_secrets=true)."
+            exit 1
+          else
+            echo "::warning title=Clé de signature temporaire::Secrets ANDROID_KEYSTORE_* absents : l'APK sera signé avec une clé jetable (désinstaller avant de réinstaller)."
+          fi
+
+      - name: Métadonnées du build (commit, version, minSdk)
+        id: meta
+        working-directory: opentv
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          VERSION="$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+          MIN_SDK="$(sed -n 's/^[[:space:]]*minSdk = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -n 1)"
+          APP_ID="$(sed -n 's/^[[:space:]]*applicationId = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+          if [ -z "$MIN_SDK" ] || [ "$MIN_SDK" -gt "$TARGET_DEVICE_API" ]; then
+            echo "::error::minSdk=$MIN_SDK > API $TARGET_DEVICE_API : cette révision ne supporte plus Android 9 (Galaxy S8). Choisissez une réf plus ancienne (input 'ref')."
+            exit 1
+          fi
+          {
+            echo "sha=$SHA"
+            echo "short=${SHA:0:7}"
+            echo "version=${VERSION:-unknown}"
+            echo "min_sdk=$MIN_SDK"
+            echo "app_id=${APP_ID:-app.opentvmobile}"
+          } >> "$GITHUB_OUTPUT"
+          echo "OpenTV Mobile $VERSION @ ${SHA:0:7} · ${APP_ID} · minSdk $MIN_SDK (cible API $TARGET_DEVICE_API OK)"
+
+      - name: Hardening des sources (H1–H4)
+        id: harden
+        working-directory: opentv
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPLIED=()
+          fail() { echo "::error::$1 — l'amont a changé : mettez à jour ce step ou relancez avec hardening=false"; exit 1; }
+
+          if [ "$HARDENING" != "true" ]; then
+            echo "::warning::hardening=false : sources compilées telles quelles (allowBackup=true, vérification de mise à jour automatique toutes les 6 h, EPG tiers auto-activés)."
+            echo "applied=aucun (hardening=false)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # H1 — allowBackup=false : identifiants Xtream/Stalker (base Room, en clair) et mot de passe
+          #      NAS (SharedPreferences) ne sont plus extractibles par `adb backup` sur Android 9.
+          F=app/src/main/AndroidManifest.xml
+          sed -i 's/android:allowBackup="true"/android:allowBackup="false"/' "$F"
+          grep -q 'android:allowBackup="false"' "$F" || fail "H1 allowBackup introuvable dans $F"
+          APPLIED+=("H1 allowBackup=false")
+
+          # H2 — plus de vérification automatique : UpdateViewModel interrogeait api.github.com à chaque
+          #      lancement (toutes les 6 h max), sans réglage pour le désactiver. Inutile pour un build
+          #      personnel : un APK officiel ne peut de toute façon pas s'installer par-dessus (signature).
+          F=app/src/main/java/app/opentv/update/UpdateScreen.kt
+          sed -i 's|init { checkThrottled() }|init { /* H2 : vérification automatique des mises à jour désactivée (build personnel) */ }|' "$F"
+          grep -q 'init { /\* H2' "$F" || fail "H2 'init { checkThrottled() }' introuvable dans $F"
+          if grep -rn 'checkThrottled()' app/src/main/java | grep -v 'private fun checkThrottled()' | grep -q .; then
+            fail "H2 un autre appel automatique de checkThrottled() existe"
+          fi
+          if [ "$UPDATER" = "off" ]; then
+            # Bouton "Rechercher des mises à jour" neutralisé : check() répond toujours "à jour", aucune
+            # requête réseau, aucun téléchargement d'APK ; la permission d'installation disparaît.
+            F=app/src/main/java/app/opentv/update/UpdateChecker.kt
+            sed -i 's|^\([[:space:]]*\)suspend fun check(): Update? = withContext(Dispatchers.IO) {|\1suspend fun check(): Update? = null // H2 (updater=off) : aucune requête GitHub, aucun APK téléchargé\n\1@Suppress("unused") private suspend fun checkUpstream(): Update? = withContext(Dispatchers.IO) {|' "$F"
+            grep -q 'suspend fun check(): Update? = null' "$F" || fail "H2 signature de UpdateChecker.check() introuvable dans $F"
+            grep -q 'private suspend fun checkUpstream()' "$F" || fail "H2 réécriture de UpdateChecker.check() incomplète"
+            F=app/src/main/AndroidManifest.xml
+            sed -i '/android:name="android.permission.REQUEST_INSTALL_PACKAGES"/d' "$F"
+            if grep -q 'REQUEST_INSTALL_PACKAGES' "$F"; then fail "H2 permission REQUEST_INSTALL_PACKAGES toujours présente"; fi
+            APPLIED+=("H2 updater désactivé (aucune requête, permission d'installation retirée)")
+          else
+            APPLIED+=("H2 vérification automatique des mises à jour désactivée (bouton manuel conservé)")
+          fi
+
+          # H3 — guides TV intégrés : EpgRepository activait seul un flux XMLTV tiers (epgshare01.online
+          #      ou GitHub) dès que ≥ 5 chaînes portaient un préfixe UK|/US|/CA|/AU|. Seuil rendu
+          #      inatteignable : rien n'est contacté sans action de l'utilisateur (la liste reste
+          #      disponible dans Réglages → Guide).
+          F=app/src/main/java/app/opentv/data/repo/EpgRepository.kt
+          sed -i 's/const val MIN_CHANNELS_FOR_AUTO_REGION = 5$/const val MIN_CHANNELS_FOR_AUTO_REGION = Int.MAX_VALUE \/\/ H3 : pas d'\''auto-activation/' "$F"
+          grep -q 'MIN_CHANNELS_FOR_AUTO_REGION = Int.MAX_VALUE' "$F" || fail "H3 MIN_CHANNELS_FOR_AUTO_REGION introuvable dans $F"
+          APPLIED+=("H3 EPG tiers non auto-activés")
+
+          # H4 — trafic en clair : autorisé par défaut (panels IPTV en http://). allow_cleartext=false
+          #      impose HTTPS pour tout (fournisseur, logos, EPG) — à n'utiliser que si tout est en https.
+          F=app/src/main/AndroidManifest.xml
+          if [ "$ALLOW_CLEARTEXT" = "true" ]; then
+            echo "H4 ignoré (allow_cleartext=true) : HTTP en clair autorisé pour les panels IPTV"
+          else
+            sed -i 's/android:usesCleartextTraffic="true"/android:usesCleartextTraffic="false"/' "$F"
+            grep -q 'android:usesCleartextTraffic="false"' "$F" || fail "H4 usesCleartextTraffic introuvable dans $F"
+            APPLIED+=("H4 cleartext interdit")
+          fi
+
+          echo "Diff appliqué :"
+          git --no-pager diff --stat
+          git --no-pager diff
+          printf -v JOINED '%s, ' "${APPLIED[@]}"
+          echo "applied=${JOINED%, }" >> "$GITHUB_OUTPUT"
+
+      - name: Patches locaux optionnels (self/patches/opentv/*.patch)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(self/patches/opentv/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then echo "Aucun patch local."; exit 0; fi
+          for p in "${patches[@]}"; do
+            echo "Application de $p"
+            git -C opentv apply --verbose --3way "$GITHUB_WORKSPACE/$p"
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+        with:
+          cache-cleanup: on-success
+
+      - name: Build Release APK
+        working-directory: opentv
+        shell: bash
+        # KEYSTORE_PATH volontairement absent : le projet signe alors avec une clé debug locale,
+        # remplacée ensuite par apksigner avec VOTRE clé (le keystore ne passe jamais par Gradle).
+        run: |
+          chmod +x gradlew
+          ./gradlew --console=plain assembleRelease --warning-mode summary
+
+      - name: Signature (zipalign + apksigner, keystore des secrets ou clé jetable)
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+          if [ ! -x "$BT/apksigner" ]; then BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"; fi
+          echo "build-tools : $BT"
+          DIR="opentv/app/build/outputs/apk/release"
+          BUILT="$(find "$DIR" -maxdepth 1 -name '*.apk' ! -name '*-signed.apk' | head -n 1)"
+          if [ -z "$BUILT" ]; then echo "::error::Aucun APK dans $DIR"; ls -R "$DIR" || true; exit 1; fi
+
+          KS="$RUNNER_TEMP/release.keystore"
+          cleanup() { rm -f "$KS" "$RUNNER_TEMP/aligned.apk"; }
+          trap cleanup EXIT
+          if [ "$HAS_SIGNING_SECRETS" = "true" ]; then
+            printf '%s' "$KS_B64" | tr -d '\n\r ' | base64 -d > "$KS"
+            [ -s "$KS" ] || { echo "::error::ANDROID_KEYSTORE_BASE64 ne se décode pas (base64 invalide ?)"; exit 1; }
+          else
+            KS_ALIAS="opentv"; KS_PASS="$(openssl rand -hex 24)"; KEY_PASS="$KS_PASS"
+            keytool -genkeypair -v -keystore "$KS" -storetype PKCS12 -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=OpenTV Mobile self-build (throwaway), O=self-build" >/dev/null
+          fi
+
+          # zipalign puis apksigner : la signature debug posée par Gradle est remplacée par la vôtre.
+          "$BT/zipalign" -p -f 4 "$BUILT" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$KS" --ks-key-alias "$KS_ALIAS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+            --v4-signing-enabled false \
+            --out "${BUILT%.apk}-signed.apk" "$RUNNER_TEMP/aligned.apk"
+          echo "APK signé : ${BUILT%.apk}-signed.apk"
+
+      - name: Vérifications de sécurité sur l'APK final
+        id: apk
+        shell: bash
+        env:
+          SRC_VERSION: ${{ steps.meta.outputs.version }}
+          SRC_SHORT: ${{ steps.meta.outputs.short }}
+          SRC_SHA: ${{ steps.meta.outputs.sha }}
+          HARDENING_APPLIED: ${{ steps.harden.outputs.applied }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+          if [ ! -x "$BT/apksigner" ]; then BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"; fi
+          DIR="opentv/app/build/outputs/apk/release"
+          SIGNED="$(find "$DIR" -maxdepth 1 -name '*-signed.apk' | head -n 1)"
+          if [ -z "$SIGNED" ]; then echo "::error::Aucun APK signé trouvé"; ls -R "$DIR" || true; exit 1; fi
+          ERRORS=0
+
+          echo "== Signature =="
+          "$BT/apksigner" verify --verbose --print-certs --min-sdk-version "$TARGET_DEVICE_API" "$SIGNED" | tee cert.txt
+          CERT_SHA256="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' cert.txt | head -n 1)"
+          if grep -q 'CN=Android Debug' cert.txt; then echo "::error::APK encore signé avec la clé debug"; ERRORS=$((ERRORS+1)); fi
+
+          echo "== Manifeste =="
+          "$BT/aapt2" dump badging "$SIGNED" > badging.txt
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$SIGNED" > manifest.txt
+          SDK="$(sed -n -E "s/^(minSdkVersion|sdkVersion):'([0-9]+)'.*/\2/p" badging.txt | head -n 1)"
+          PKG="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" badging.txt | head -n 1)"
+          echo "package=$PKG minSdk=$SDK"
+          if [ -z "$SDK" ] || [ "$SDK" -gt "$TARGET_DEVICE_API" ]; then echo "::error::minSdk $SDK > $TARGET_DEVICE_API : incompatible Android 9"; ERRORS=$((ERRORS+1)); fi
+          # Pur Kotlin : s'il y a des libs natives, arm64-v8a doit en faire partie ; sans libs natives, OK.
+          if grep -q "^native-code:" badging.txt && ! grep -q "native-code:.*'arm64-v8a'" badging.txt; then echo "::error::libs natives sans arm64-v8a"; ERRORS=$((ERRORS+1)); fi
+          if grep -Eq 'debuggable\(0x0101000f\)=(true|\(type 0x12\)0xffffffff)' manifest.txt; then echo "::error::APK debuggable"; ERRORS=$((ERRORS+1)); fi
+          if grep -Eq 'allowBackup\(0x01010280\)=(true|\(type 0x12\)0xffffffff)' manifest.txt; then
+            if [ "$HARDENING" = "true" ]; then echo "::error::allowBackup=true malgré H1"; ERRORS=$((ERRORS+1)); else echo "::warning::allowBackup=true (hardening=false)"; fi
+          fi
+          if [ "$HARDENING" = "true" ] && [ "$ALLOW_CLEARTEXT" = "false" ] && grep -Eq '(usesCleartextTraffic|0x010104ec)[^=]*=(true|\(type 0x12\)0xffffffff)' manifest.txt; then
+            echo "::error::usesCleartextTraffic=true malgré allow_cleartext=false"; ERRORS=$((ERRORS+1))
+          fi
+          grep "^uses-permission" badging.txt | sed "s/.*name='\([^']*\)'.*/  perm: \1/" | tee perms.txt
+          if [ "$HARDENING" = "true" ] && [ "$UPDATER" = "off" ] && grep -q 'REQUEST_INSTALL_PACKAGES' perms.txt; then
+            echo "::error::REQUEST_INSTALL_PACKAGES encore présente (updater=off)"; ERRORS=$((ERRORS+1))
+          fi
+
+          echo "== Secrets embarqués ? (DEX) =="
+          mkdir -p "$RUNNER_TEMP/dex"
+          unzip -o -q "$SIGNED" 'classes*.dex' -d "$RUNNER_TEMP/dex"
+          if LC_ALL=C grep -a -h -o -E '(github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{32,}|AIza[0-9A-Za-z_-]{35})' "$RUNNER_TEMP"/dex/*.dex | sort -u | sed 's/\(.\{12\}\).*/\1…/' | tee secrets.txt | grep -q .; then
+            echo "::error::Jeton/secret trouvé dans le code compilé (ci-dessus, tronqué)"; ERRORS=$((ERRORS+1))
+          else
+            echo "Aucun jeton GitHub/API dans les DEX ✔"
+          fi
+
+          echo "== Hôtes réseau embarqués =="
+          LC_ALL=C grep -a -h -o -E '(https?|wss?)://[A-Za-z0-9._-]+' "$RUNNER_TEMP"/dex/*.dex \
+            | sed -E 's#^[^:]+://##' | grep -Ev '^(schemas\.android\.com|www\.w3\.org|xml\.org|xmlpull\.org|xml\.apache\.org|apache\.org|java\.sun\.com|ns\.adobe\.com|purl\.org|schemas\.microsoft\.com|localhost|default\.url|aomedia\.org|dashif\.org|developer\.android\.com|developer\.apple\.com|issuetracker\.google\.com|g\.co|goo\.gle|([A-Za-z0-9-]+\.)*example\.com|youtrack\.jetbrains\.com|www\.slf4j\.org|[A-Za-z0-9]{1,2})$' \
+            | sort -u > hosts.txt || true
+          wc -l < hosts.txt | xargs echo "hôtes distincts :"
+          cat hosts.txt
+          # Hôtes attendus (audit du 14/10/2026) : fournisseur de l'utilisateur (saisi), GitHub (bouton manuel),
+          # TMDB (uniquement avec VOTRE clé), EPG intégrés (activation manuelle), liens de dons/licence.
+          EXPECTED='^(github\.com|api\.github\.com|api\.themoviedb\.org|image\.tmdb\.org|epgshare01\.online|raw\.githubusercontent\.com|ko-fi\.com|www\.paypal\.com|www\.gnu\.org)$'
+          if grep -Ev "$EXPECTED" hosts.txt | grep -q .; then
+            echo "::warning title=Hôte réseau inattendu::$(grep -Ev "$EXPECTED" hosts.txt | tr '\n' ' ') — vérifiez le diff amont avant d'installer"
+          fi
+
+          [ "$ERRORS" -eq 0 ] || { echo "::error::$ERRORS vérification(s) en échec"; exit 1; }
+
+          APK_NAME="OpenTV-Mobile-${SRC_VERSION}-${SRC_SHORT}.apk"
+          ARTIFACT_NAME="${APK_NAME%.apk}"
+          mkdir -p artifacts
+          cp "$SIGNED" "artifacts/$APK_NAME"
+          (cd artifacts && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          {
+            echo "apk_name=$APK_NAME"
+            echo "artifact_name=$ARTIFACT_NAME"
+            echo "cert_sha256=$CERT_SHA256"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## OpenTV Mobile ${SRC_VERSION} · commit \`${SRC_SHORT}\`"
+            echo ""
+            echo "- Source : https://github.com/${SRC_REPO}/commit/${SRC_SHA} (réf \`${SRC_REF}\`)"
+            echo "- Cible : Android 9 (API ${TARGET_DEVICE_API}) · minSdk ${SDK} · package \`${PKG}\`"
+            echo "- Hardening : ${HARDENING_APPLIED}"
+            echo "- Signature : $([ "$HAS_SIGNING_SECRETS" = "true" ] && echo 'keystore des secrets ANDROID_KEYSTORE_*' || echo '**clé jetable (test uniquement)**') · cert SHA-256 \`${CERT_SHA256}\`"
+            echo "- SHA-256 APK : \`$(cut -d' ' -f1 "artifacts/$APK_NAME.sha256")\`"
+            echo "- Secrets embarqués : aucun ✔ · Permissions :"
+            echo '```'
+            cat perms.txt
+            echo '```'
+            echo "<details><summary>Hôtes réseau présents dans le code ($(wc -l < hosts.txt))</summary>"
+            echo ""
+            echo '```'
+            cat hosts.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload de l'APK signé
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.apk.outputs.artifact_name }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
