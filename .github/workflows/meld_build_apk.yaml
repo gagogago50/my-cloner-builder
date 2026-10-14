@@ -15,8 +15,10 @@
 #                                        serveur Listen Together local en ws://)
 #       H3 UPDATER_AVAILABLE=false      (pas de vérif. de mise à jour vers les APK
 #                                        officiels, incompatibles avec votre signature)
-#       H4 miroir Maven Aliyun retiré   (chaîne d'approvisionnement : Google,
-#                                        Maven Central, JitPack uniquement)
+#       H4 miroir Maven Aliyun retiré   (Google, Maven Central, JitPack uniquement ;
+#                                        le seul artefact JCenter requis, tinypinyin
+#                                        2.0.3, est téléchargé, vérifié par SHA-256 et
+#                                        servi depuis un dépôt local)
 #       H5 CRASH_REPORT_TOKEN vide      (CrashReporter désactivé : rien n'est envoyé
 #                                        aux issues GitHub du projet)
 #   • vérifications sur l'APK final : aucun jeton GitHub/API embarqué, allowBackup,
@@ -258,13 +260,40 @@ jobs:
           if grep -q '"UPDATER_AVAILABLE", "true"' "$F"; then fail "H3 UPDATER_AVAILABLE encore à true dans $F"; fi
           APPLIED+=("H3 updater désactivé")
 
-          # H4 — dépendances résolues uniquement via Google / Maven Central / JitPack
-          #      (le miroir Aliyun, hérité de Metrolist, n'est qu'un proxy non vérifié).
+          # H4 — plus de miroir Aliyun (proxy non vérifié hérité de Metrolist). Un seul artefact en a
+          #      besoin : com.github.promeg:tinypinyin:2.0.3 (JCenter, disparu), dépendance transitive de
+          #      com.github.promeG:tinypinyin (JitPack) utilisée pour la romanisation des paroles chinoises.
+          #      On le télécharge AVANT le build, on vérifie son SHA-256 (identique sur deux miroirs
+          #      indépendants, Aliyun et Huawei Cloud, bibliothèque Java pure sans réseau), puis on le sert
+          #      depuis un dépôt Maven local limité à ce seul module. Gradle ne contacte plus Aliyun.
+          VENDOR="$RUNNER_TEMP/vendored-m2"
+          A="$VENDOR/com/github/promeg/tinypinyin/2.0.3"
+          mkdir -p "$A"
+          JAR_SHA="083648e8a4412cecaa72d26c11c4116f49ec9c887cc046fabc21458c78c6cbf8"
+          POM_SHA="a9b7572ad868df838cd9863bba7da67ec6a7a56529ca7d0806da43da62c73143"
+          vendored=false
+          for base in "https://maven.aliyun.com/repository/public" "https://repo.huaweicloud.com/repository/maven"; do
+            if curl -fsSL --retry 3 --max-time 120 -o "$A/tinypinyin-2.0.3.jar" "$base/com/github/promeg/tinypinyin/2.0.3/tinypinyin-2.0.3.jar" \
+               && curl -fsSL --retry 3 --max-time 60 -o "$A/tinypinyin-2.0.3.pom" "$base/com/github/promeg/tinypinyin/2.0.3/tinypinyin-2.0.3.pom" \
+               && echo "$JAR_SHA  $A/tinypinyin-2.0.3.jar" | sha256sum -c --quiet \
+               && echo "$POM_SHA  $A/tinypinyin-2.0.3.pom" | sha256sum -c --quiet; then
+              echo "tinypinyin 2.0.3 vendorisé depuis $base (SHA-256 vérifié)"
+              vendored=true
+              break
+            fi
+            echo "::warning::$base : téléchargement impossible ou empreinte différente, miroir suivant"
+            rm -f "$A/tinypinyin-2.0.3.jar" "$A/tinypinyin-2.0.3.pom"
+          done
+          [ "$vendored" = "true" ] || fail "H4 tinypinyin 2.0.3 introuvable (ou empreinte SHA-256 différente) sur tous les miroirs"
+          F=settings.gradle.kts
+          sed -i "s|maven { setUrl(\"https://maven.aliyun.com/repository/public\") }|maven { setUrl(\"file://$VENDOR\"); content { includeModule(\"com.github.promeg\", \"tinypinyin\") } }|" "$F"
+          grep -q "file://$VENDOR" "$F" || fail "H4 ligne du miroir Aliyun introuvable dans $F"
+          F=build.gradle.kts
+          sed -i '/maven\.aliyun\.com/d' "$F"   # classpath buildscript : AGP (Google) + Kotlin (Central), rien d'autre
           for F in settings.gradle.kts build.gradle.kts; do
-            sed -i '/maven\.aliyun\.com/d' "$F"
             if grep -qi 'aliyun' "$F"; then fail "H4 miroir Aliyun toujours présent dans $F"; fi
           done
-          APPLIED+=("H4 miroir Aliyun retiré")
+          APPLIED+=("H4 miroir Aliyun retiré (tinypinyin vendorisé, SHA-256 épinglé)")
 
           echo "Diff appliqué :"
           git --no-pager diff --stat
