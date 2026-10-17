@@ -1,0 +1,813 @@
+# =============================================================================
+#  Build Nuvio (NuvioMedia/NuvioMobile) depuis VOTRE dépôt, sans fork.
+#  Cible : Galaxy S8 · Android 9 (API 28) · arm64-v8a (APK allégé par défaut).
+#
+#  Même recette que meld-build.yml / opentv-build.yml / cloudstream-build.yml :
+#   • actions épinglées par SHA (pas de mise à jour silencieuse d'une action)
+#   • variante "full" compilée NON signée par Gradle (ligne signingConfig retirée),
+#     puis signée directement avec apksigner (aucune action tierce ne voit votre
+#     keystore), clé lue dans VOS secrets :
+#       ANDROID_KEYSTORE_BASE64 · ANDROID_KEYSTORE_PASSWORD
+#       ANDROID_KEY_ALIAS       · ANDROID_KEY_PASSWORD
+#   • backend (input backend) — Nuvio s'appuie sur un serveur Supabase pour les
+#     comptes, la synchro et les catalogues d'avatars :
+#       local    (défaut) aucune adresse de serveur dans l'APK (hôte factice
+#                .invalid, RFC 2606) → mode « Continuer sans compte » uniquement,
+#                données 100 % locales, AUCUNE connexion aux serveurs Nuvio.
+#                Vous pourrez toujours brancher un serveur auto-hébergé dans
+#                l'écran de connexion (« serveur personnalisé »).
+#       official serveur officiel api.nuvio.tv : URL + clé publique (rôle anon)
+#                lues au moment du build dans le document PUBLIC
+#                https://api.nuvio.tv/.well-known/nuvio → comptes et synchro.
+#       custom   votre propre instance : secrets NUVIO_SUPABASE_URL +
+#                NUVIO_SUPABASE_ANON_KEY (+ NUVIO_SUPABASE_FALLBACK_URL optionnel).
+#   • "hardening" appliqué aux sources AVANT compilation (input hardening=true) :
+#       N1 Sentry neutralisé          DSN toujours vide (jamais transmis au build)
+#                                     + interrupteur « rapports de plantage »
+#                                     masqué et désactivé par défaut
+#       N2 mises à jour de l'appli    (updater=off, défaut) plus aucune requête
+#          désactivées                api.github.com ; REQUEST_INSTALL_PACKAGES
+#                                     retirée. L'updater amont proposerait de
+#                                     toute façon l'APK officiel, refusé par
+#                                     Android (signature différente).
+#       N3 installation d'addon par   un lien web stremio://… ou nuvio://hôte/…
+#          lien désactivée            installait un addon distant SANS
+#                                     confirmation (simple toast). Les addons et
+#                                     dépôts de plugins s'ajoutent toujours à la
+#                                     main dans Réglages. addon_deeplinks=true
+#                                     pour garder le comportement amont.
+#       N4 contrôles                  allowBackup=false et magasin de certificats
+#                                     « system » (pas de CA utilisateur) vérifiés
+#                                     (déjà le cas en amont : le build échoue si
+#                                     ça change)
+#       N5 plugins coupés du réseau   le fetch des plugins JS ne peut plus
+#          local                      joindre 192.168.x / 10.x / 172.16-31.x /
+#                                     localhost / *.local / IPv6 littérales, y
+#                                     compris via une redirection HTTP (chaque
+#                                     saut est contrôlé). Protège box, NAS,
+#                                     caméras contre un plugin malveillant.
+#       N6 pas de synchro cloud des   avec un compte (backend official/custom),
+#          secrets                    vos clés Debrid/TMDB/MDBList et les jetons
+#                                     de serveurs Jellyfin/Plex/Emby ne sont plus
+#                                     envoyés au serveur (le reste de la synchro
+#                                     — bibliothèque, progression… — fonctionne)
+#   • ajustements hors hardening : abi=arm64-v8a (split ABI réduit à arm64),
+#     app_id_suffix optionnel (ex. .selfbuild) pour cohabiter avec l'officiel.
+#   • vérifications sur l'APK final : signature, minSdk ≤ 28, package, ABI,
+#     debuggable, allowBackup, permissions, aucun SDK de pistage (le SDK Sentry
+#     est présent mais doit être inerte : aucun DSN dans les DEX), aucun jeton
+#     dans les DEX, inventaire des hôtes dans le résumé.
+#
+#  Chaque modification est contrôlée par grep : si l'amont change le code ciblé,
+#  le build ÉCHOUE au lieu de produire un APK non durci.
+#
+#  Secrets optionnels :
+#    TMDB_API_KEY                         métadonnées + plugins Gowaru (sinon :
+#                                         saisissez votre propre clé TMDB dans
+#                                         Réglages de l'appli)
+#    TRAKT_CLIENT_ID · TRAKT_CLIENT_SECRET · SIMKL_CLIENT_ID   (suivi, sinon
+#                                         connexion Trakt/Simkl indisponible)
+#    NUVIO_SUPABASE_URL · NUVIO_SUPABASE_ANON_KEY · NUVIO_SUPABASE_FALLBACK_URL
+#                                         (backend=custom uniquement)
+#  Sans secrets de signature : clé jetable + avertissement (ou échec si
+#  require_signing_secrets=true, ce que fait nuvio-release.yml).
+# =============================================================================
+name: Build Nuvio (Galaxy S8 / Android 9)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag/branche/commit de NuvioMedia/NuvioMobile (ex. 0.6.1-beta, ou cmp-rewrite = dernier code)"
+        required: false
+        default: "0.6.1-beta"
+        type: string
+      backend:
+        description: "local = aucun serveur Nuvio (sans compte) · official = api.nuvio.tv (comptes/synchro) · custom = secrets NUVIO_SUPABASE_*"
+        required: false
+        default: "local"
+        type: choice
+        options:
+          - local
+          - official
+          - custom
+      hardening:
+        description: "Appliquer les correctifs N1–N6"
+        required: false
+        default: true
+        type: boolean
+      updater:
+        description: "off = updater intégré neutralisé (conseillé) · upstream = laissé tel quel (inutile : APK officiel refusé, signature différente)"
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - "off"
+          - upstream
+      addon_deeplinks:
+        description: "Garder l'installation d'addons par lien stremio:// / nuvio:// sans confirmation (déconseillé)"
+        required: false
+        default: false
+        type: boolean
+      abi:
+        description: "arm64-v8a (Galaxy S8, APK léger) ou all (universel)"
+        required: false
+        default: "arm64-v8a"
+        type: choice
+        options:
+          - arm64-v8a
+          - all
+      app_id_suffix:
+        description: "Suffixe de package optionnel (ex. .selfbuild) pour installer à côté de l'officiel"
+        required: false
+        default: ""
+        type: string
+      require_signing_secrets:
+        description: "Échouer si les secrets ANDROID_KEYSTORE_* sont absents (au lieu d'une clé jetable)"
+        required: false
+        default: false
+        type: boolean
+
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        default: "0.6.1-beta"
+        type: string
+      backend:
+        required: false
+        default: "local"
+        type: string
+      hardening:
+        required: false
+        default: true
+        type: boolean
+      updater:
+        required: false
+        default: "off"
+        type: string
+      addon_deeplinks:
+        required: false
+        default: false
+        type: boolean
+      abi:
+        required: false
+        default: "arm64-v8a"
+        type: string
+      app_id_suffix:
+        required: false
+        default: ""
+        type: string
+      require_signing_secrets:
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      artifact_name:
+        description: "Nom de l'artefact contenant l'APK signé (+ .sha256)"
+        value: ${{ jobs.build.outputs.artifact_name }}
+      apk_name:
+        description: "Nom du fichier APK"
+        value: ${{ jobs.build.outputs.apk_name }}
+      src_sha:
+        description: "Commit Nuvio compilé"
+        value: ${{ jobs.build.outputs.src_sha }}
+      src_version:
+        description: "versionName (iosApp/Configuration/Version.xcconfig)"
+        value: ${{ jobs.build.outputs.src_version }}
+      package_name:
+        description: "Package Android de l'APK"
+        value: ${{ jobs.build.outputs.package_name }}
+      hardening_applied:
+        description: "Liste des correctifs appliqués"
+        value: ${{ jobs.build.outputs.hardening_applied }}
+      backend_mode:
+        description: "Mode backend compilé (local/official/custom)"
+        value: ${{ jobs.build.outputs.backend_mode }}
+      cert_sha256:
+        description: "Empreinte SHA-256 du certificat de signature"
+        value: ${{ jobs.build.outputs.cert_sha256 }}
+
+  push:
+    paths:
+      - ".github/workflows/nuvio-build.yml"
+
+permissions:
+  contents: read
+
+env:
+  SRC_REPO: NuvioMedia/NuvioMobile
+  SRC_REF: ${{ inputs.ref || '0.6.1-beta' }}
+  BACKEND: ${{ inputs.backend || 'local' }}
+  UPDATER: ${{ inputs.updater || 'off' }}
+  ABI: ${{ inputs.abi || 'arm64-v8a' }}
+  APP_ID_SUFFIX: ${{ inputs.app_id_suffix || '' }}
+  # Booléens : format() évite les pièges de coercition ('' / null / false) → défauts sûrs.
+  HARDENING: ${{ format('{0}', inputs.hardening) == 'false' && 'false' || 'true' }}
+  ADDON_DEEPLINKS: ${{ format('{0}', inputs.addon_deeplinks) == 'true' && 'true' || 'false' }}
+  REQUIRE_SIGNING: ${{ format('{0}', inputs.require_signing_secrets) == 'true' && 'true' || 'false' }}
+  BASE_APP_ID: com.nuvio.app
+  # Hôte réservé (RFC 2606) : ne se résout jamais → aucun trafic vers un serveur.
+  LOCAL_BACKEND_URL: https://nuvio-backend.invalid
+  OFFICIAL_DISCOVERY_URL: https://api.nuvio.tv/.well-known/nuvio
+  # Android 9 = API 28 : le build échoue tôt si l'amont relève minSdk au-dessus.
+  TARGET_DEVICE_API: "28"
+  BUILD_TOOLS_VERSION: "36.0.0"
+
+jobs:
+  build:
+    name: Build full release (${{ inputs.abi || 'arm64-v8a' }}, backend ${{ inputs.backend || 'local' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    env:
+      # `secrets` n'est pas utilisable dans `if:` d'un step → projeté en env.
+      HAS_SIGNING_SECRETS: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+    outputs:
+      artifact_name: ${{ steps.apk.outputs.artifact_name }}
+      apk_name: ${{ steps.apk.outputs.apk_name }}
+      src_sha: ${{ steps.meta.outputs.sha }}
+      src_version: ${{ steps.meta.outputs.version }}
+      package_name: ${{ steps.apk.outputs.package_name }}
+      hardening_applied: ${{ steps.harden.outputs.applied }}
+      backend_mode: ${{ steps.backend.outputs.mode }}
+      cert_sha256: ${{ steps.apk.outputs.cert_sha256 }}
+
+    steps:
+      - name: Checkout de ce dépôt (workflow + patches optionnels)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: self
+          persist-credentials: false
+
+      - name: Checkout des sources Nuvio (sans fork, sans sous-module iOS)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+          path: nuvio
+          persist-credentials: false
+          submodules: false
+
+      - name: Secrets de signature présents ?
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$HAS_SIGNING_SECRETS" = "true" ]; then
+            echo "Signature : keystore des secrets ANDROID_KEYSTORE_*"
+          elif [ "$REQUIRE_SIGNING" = "true" ]; then
+            echo "::error::Secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD manquants (require_signing_secrets=true)."
+            exit 1
+          else
+            echo "::warning title=Clé de signature temporaire::Secrets ANDROID_KEYSTORE_* absents : l'APK sera signé avec une clé jetable (désinstaller avant de réinstaller)."
+          fi
+
+      - name: Métadonnées du build (commit, version, contrôles d'entrée)
+        id: meta
+        working-directory: nuvio
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          XC=iosApp/Configuration/Version.xcconfig
+          VERSION="$(sed -n 's/^MARKETING_VERSION=\([^[:space:]]*\).*/\1/p' "$XC" | head -n 1)"
+          VCODE="$(sed -n 's/^CURRENT_PROJECT_VERSION=\([0-9]*\).*/\1/p' "$XC" | head -n 1)"
+          MIN_SDK="$(sed -n 's/^android-minSdk = "\([0-9]*\)".*/\1/p' gradle/libs.versions.toml | head -n 1)"
+          if [ -z "$VERSION" ] || [ -z "$VCODE" ]; then echo "::error::MARKETING_VERSION / CURRENT_PROJECT_VERSION introuvables dans $XC"; exit 1; fi
+          if [ -z "$MIN_SDK" ] || [ "$MIN_SDK" -gt "$TARGET_DEVICE_API" ]; then
+            echo "::error::minSdk=$MIN_SDK > API $TARGET_DEVICE_API : cette révision ne supporte plus Android 9. Choisissez une réf plus ancienne (input 'ref')."
+            exit 1
+          fi
+          case "$BACKEND" in local|official|custom) ;; *) echo "::error::backend inconnu : $BACKEND (local|official|custom)"; exit 1;; esac
+          case "$UPDATER" in off|upstream) ;; *) echo "::error::updater inconnu : $UPDATER (off|upstream)"; exit 1;; esac
+          case "$ABI" in arm64-v8a|all) ;; *) echo "::error::abi inconnue : $ABI (arm64-v8a|all)"; exit 1;; esac
+          if [ -n "$APP_ID_SUFFIX" ] && ! [[ "$APP_ID_SUFFIX" =~ ^(\.[a-z][a-z0-9_]{0,30}){1,2}$ ]]; then
+            echo "::error::app_id_suffix invalide : '$APP_ID_SUFFIX' (attendu : .motenminuscules, ex. .selfbuild)"
+            exit 1
+          fi
+          {
+            echo "sha=$SHA"
+            echo "short=${SHA:0:7}"
+            echo "version=$VERSION"
+            echo "version_code=$VCODE"
+            echo "min_sdk=$MIN_SDK"
+            echo "package=${BASE_APP_ID}${APP_ID_SUFFIX}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Nuvio $VERSION ($VCODE) @ ${SHA:0:7} · minSdk $MIN_SDK (cible API $TARGET_DEVICE_API OK) · package ${BASE_APP_ID}${APP_ID_SUFFIX} · ABI $ABI · backend $BACKEND"
+
+      - name: Configuration runtime (backend, clés optionnelles → local.properties)
+        id: backend
+        working-directory: nuvio
+        shell: bash
+        env:
+          S_SUPA_URL: ${{ secrets.NUVIO_SUPABASE_URL }}
+          S_SUPA_KEY: ${{ secrets.NUVIO_SUPABASE_ANON_KEY }}
+          S_SUPA_FALLBACK: ${{ secrets.NUVIO_SUPABASE_FALLBACK_URL }}
+          S_TMDB: ${{ secrets.TMDB_API_KEY }}
+          S_TRAKT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          S_TRAKT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
+          S_SIMKL_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          # Les valeurs finissent dans du code Kotlin généré ("…") : on refuse tout
+          # caractère qui pourrait casser la chaîne ou injecter du code.
+          safe() { [[ "$2" =~ ^[A-Za-z0-9._:/=+-]*$ ]] || { echo "::error::valeur de $1 refusée (caractères non autorisés)"; exit 1; }; }
+          https_url() { [[ "$2" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$ ]] || { echo "::error::$1 doit être une URL https:// simple"; exit 1; }; }
+
+          case "$BACKEND" in
+            local)
+              SUPA_URL="$LOCAL_BACKEND_URL"; SUPA_KEY="local-only-build"; SUPA_FALLBACK=""
+              ;;
+            official)
+              DOC="$(curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 --retry 3 "$OFFICIAL_DISCOVERY_URL")" \
+                || { echo "::error::Impossible de lire $OFFICIAL_DISCOVERY_URL"; exit 1; }
+              [ "$(jq -r '.service // empty' <<< "$DOC")" = "nuvio" ] || { echo "::error::Document de découverte inattendu (service ≠ nuvio)"; exit 1; }
+              SUPA_URL="$(jq -r '.backend_url // empty' <<< "$DOC")"
+              SUPA_KEY="$(jq -r '.publishable_key // empty' <<< "$DOC")"
+              SUPA_FALLBACK=""
+              [ -n "$SUPA_KEY" ] || { echo "::error::publishable_key absente du document de découverte"; exit 1; }
+              # Clé publique par conception (rôle anon, déjà présente dans l'APK officiel) ; masquée quand même dans les logs.
+              echo "::add-mask::$SUPA_KEY"
+              ;;
+            custom)
+              if [ -z "$S_SUPA_URL" ] || [ -z "$S_SUPA_KEY" ]; then echo "::error::backend=custom : secrets NUVIO_SUPABASE_URL et NUVIO_SUPABASE_ANON_KEY requis"; exit 1; fi
+              SUPA_URL="$S_SUPA_URL"; SUPA_KEY="$S_SUPA_KEY"; SUPA_FALLBACK="${S_SUPA_FALLBACK:-}"
+              ;;
+          esac
+          SUPA_URL="${SUPA_URL%/}"
+          https_url NUVIO_SUPABASE_URL "$SUPA_URL"
+          [ -z "$SUPA_FALLBACK" ] || https_url NUVIO_SUPABASE_FALLBACK_URL "$SUPA_FALLBACK"
+          for kv in "NUVIO_SUPABASE_ANON_KEY=$SUPA_KEY" "TMDB_API_KEY=$S_TMDB" "TRAKT_CLIENT_ID=$S_TRAKT_ID" \
+                    "TRAKT_CLIENT_SECRET=$S_TRAKT_SECRET" "SIMKL_CLIENT_ID=$S_SIMKL_ID"; do
+            safe "${kv%%=*}" "${kv#*=}"
+          done
+
+          # local.properties est lu par composeApp (GenerateRuntimeConfigsTask) ;
+          # il reste sur le runner (jamais uploadé). Pas de clés NUVIO_RELEASE_* :
+          # la signature Gradle est retirée plus bas, apksigner signe ensuite.
+          umask 077
+          {
+            echo "NUVIO_SUPABASE_URL=$SUPA_URL"
+            echo "NUVIO_SUPABASE_ANON_KEY=$SUPA_KEY"
+            [ -z "$SUPA_FALLBACK" ] || echo "NUVIO_SUPABASE_FALLBACK_URL=$SUPA_FALLBACK"
+            [ -z "$S_TMDB" ] || echo "TMDB_API_KEY=$S_TMDB"
+            [ -z "$S_TRAKT_ID" ] || echo "TRAKT_CLIENT_ID=$S_TRAKT_ID"
+            [ -z "$S_TRAKT_SECRET" ] || echo "TRAKT_CLIENT_SECRET=$S_TRAKT_SECRET"
+            [ -z "$S_SIMKL_ID" ] || echo "SIMKL_CLIENT_ID=$S_SIMKL_ID"
+          } > local.properties
+          echo "mode=$BACKEND" >> "$GITHUB_OUTPUT"
+          echo "Backend : $BACKEND → $(sed -E 's#^https://([^/]+).*#\1#' <<< "$SUPA_URL")"
+          echo "Clés optionnelles : TMDB=$([ -n "$S_TMDB" ] && echo oui || echo non) · Trakt=$([ -n "$S_TRAKT_ID" ] && echo oui || echo non) · Simkl=$([ -n "$S_SIMKL_ID" ] && echo oui || echo non)"
+          if [ -z "$S_TMDB" ]; then
+            echo "::notice title=TMDB::Pas de secret TMDB_API_KEY : saisissez votre clé TMDB dans Réglages → TMDB Enrichment (nécessaire aux métadonnées et à la plupart des plugins Gowaru)."
+          fi
+
+      - name: Hardening des sources (N1–N6)
+        id: harden
+        working-directory: nuvio
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPLIED=()
+          fail() { echo "::error::$1 — l'amont a changé : mettez à jour ce step ou relancez avec hardening=false"; exit 1; }
+          K=composeApp/src
+          MANIFEST=androidApp/src/main/AndroidManifest.xml
+
+          # N4 (contrôles, toujours actifs) : propriétés déjà sûres en amont.
+          grep -q 'android:allowBackup="false"' "$MANIFEST" || fail "N4 allowBackup n'est plus false dans $MANIFEST"
+          NSC=androidApp/src/main/res/xml/network_security_config.xml
+          [ -f "$NSC" ] || NSC="$(find androidApp/src composeApp/src -name network_security_config.xml | head -n 1)"
+          if [ -z "$NSC" ] || [ ! -f "$NSC" ]; then fail "N4 network_security_config.xml introuvable"; fi
+          if grep -q 'src="user"' "$NSC"; then fail "N4 $NSC fait confiance aux CA utilisateur"; fi
+
+          if [ "$HARDENING" != "true" ]; then
+            echo "::warning::hardening=false : sources compilées telles quelles (updater, liens d'installation d'addons, réglage Sentry)."
+            echo "applied=aucun (hardening=false) · N4 contrôlé" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # N1 — Sentry : DSN jamais fourni (voir step Build) + réglage masqué / off par défaut.
+          F=$K/androidMain/kotlin/com/nuvio/app/features/settings/SentrySettingsStorage.android.kt
+          sed -i 's/actual val crashReportsSupported: Boolean = true/actual val crashReportsSupported: Boolean = false \/* N1 *\//' "$F"
+          grep -q 'crashReportsSupported: Boolean = false /\* N1 \*/' "$F" || fail "N1 crashReportsSupported introuvable dans $F"
+          F=$K/commonMain/kotlin/com/nuvio/app/features/settings/SentrySettingsRepository.kt
+          sed -i -e 's/private val _enabled = MutableStateFlow(true)/private val _enabled = MutableStateFlow(false) \/* N1 *\//' \
+                 -e 's/SentrySettingsStorage.loadEnabled() ?: true/SentrySettingsStorage.loadEnabled() ?: false \/* N1 *\//' "$F"
+          [ "$(grep -c '/\* N1 \*/' "$F")" = "2" ] || fail "N1 valeurs par défaut Sentry introuvables dans $F"
+          if ! grep -A1 'android:name="io.sentry.auto-init"' "$MANIFEST" | grep -q 'android:value="false"'; then
+            fail "N1 io.sentry.auto-init n'est plus false"
+          fi
+          APPLIED+=("N1 Sentry inerte")
+
+          # N2 — updater intégré (androidFull) : même valeur que les variantes Play Store / iOS.
+          if [ "$UPDATER" = "off" ]; then
+            F=$K/androidFull/kotlin/com/nuvio/app/core/build/AppFeaturePolicy.android.kt
+            sed -i 's/actual val inAppUpdaterEnabled: Boolean = true/actual val inAppUpdaterEnabled: Boolean = false \/* N2 *\//' "$F"
+            grep -q 'inAppUpdaterEnabled: Boolean = false /\* N2 \*/' "$F" || fail "N2 inAppUpdaterEnabled introuvable dans $F"
+            # Déclarée deux fois en amont (androidApp/src/full + composeApp/src/androidFull) :
+            # on supprime les deux, puis tools:node="remove" écarte toute copie venant
+            # d'une bibliothèque lors de la fusion des manifestes.
+            for F in androidApp/src/full/AndroidManifest.xml composeApp/src/androidFull/AndroidManifest.xml; do
+              grep -q 'android.permission.REQUEST_INSTALL_PACKAGES' "$F" || fail "N2 REQUEST_INSTALL_PACKAGES introuvable dans $F"
+              sed -i '/android.permission.REQUEST_INSTALL_PACKAGES/d' "$F"
+            done
+            if grep -rq 'REQUEST_INSTALL_PACKAGES' androidApp/src composeApp/src --include=AndroidManifest.xml; then
+              fail "N2 REQUEST_INSTALL_PACKAGES déclarée ailleurs"
+            fi
+            F=androidApp/src/full/AndroidManifest.xml
+            grep -q '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' "$F" || fail "N2 balise <manifest> inattendue dans $F"
+            sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" tools:node="remove" />#' "$F"
+            grep -q 'REQUEST_INSTALL_PACKAGES" tools:node="remove"' "$F" || fail "N2 tools:node=remove non appliqué"
+            APPLIED+=("N2 updater off")
+          else
+            echo "::warning::updater=upstream : l'appli interrogera api.github.com et proposera l'APK officiel (installation refusée : signature différente)."
+          fi
+
+          # N3 — plus d'installation silencieuse d'addon via lien stremio:// / nuvio://hôte/…
+          if [ "$ADDON_DEEPLINKS" != "true" ]; then
+            F=$K/commonMain/kotlin/com/nuvio/app/core/deeplink/AppUrlBridge.kt
+            A='customSchemeToHttpsUrl(url, scheme)?.let(AppDeepLink::AddonInstall)'
+            [ "$(grep -cF "$A" "$F")" = "2" ] || fail "N3 les 2 points d'installation d'addon par lien sont introuvables dans $F"
+            sed -i 's/customSchemeToHttpsUrl(url, scheme)?\.let(AppDeepLink::AddonInstall)/customSchemeToHttpsUrl(url, scheme)?.let { null } \/* N3 *\//' "$F"
+            [ "$(grep -c '/\* N3 \*/' "$F")" = "2" ] || fail "N3 remplacement incomplet dans $F"
+            APPLIED+=("N3 liens d'install d'addon ignorés")
+          fi
+          # N5 — garde-fou réseau des plugins : nouveau fichier + 1 appel remplacé dans FetchBridge.
+          D=$K/fullCommonMain/kotlin/com/nuvio/app/features/plugins/runtime/network
+          F=$D/FetchBridge.kt
+          [ "$(grep -c 'val response = httpRequestRaw(' "$F")" = "1" ] || fail "N5 appel httpRequestRaw introuvable dans $F"
+          grep -q '^import com.nuvio.app.features.addons.httpRequestRaw$' "$F" || fail "N5 import httpRequestRaw introuvable dans $F"
+          grep -q 'suspend fun httpRequestRaw(' $K/commonMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.kt || fail "N5 signature httpRequestRaw introuvable"
+          grep -q 'bodyBytes: ByteArray? = null' $K/commonMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.kt || fail "N5 paramètre bodyBytes introuvable"
+          [ ! -e "$D/PluginNetworkGuard.kt" ] || fail "N5 PluginNetworkGuard.kt existe déjà en amont"
+          sed -i 's/val response = httpRequestRaw(/val response = guardedPluginRequest( \/\* N5 \*\//' "$F"
+          sed -i '/^import com.nuvio.app.features.addons.httpRequestRaw$/d' "$F"
+          grep -q 'guardedPluginRequest( /\* N5 \*/' "$F" || fail "N5 remplacement non appliqué"
+          cat > "$D/PluginNetworkGuard.kt" <<'KOTLIN_EOF'
+            // N5 (self-build) : garde-fou réseau des plugins. Ajouté par nuvio-build.yml.
+            // Les plugins (JS en sandbox QuickJS) ne peuvent plus joindre le réseau local
+            // (box, NAS, caméras, appareils 192.168.x / 10.x…) ni localhost, y compris via
+            // une redirection HTTP : les redirections sont suivies ici, une par une, et
+            // chaque saut est contrôlé. Limite connue : un nom de domaine PUBLIC qui
+            // résout vers une IP privée n'est pas détecté (pas de résolution DNS en code commun),
+            // mais les services connus de ce type (nip.io, sslip.io…) sont bloqués.
+            package com.nuvio.app.features.plugins.runtime.network
+
+            import com.nuvio.app.features.addons.RawHttpResponse
+            import com.nuvio.app.features.addons.httpRequestRaw
+            import io.ktor.http.URLBuilder
+            import io.ktor.http.Url
+            import io.ktor.http.takeFrom
+
+            private const val MAX_PLUGIN_REDIRECTS = 10
+            private val REDIRECT_STATUSES = setOf(301, 302, 303, 307, 308)
+            private val BLOCKED_HOST_SUFFIXES = listOf(
+                ".localhost", ".local", ".lan", ".home", ".home.arpa", ".internal", ".intranet", ".corp",
+                ".localdomain", ".nip.io", ".sslip.io", ".xip.io", ".localtest.me", ".lvh.me",
+            )
+            private val BLOCKED_HOSTS = setOf("localhost", "nip.io", "sslip.io", "xip.io", "localtest.me", "lvh.me")
+
+            internal class PluginNetworkBlockedException(message: String) : IllegalStateException(message)
+
+            internal fun isBlockedPluginHost(rawHost: String): Boolean {
+                val host = rawHost.trim().trimEnd('.').lowercase().removePrefix("[").removeSuffix("]")
+                if (host.isEmpty()) return true
+                if (host in BLOCKED_HOSTS || BLOCKED_HOST_SUFFIXES.any { host.endsWith(it) }) return true
+                // Littéraux IPv6 : jamais utiles à un scraper, et trop de formes d'encodage
+                // (::1, fc00::/7, fe80::/10, ::ffff:a.b.c.d, 64:ff9b::…) → tous refusés.
+                if (':' in host) return true
+                // Nom sans point (« router », « nas ») : résolu par le DNS local.
+                if ('.' !in host) return true
+                val labels = host.split('.')
+                // Encodages IPv4 alternatifs (127.1, 0x7f.0.0.1, 0177.0.0.1…) : refusés.
+                val numericLike = labels.all { l -> l.isNotEmpty() && (l.all(Char::isDigit) || l.startsWith("0x")) }
+                if (!numericLike) return false
+                if (labels.size != 4 || labels.any { l -> l.startsWith("0x") || (l.length > 1 && l.startsWith('0')) }) return true
+                val o = labels.map { it.toIntOrNull() ?: return true }
+                if (o.any { it !in 0..255 }) return true
+                val (a, b) = o
+                return a == 0 || a == 10 || a == 127 || a >= 224 ||
+                    (a == 100 && b in 64..127) ||
+                    (a == 169 && b == 254) ||
+                    (a == 172 && b in 16..31) ||
+                    (a == 192 && b == 168) ||
+                    (a == 192 && b == 0 && o[2] == 0) ||
+                    (a == 198 && b in 18..19)
+            }
+
+            private fun checkPluginUrl(url: String) {
+                if (url.any { it == '\\' || it.code <= 0x20 || it.code == 0x7f }) {
+                    throw PluginNetworkBlockedException("Blocked malformed URL")
+                }
+                val parsed = runCatching { Url(url) }.getOrNull()
+                    ?: throw PluginNetworkBlockedException("Blocked invalid URL")
+                val scheme = parsed.protocol.name.lowercase()
+                if (scheme != "http" && scheme != "https") throw PluginNetworkBlockedException("Blocked scheme: $scheme")
+                if (isBlockedPluginHost(parsed.host)) {
+                    throw PluginNetworkBlockedException("Blocked local-network host for plugins: ${parsed.host}")
+                }
+            }
+
+            internal suspend fun guardedPluginRequest(
+                method: String,
+                url: String,
+                headers: Map<String, String>,
+                body: String,
+                followRedirects: Boolean,
+                bodyBytes: ByteArray?,
+            ): RawHttpResponse {
+                var currentUrl = url
+                var currentMethod = method
+                var currentBody = body
+                var currentBytes = bodyBytes
+                var currentHeaders = headers
+                var hops = 0
+                while (true) {
+                    checkPluginUrl(currentUrl)
+                    val response = httpRequestRaw(
+                        method = currentMethod,
+                        url = currentUrl,
+                        headers = currentHeaders,
+                        body = currentBody,
+                        followRedirects = false,
+                        bodyBytes = currentBytes,
+                    )
+                    if (!followRedirects || response.status !in REDIRECT_STATUSES) return response
+                    val location = response.headers.entries
+                        .firstOrNull { it.key.equals("location", ignoreCase = true) }
+                        ?.value?.trim()
+                    if (location.isNullOrEmpty()) return response
+                    hops += 1
+                    if (hops > MAX_PLUGIN_REDIRECTS) throw PluginNetworkBlockedException("Too many redirects")
+                    val previousHost = runCatching { Url(currentUrl).host }.getOrNull()
+                    currentUrl = URLBuilder(currentUrl).takeFrom(location).buildString()
+                    if (runCatching { Url(currentUrl).host }.getOrNull() != previousHost) {
+                        // Comme OkHttp : pas d'en-tête Authorization vers un autre hôte.
+                        currentHeaders = currentHeaders.filterKeys { !it.equals("Authorization", ignoreCase = true) }
+                    }
+                    val status = response.status
+                    if (status == 303 || ((status == 301 || status == 302) && currentMethod.uppercase() == "POST")) {
+                        currentMethod = "GET"
+                        currentBody = ""
+                        currentBytes = null
+                        currentHeaders = currentHeaders.filterKeys {
+                            !it.equals("Content-Type", ignoreCase = true) && !it.equals("Content-Length", ignoreCase = true)
+                        }
+                    }
+                }
+            }
+          KOTLIN_EOF
+          grep -q 'internal suspend fun guardedPluginRequest(' "$D/PluginNetworkGuard.kt" || fail "N5 fichier garde-fou incomplet"
+          APPLIED+=("N5 plugins coupés du réseau local")
+
+          # N6 — plus de synchro cloud des secrets (clés API + jetons de serveurs média).
+          F=$K/commonMain/kotlin/com/nuvio/app/core/sync/ProviderCredentialSync.kt
+          L='if (state.isAnonymous || ProfileRepository.activeProfileId != profileId) return null'
+          [ "$(grep -cF "$L" "$F")" = "1" ] || fail "N6 garde currentScope introuvable dans $F"
+          sed -i 's/if (state.isAnonymous || ProfileRepository.activeProfileId != profileId) return null/if (n6NoCredentialCloudSync || state.isAnonymous || ProfileRepository.activeProfileId != profileId) return null \/\* N6 \*\//' "$F"
+          printf '\n// N6 (self-build) : clés Debrid/TMDB/MDBList jamais synchronisées vers le serveur.\nprivate val n6NoCredentialCloudSync: Boolean = true\n' >> "$F"
+          grep -q 'if (n6NoCredentialCloudSync || state.isAnonymous' "$F" || fail "N6 remplacement non appliqué dans $F"
+          F=$K/commonMain/kotlin/com/nuvio/app/core/sync/MediaServerSync.kt
+          L='return !state.isAnonymous && ProfileRepository.activeProfileId == profileId'
+          [ "$(grep -cF "$L" "$F")" = "1" ] || fail "N6 garde canSync introuvable dans $F"
+          sed -i 's/return !state.isAnonymous && ProfileRepository.activeProfileId == profileId/return !n6NoMediaServerCloudSync \&\& !state.isAnonymous \&\& ProfileRepository.activeProfileId == profileId \/\* N6 \*\//' "$F"
+          printf '\n// N6 (self-build) : adresses + jetons Jellyfin/Plex/Emby jamais synchronisés vers le serveur.\nprivate val n6NoMediaServerCloudSync: Boolean = true\n' >> "$F"
+          grep -q 'return !n6NoMediaServerCloudSync && !state.isAnonymous' "$F" || fail "N6 remplacement non appliqué dans $F"
+          APPLIED+=("N6 pas de synchro cloud des secrets")
+
+          APPLIED+=("N4 allowBackup=false + CA système contrôlés")
+
+          git --no-pager diff --stat
+          (IFS=';'; echo "applied=${APPLIED[*]}") | sed 's/;/ · /g' >> "$GITHUB_OUTPUT"
+
+      - name: Ajustements (signature Gradle retirée, ABI, suffixe de package)
+        working-directory: nuvio
+        shell: bash
+        run: |
+          set -euo pipefail
+          F=androidApp/build.gradle.kts
+          # 1) APK non signé par Gradle : la signature se fait avec apksigner (step suivant).
+          L='signingConfig = signingConfigs.getByName("release")'
+          [ "$(grep -cF "$L" "$F")" = "1" ] || { echo "::error::ligne signingConfig introuvable dans $F"; exit 1; }
+          sed -i '/signingConfig = signingConfigs.getByName("release")/d' "$F"
+          # 2) ABI : split amont = 4 APK (v7a, arm64, x86, x86_64) sans universel.
+          INC='include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")'
+          [ "$(grep -cF "$INC" "$F")" = "1" ] || { echo "::error::bloc splits.abi introuvable dans $F"; exit 1; }
+          if [ "$ABI" = "arm64-v8a" ]; then
+            sed -i 's/include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")/include("arm64-v8a") \/\/ Galaxy S8/' "$F"
+            grep -q 'include("arm64-v8a") // Galaxy S8' "$F" || { echo "::error::split ABI non appliqué"; exit 1; }
+          else
+            sed -i 's/isUniversalApk = false/isUniversalApk = true/' "$F"
+            grep -q 'isUniversalApk = true' "$F" || { echo "::error::isUniversalApk non appliqué"; exit 1; }
+          fi
+          # 3) Suffixe de package optionnel.
+          if [ -n "$APP_ID_SUFFIX" ]; then
+            sed -i "s/^\([[:space:]]*\)applicationId = \"${BASE_APP_ID//./\\.}\"$/\1applicationId = \"${BASE_APP_ID}${APP_ID_SUFFIX}\"/" "$F"
+            grep -q "applicationId = \"${BASE_APP_ID}${APP_ID_SUFFIX}\"" "$F" || { echo "::error::applicationId non modifié"; exit 1; }
+          fi
+          git --no-pager diff -- "$F"
+
+      - name: Patches locaux optionnels (self/patches/nuvio/*.patch)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(self/patches/nuvio/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then echo "Aucun patch local."; exit 0; fi
+          for p in "${patches[@]}"; do
+            echo "Application de $p"
+            git -C nuvio apply --verbose --3way "$GITHUB_WORKSPACE/$p"
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+        with:
+          cache-cleanup: on-success
+
+      - name: Build full release APK (non signé)
+        working-directory: nuvio
+        shell: bash
+        env:
+          # N1 : jamais de DSN ni de jeton d'upload Sentry (mapping non envoyé).
+          SENTRY_DSN: ""
+          SENTRY_AUTH_TOKEN: ""
+          SENTRY_ORG: ""
+          SENTRY_PROJECT: ""
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --console=plain :androidApp:assembleFullRelease --warning-mode summary
+          ls -la androidApp/build/outputs/apk/full/release/
+
+      - name: Signature (zipalign + apksigner, keystore des secrets ou clé jetable)
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+          if [ ! -x "$BT/apksigner" ]; then BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"; fi
+          echo "build-tools : $BT"
+          DIR="nuvio/androidApp/build/outputs/apk/full/release"
+          PATTERN="$([ "$ABI" = "arm64-v8a" ] && echo '*arm64-v8a*.apk' || echo '*universal*.apk')"
+          mapfile -t FOUND < <(find "$DIR" -maxdepth 1 -name "$PATTERN" ! -name '*-signed.apk' | sort)
+          if [ "${#FOUND[@]}" -ne 1 ]; then echo "::error::attendu 1 APK '$PATTERN' dans $DIR, trouvé ${#FOUND[@]}"; ls -la "$DIR" || true; exit 1; fi
+          UNSIGNED="${FOUND[0]}"
+          echo "APK non signé : $UNSIGNED"
+
+          KS="$RUNNER_TEMP/release.keystore"
+          cleanup() { rm -f "$KS" "$RUNNER_TEMP/aligned.apk"; }
+          trap cleanup EXIT
+          if [ "$HAS_SIGNING_SECRETS" = "true" ]; then
+            printf '%s' "$KS_B64" | tr -d '\n\r ' | base64 -d > "$KS"
+            [ -s "$KS" ] || { echo "::error::ANDROID_KEYSTORE_BASE64 ne se décode pas (base64 invalide ?)"; exit 1; }
+          else
+            KS_ALIAS="nuvio"; KS_PASS="$(openssl rand -hex 24)"; KEY_PASS="$KS_PASS"
+            keytool -genkeypair -v -keystore "$KS" -storetype PKCS12 -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=Nuvio self-build (throwaway), O=self-build" >/dev/null
+          fi
+
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$KS" --ks-key-alias "$KS_ALIAS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+            --v4-signing-enabled false \
+            --out "$DIR/nuvio-signed.apk" "$RUNNER_TEMP/aligned.apk"
+          echo "APK signé : $DIR/nuvio-signed.apk"
+
+      - name: Vérifications de sécurité sur l'APK final
+        id: apk
+        shell: bash
+        env:
+          EXPECTED_PKG: ${{ steps.meta.outputs.package }}
+          HARDENING_APPLIED: ${{ steps.harden.outputs.applied }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+          if [ ! -x "$BT/apksigner" ]; then BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"; fi
+          SIGNED="nuvio/androidApp/build/outputs/apk/full/release/nuvio-signed.apk"
+          [ -f "$SIGNED" ] || { echo "::error::APK signé introuvable"; exit 1; }
+          ERRORS=0
+
+          echo "== Signature =="
+          "$BT/apksigner" verify --verbose --print-certs --min-sdk-version "$TARGET_DEVICE_API" "$SIGNED" | tee cert.txt
+          CERT_SHA256="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' cert.txt | head -n 1)"
+
+          echo "== Manifeste =="
+          "$BT/aapt2" dump badging "$SIGNED" > badging.txt
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$SIGNED" > manifest.txt
+          SDK="$(sed -n -E "s/^(minSdkVersion|sdkVersion):'([0-9]+)'.*/\2/p" badging.txt | head -n 1)"
+          PKG="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" badging.txt | head -n 1)"
+          NATIVE="$(sed -n "s/^native-code: //p" badging.txt | head -n 1)"
+          echo "package=$PKG minSdk=$SDK native-code=$NATIVE"
+          if [ "$PKG" != "$EXPECTED_PKG" ]; then echo "::error::package $PKG ≠ attendu $EXPECTED_PKG"; ERRORS=$((ERRORS+1)); fi
+          if [ -z "$SDK" ] || [ "$SDK" -gt "$TARGET_DEVICE_API" ]; then echo "::error::minSdk $SDK > $TARGET_DEVICE_API : incompatible Android 9"; ERRORS=$((ERRORS+1)); fi
+          if ! grep -q "'arm64-v8a'" <<< "$NATIVE"; then echo "::error::arm64-v8a absent de l'APK"; ERRORS=$((ERRORS+1)); fi
+          if [ "$ABI" = "arm64-v8a" ] && grep -Eq "'(armeabi-v7a|x86|x86_64)'" <<< "$NATIVE"; then echo "::error::ABI supplémentaires présentes malgré abi=arm64-v8a : $NATIVE"; ERRORS=$((ERRORS+1)); fi
+          if grep -Eq 'debuggable\(0x0101000f\)=(true|\(type 0x12\)0xffffffff)' manifest.txt; then echo "::error::APK debuggable"; ERRORS=$((ERRORS+1)); fi
+          if grep -Eq 'allowBackup\(0x01010280\)=(true|\(type 0x12\)0xffffffff)' manifest.txt; then echo "::error::allowBackup=true"; ERRORS=$((ERRORS+1)); fi
+          grep "^uses-permission" badging.txt | sed "s/.*name='\([^']*\)'.*/  perm: \1/" | tee perms.txt
+          if [ "$HARDENING" = "true" ] && [ "$UPDATER" = "off" ] && grep -Eq 'REQUEST_INSTALL_PACKAGES|UPDATE_PACKAGES_WITHOUT_USER_ACTION' perms.txt; then
+            echo "::error::permissions d'installation encore présentes malgré updater=off"; ERRORS=$((ERRORS+1))
+          fi
+          if grep -Eq 'READ_CONTACTS|READ_SMS|RECORD_AUDIO|CAMERA|ACCESS_FINE_LOCATION|ACCESS_COARSE_LOCATION|READ_PHONE_STATE|GET_ACCOUNTS|QUERY_ALL_PACKAGES|SYSTEM_ALERT_WINDOW|BIND_ACCESSIBILITY_SERVICE' perms.txt; then
+            echo "::error::permission sensible inattendue (ci-dessus)"; ERRORS=$((ERRORS+1))
+          fi
+
+          echo "== SDK de pistage / publicité (DEX) =="
+          mkdir -p "$RUNNER_TEMP/dex"
+          unzip -o -q "$SIGNED" 'classes*.dex' -d "$RUNNER_TEMP/dex"
+          # io/sentry est volontairement exclu ici : le SDK est lié par l'amont mais
+          # ne démarre qu'avec un DSN → contrôle dédié juste après.
+          TRACKERS='L(com/google/firebase/analytics|com/google/firebase/crashlytics|com/google/android/gms/measurement|com/google/android/gms/ads|com/facebook/appevents|com/appsflyer|com/adjust/sdk|com/posthog|com/amplitude|com/mixpanel|com/onesignal|com/bugsnag|com/microsoft/appcenter|com/yandex/metrica|com/flurry|com/startapp|com/unity3d/ads|com/applovin|com/ironsource)/'
+          if LC_ALL=C grep -a -h -o -E "$TRACKERS" "$RUNNER_TEMP"/dex/*.dex | sort -u | tee trackers.txt | grep -q .; then
+            echo "::error::SDK de pistage/publicité détecté (ci-dessus)"; ERRORS=$((ERRORS+1))
+          else
+            echo "Aucun SDK de pistage/publicité ✔"
+          fi
+          if LC_ALL=C grep -a -h -o -E 'https://[0-9a-f]{32}@[A-Za-z0-9.-]*(sentry\.io|ingest[A-Za-z0-9.-]*)[^"[:space:]]*' "$RUNNER_TEMP"/dex/*.dex | sort -u | sed 's/\(.\{18\}\).*/\1…/' | tee dsn.txt | grep -q .; then
+            echo "::error::DSN Sentry présent dans les DEX (rapports de plantage actifs)"; ERRORS=$((ERRORS+1))
+          else
+            echo "SDK Sentry présent mais SANS DSN → inerte ✔"
+          fi
+
+          if [ "$HARDENING" = "true" ]; then
+            if LC_ALL=C grep -a -q -F 'Blocked local-network host for plugins' "$RUNNER_TEMP"/dex/*.dex; then
+              echo "Garde-fou réseau des plugins (N5) présent ✔"
+            else
+              echo "::error::N5 absent de l'APK (garde-fou réseau des plugins)"; ERRORS=$((ERRORS+1))
+            fi
+          fi
+
+          echo "== Backend compilé =="
+          if [ "$BACKEND" = "local" ]; then
+            if LC_ALL=C grep -a -q -F 'nuvio-backend.invalid' "$RUNNER_TEMP"/dex/*.dex; then echo "Backend factice .invalid ✔"; else echo "::error::hôte factice absent des DEX (backend=local)"; ERRORS=$((ERRORS+1)); fi
+            if LC_ALL=C grep -a -q -E 'eyJhbGciOi[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]*' "$RUNNER_TEMP"/dex/*.dex; then
+              echo "::warning::un jeton JWT figure dans les DEX alors que backend=local : à examiner"
+            fi
+          fi
+
+          echo "== Secrets embarqués ? (DEX) =="
+          if LC_ALL=C grep -a -h -o -E '(github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{32,}|AIza[0-9A-Za-z_-]{35}|sntrys_[A-Za-z0-9_]{20,})' "$RUNNER_TEMP"/dex/*.dex | sort -u | sed 's/\(.\{10\}\).*/\1…/' | tee secrets.txt | grep -q .; then
+            echo "::warning::Motif de clé trouvé dans les DEX (ci-dessus, tronqué) : à examiner"
+          else
+            echo "Aucun jeton GitHub/AWS/Google/Sentry dans les DEX ✔"
+          fi
+
+          echo "== Hôtes réseau embarqués =="
+          LC_ALL=C grep -a -h -o -E '(https?|wss?)://[A-Za-z0-9._-]+' "$RUNNER_TEMP"/dex/*.dex \
+            | sed -E 's#^[^:]+://##' | grep -Ev '^(schemas\.android\.com|www\.w3\.org|xml\.org|xmlpull\.org|xml\.apache\.org|apache\.org|java\.sun\.com|ns\.adobe\.com|purl\.org|localhost|127\.0\.0\.1|example\.com|www\.example\.com)$' \
+            | sort -u > hosts.txt || true
+          wc -l < hosts.txt | xargs echo "hôtes distincts :"
+
+          [ "$ERRORS" -eq 0 ] || { echo "::error::$ERRORS vérification(s) en échec"; exit 1; }
+
+          ABI_TAG="$([ "$ABI" = "arm64-v8a" ] && echo "arm64" || echo "universal")"
+          APK_NAME="Nuvio-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.short }}-${ABI_TAG}-${BACKEND}.apk"
+          ARTIFACT_NAME="${APK_NAME%.apk}"
+          mkdir -p artifacts
+          cp "$SIGNED" "artifacts/$APK_NAME"
+          (cd artifacts && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          {
+            echo "apk_name=$APK_NAME"
+            echo "artifact_name=$ARTIFACT_NAME"
+            echo "cert_sha256=$CERT_SHA256"
+            echo "package_name=$PKG"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Nuvio ${{ steps.meta.outputs.version }} (${{ steps.meta.outputs.version_code }}) · commit \`${{ steps.meta.outputs.short }}\` · ${ABI_TAG}"
+            echo ""
+            echo "- Source : https://github.com/${SRC_REPO}/commit/${{ steps.meta.outputs.sha }} (réf \`${SRC_REF}\`)"
+            echo "- Cible : Android 9 (API ${TARGET_DEVICE_API}) · minSdk ${SDK} · ABI ${NATIVE} · package \`${PKG}\`"
+            echo "- Backend : \`${BACKEND}\` $([ "$BACKEND" = "local" ] && echo '(aucun serveur Nuvio : utilisez « Continuer sans compte »)')"
+            echo "- Hardening : ${HARDENING_APPLIED}"
+            echo "- Options : updater=${UPDATER} · addon_deeplinks=${ADDON_DEEPLINKS}"
+            echo "- Signature : $([ "$HAS_SIGNING_SECRETS" = "true" ] && echo 'keystore des secrets ANDROID_KEYSTORE_*' || echo '**clé jetable (test uniquement)**') · cert SHA-256 \`${CERT_SHA256}\`"
+            echo "- SHA-256 APK : \`$(cut -d' ' -f1 "artifacts/$APK_NAME.sha256")\`"
+            echo "- SDK de pistage : aucun ✔ · Sentry : sans DSN ✔ · Permissions :"
+            echo '```'
+            cat perms.txt
+            echo '```'
+            echo "<details><summary>Hôtes réseau présents dans le code ($(wc -l < hosts.txt))</summary>"
+            echo ""
+            echo '```'
+            cat hosts.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload de l'APK signé
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.apk.outputs.artifact_name }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
