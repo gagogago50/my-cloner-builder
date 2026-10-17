@@ -239,14 +239,41 @@ jobs:
           path: self
           persist-credentials: false
 
-      - name: Checkout des sources Nuvio (sans fork, sans sous-module iOS)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          repository: ${{ env.SRC_REPO }}
-          ref: ${{ env.SRC_REF }}
-          path: nuvio
-          persist-credentials: false
-          submodules: false
+      # PAS d'actions/checkout ici : le dépôt Nuvio contient des gitlinks
+      # (libass-android, vendor/TorrServer, vendor/quickjs-kt) SANS entrée dans
+      # .gitmodules. Le nettoyage de fin d'actions/checkout lance
+      # `git submodule foreach` même avec submodules: false et plante :
+      #   fatal: No url found for submodule path 'libass-android' in .gitmodules
+      # Ces dossiers ne servent pas au build Android (AAR précompilés dans
+      # composeApp/libs) → simple git fetch, sans aucun sous-module.
+      - name: Récupération des sources Nuvio (git fetch, sans fork, sans sous-modules)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$SRC_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+            echo "::error::ref invalide : '$SRC_REF' (tag, branche ou SHA attendu)"
+            exit 1
+          fi
+          git init -q nuvio
+          cd nuvio
+          git config advice.detachedHead false
+          git remote add origin "https://github.com/${SRC_REPO}.git"
+          # 1) tag, branche ou SHA complet : fetch superficiel (rapide).
+          if git fetch -q --depth 1 --no-recurse-submodules --no-tags origin "$SRC_REF" 2>/dev/null; then
+            git checkout -q --detach FETCH_HEAD
+          else
+            # 2) SHA abrégé ou réf inhabituelle : historique sans contenus de fichiers, puis résolution locale.
+            echo "::notice::fetch direct impossible pour '$SRC_REF' → récupération de l'historique (blob:none)"
+            git fetch -q --filter=blob:none --no-recurse-submodules --tags origin '+refs/heads/*:refs/remotes/origin/*'
+            if ! SHA="$(git rev-parse --verify -q "${SRC_REF}^{commit}" || git rev-parse --verify -q "origin/${SRC_REF}^{commit}")"; then
+              echo "::error::réf '$SRC_REF' introuvable dans ${SRC_REPO}"
+              exit 1
+            fi
+            git checkout -q --detach "$SHA"
+          fi
+          echo "Nuvio @ $(git rev-parse HEAD) ($(git log -1 --format='%cs %s'))"
+          GITLINKS="$(git ls-tree -r HEAD | awk '$1 == "160000" {print $4}' | paste -sd ' ' -)"
+          echo "Gitlinks ignorés (non nécessaires au build Android) : ${GITLINKS:-aucun}"
 
       - name: Secrets de signature présents ?
         shell: bash
