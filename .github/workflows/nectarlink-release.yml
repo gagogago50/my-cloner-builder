@@ -1,0 +1,268 @@
+name: NectarLink — release sans mise à jour interne
+on:
+  workflow_dispatch:
+    inputs:
+      cible:
+        description: Plateforme à compiler
+        type: choice
+        required: true
+        default: les-deux
+        options: [android, windows, les-deux]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.cible == 'les-deux' && '["ubuntu-24.04","windows-2022"]' || inputs.cible == 'android' && '["ubuntu-24.04"]' || '["windows-2022"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: thtbee/nectarlink
+          ref: 2d15f3d2fb129c7cd661dd4f810df43151586a3c
+          persist-credentials: false
+      - name: Appliquer le patch à la copie éphémère
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > no-updates.diff <<'PATCH'
+          diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+          index 17bc33d..2e37a5a 100644
+          --- a/android/app/src/main/AndroidManifest.xml
+          +++ b/android/app/src/main/AndroidManifest.xml
+          @@ -66,9 +66,7 @@
+                   android:name="android.permission.BLUETOOTH_SCAN"
+                   android:usesPermissionFlags="neverForLocation" />
+               <!-- Installing its own updates from GitHub releases (the user allows it once). -->
+          -    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+               <!-- Updates of NectarLink itself without a prompt (Android 12+), when turned on in Settings. -->
+          -    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+               <!-- Calls, shown on paired PCs, with the caller's number and contact
+                    (asked for in the app). The call itself stays on the phone. -->
+               <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+          diff --git a/android/app/src/main/kotlin/app/nectarlink/android/update/AppUpdater.kt b/android/app/src/main/kotlin/app/nectarlink/android/update/AppUpdater.kt
+          index 45642fb..fb745d2 100644
+          --- a/android/app/src/main/kotlin/app/nectarlink/android/update/AppUpdater.kt
+          +++ b/android/app/src/main/kotlin/app/nectarlink/android/update/AppUpdater.kt
+          @@ -121,7 +121,7 @@ class AppUpdater(context: Context) {
+               val state: StateFlow<State> = _state.asStateFlow()
+           
+               /** Whether this build updates itself. */
+          -    val enabled: Boolean get() = !BuildConfig.DEBUG
+          +    val enabled: Boolean get() = false
+           
+               private val _autoInstall = MutableStateFlow(prefs.getBoolean(AUTO_INSTALL, true))
+           
+          @@ -342,6 +342,7 @@ class AppUpdater(context: Context) {
+                * continues by itself once they come back ([onAppResumed]).
+                */
+               fun requestInstall(update: Update): Intent? {
+          +        if (!enabled) return null
+                   if (!canInstall()) {
+                       _state.value = State.NeedsPermission(update)
+                       return allowInstallsIntent()
+          @@ -358,7 +359,7 @@ class AppUpdater(context: Context) {
+           
+               /** Downloads, checks and hands the update to Android's installer. */
+               suspend fun install(update: Update, automatic: Boolean = false) {
+          -        if (!busy.tryLock()) return
+          +        if (!enabled || !busy.tryLock()) return
+                   try {
+                       prefs.edit { putBoolean(LAST_AUTOMATIC, automatic) }
+                       if (!canInstall()) {
+          diff --git a/desktop/app/src/phone_install.rs b/desktop/app/src/phone_install.rs
+          index 6f6d0b8..a085dda 100644
+          --- a/desktop/app/src/phone_install.rs
+          +++ b/desktop/app/src/phone_install.rs
+          @@ -657,6 +657,7 @@ fn crc32(data: &[u8]) -> u32 {
+           
+           /// The newest phone app on this PC's update channel: (version, file).
+           fn latest_apk() -> Result<(String, crate::feed::FeedFile), String> {
+          +    if cfg!(windows) { return Err("Upstream APK downloads disabled".into()); }
+               let feed = crate::feed::fetch(crate::updater::channel())?.ok_or("no release feed")?;
+               let file = feed
+                   .files
+          diff --git a/desktop/app/src/updater.rs b/desktop/app/src/updater.rs
+          index 61e17fb..40bb8ad 100644
+          --- a/desktop/app/src/updater.rs
+          +++ b/desktop/app/src/updater.rs
+          @@ -221,7 +221,7 @@ pub fn set_auto_install(on: bool) {
+           /// from its folder). Not on macOS yet: nothing there picks a Mac build or
+           /// installs one, so a check would always say it's up to date.
+           pub fn can_update() -> bool {
+          -    cfg!(any(windows, target_os = "linux"))
+          +    cfg!(target_os = "linux")
+                   && std::env::current_exe().is_ok_and(|exe| autostart::is_installed(&exe))
+           }
+           
+          @@ -280,7 +280,7 @@ pub fn start() {
+           /// Checks now (blocking). `told`: the user asked, so say "up to date" too.
+           /// Returns what to tell the user.
+           pub fn check_now(told: bool) -> Option<String> {
+          -    if CHECKING.swap(true, Ordering::AcqRel) {
+          +    if cfg!(windows) || CHECKING.swap(true, Ordering::AcqRel) {
+                   return None;
+               }
+               let result = latest();
+          @@ -629,6 +629,7 @@ fn task_registered() -> bool {
+           /// Blocking. Returns what went wrong, in words for the user. On success the
+           /// app is about to quit for the installer.
+           pub fn install(progress: impl FnMut(u64, u64)) -> Result<(), String> {
+          +    if cfg!(windows) { return Err("Updates disabled in this build".into()); }
+               let update = available().ok_or("There's no update to install.")?;
+               let staged = stage(&update, progress).map_err(|e| {
+                   tracing::warn!(error = %e, "update download failed");
+          @@ -793,6 +794,7 @@ pub fn stage(update: &Update, progress: impl FnMut(u64, u64)) -> Result<PathBuf,
+           /// hidden relauncher opens the new version afterwards. `shown`: open its
+           /// window again (the user asked for the update) rather than start in the tray.
+           fn install_with_task(shown: bool) -> Result<(), String> {
+          +    if cfg!(windows) { return Err("Updates disabled in this build".into()); }
+               let update = available().ok_or("no update")?;
+               let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+               spawn_relauncher(&exe, env!("CARGO_PKG_VERSION"), shown)?;
+          @@ -897,6 +899,7 @@ fn relauncher_script(exe: &str, version: &str, arguments: &str) -> String {
+           /// release if it's newer than this copy. Writes what it did to `update.log`
+           /// beside the program, where only administrators can write.
+           pub fn run_service() -> ExitCode {
+          +    if cfg!(windows) { return ExitCode::FAILURE; }
+               let log_path =
+                   std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join("update.log")));
+               let log = |message: &str| {
+          diff --git a/desktop/installer/nectarlink.nsi b/desktop/installer/nectarlink.nsi
+          index 5be42c3..be3cfed 100644
+          --- a/desktop/installer/nectarlink.nsi
+          +++ b/desktop/installer/nectarlink.nsi
+          @@ -403,41 +403,7 @@ Section "Install"
+             ; Owned by administrators, and set on the folder alone: never /T, which
+             ; would follow a junction a user put inside to wherever it points. What
+             ; is created in it from now on inherits the grant.
+          -  CreateDirectory "$APPDATA\${APP}\updates"
+          -  nsExec::Exec 'icacls "$APPDATA\${APP}" /setowner *S-1-5-32-544'
+          -  nsExec::Exec 'icacls "$APPDATA\${APP}" /grant *S-1-5-32-545:(OI)(CI)M'
+          -  ${If} $AdminOnly != 1
+          -    ; Updates ask for permission in this folder (see the top of this file).
+          -    nsExec::Exec 'schtasks /Delete /TN "Nectarlink Update" /F'
+          -    Goto updates_done
+          -  ${EndIf}
+          -  InitPluginsDir
+          -  ${WordReplace} "$INSTDIR" "&" "&amp;" "+" $1
+          -  FileOpen $0 "$PLUGINSDIR\update-task.xml" w
+          -  FileWriteUTF16LE /BOM $0 '<?xml version="1.0" encoding="UTF-16"?>$\r$\n'
+          -  FileWriteUTF16LE $0 '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">$\r$\n'
+          -  FileWriteUTF16LE $0 '  <RegistrationInfo>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <Description>Installs new versions of NectarLink from its GitHub releases.</Description>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <SecurityDescriptor>D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;AU)</SecurityDescriptor>$\r$\n'
+          -  FileWriteUTF16LE $0 '  </RegistrationInfo>$\r$\n'
+          -  FileWriteUTF16LE $0 '  <Principals>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal>$\r$\n'
+          -  FileWriteUTF16LE $0 '  </Principals>$\r$\n'
+          -  FileWriteUTF16LE $0 '  <Settings>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <AllowStartOnDemand>true</AllowStartOnDemand>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <Enabled>true</Enabled>$\r$\n'
+          -  FileWriteUTF16LE $0 '    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>$\r$\n'
+          -  FileWriteUTF16LE $0 '  </Settings>$\r$\n'
+          -  FileWriteUTF16LE $0 '  <Actions Context="Author">$\r$\n'
+          -  FileWriteUTF16LE $0 '    <Exec><Command>"$1\${EXE}"</Command><Arguments>--update-service</Arguments></Exec>$\r$\n'
+          -  FileWriteUTF16LE $0 '  </Actions>$\r$\n'
+          -  FileWriteUTF16LE $0 '</Task>$\r$\n'
+          -  FileClose $0
+          -  nsExec::Exec 'schtasks /Create /TN "Nectarlink Update" /XML "$PLUGINSDIR\update-task.xml" /F'
+          -  updates_done:
+          +  nsExec::Exec 'schtasks /Delete /TN "Nectarlink Update" /F'
+           
+             !insertmacro Progress "step shortcuts"
+             CreateShortCut "$SMPROGRAMS\${DISPLAY}.lnk" "$INSTDIR\${EXE}" "" "$INSTDIR\${EXE}" 0 "" "" "Your phone, on your PC"
+          PATCH
+          git apply --check no-updates.diff
+          git apply no-updates.diff
+      - name: Rust
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install stable
+      - name: Qt pour MSVC x64
+        if: runner.os == 'Windows'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.12.0'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git@5a49f2b391ae8ee1d3c0dd87f8b33c1d49a4deb7
+      - name: NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install-nsis.ps1
+      - name: Installateur release AMD64
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package.ps1 -Arch x64
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NectarLink-Windows-AMD64-release
+          path: target/package/*-x64-setup.exe
+          if-no-files-found: error
+      - if: runner.os == 'Linux'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - if: runner.os == 'Linux'
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '16111833'
+          packages: 'platforms;android-37.0 ndk;30.0.16248370 build-tools;37.0.0'
+      - name: Compiler la release ARM 32 et 64 bits sans clé privée
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          cargo install --locked cargo-ndk
+          cd android
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          s = p.read_text()
+          old = 'signingConfig = if (keystore != null) signingConfigs.getByName("release") else signingConfigs.getByName("debug")'
+          assert s.count(old) == 1, 'Configuration de signature amont inattendue'
+          p.write_text(s.replace(old, 'signingConfig = null'))
+          PYCODE
+          ./gradlew --no-daemon :app:assembleRelease -Pnectarlink.abis=arm64-v8a,armeabi-v7a
+      - name: Aligner, signer et vérifier pour Android 9 (API 28)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : "${ANDROID_KEYSTORE_BASE64:?secret manquant}" "${ANDROID_KEYSTORE_PASSWORD:?secret manquant}" "${ANDROID_KEY_ALIAS:?secret manquant}" "${ANDROID_KEY_PASSWORD:?secret manquant}"
+          ks=$(mktemp "$RUNNER_TEMP/keystore.XXXXXX")
+          trap 'rm -f "$ks"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ks"
+          unset ANDROID_KEYSTORE_BASE64
+          bt="$ANDROID_HOME/build-tools/37.0.0"
+          mkdir -p artifacts
+          apk=artifacts/NectarLink-Android-release.apk
+          "$bt/zipalign" -P 16 -f 4 android/app/build/outputs/apk/release/app-release-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+          "$bt/apksigner" sign --ks "$ks" --ks-key-alias "$ANDROID_KEY_ALIAS" --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEY_PASSWORD --out "$apk" "$RUNNER_TEMP/aligned.apk"
+          "$bt/apksigner" verify --min-sdk-version 28 --max-sdk-version 28 --verbose --print-certs "$apk"
+          "$bt/aapt" dump badging "$apk" > "$RUNNER_TEMP/badging"
+          sdk=$(sed -n "s/^sdkVersion:'\([0-9]*\)'.*/\1/p" "$RUNNER_TEMP/badging")
+          [[ "$sdk" =~ ^[0-9]+$ && "$sdk" -le 28 ]]
+          "$bt/aapt" dump permissions "$apk" > "$RUNNER_TEMP/perms"
+          if grep -Eq 'REQUEST_INSTALL_PACKAGES|UPDATE_PACKAGES_WITHOUT_USER_ACTION' "$RUNNER_TEMP/perms"; then echo 'Permission de mise à jour inattendue'; exit 1; fi
+      - if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NectarLink-Android-ARM-release
+          path: artifacts/NectarLink-Android-release.apk
+          if-no-files-found: error
